@@ -25,6 +25,14 @@ fn main() {
     env_logger::init();
 
     Application::new().run(|cx: &mut App| {
+        // Load bundled icon font (Nerd Font Symbols)
+        let icon_font = std::borrow::Cow::Borrowed(
+            include_bytes!("../resources/icons.ttf").as_slice(),
+        );
+        if let Err(e) = cx.text_system().add_fonts(vec![icon_font]) {
+            log::error!("Failed to load icon font: {e}");
+        }
+
         crate::settings::AppSettings::init(cx);
 
         cx.bind_keys([

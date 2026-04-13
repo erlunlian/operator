@@ -276,13 +276,16 @@ impl OperatorApp {
             return;
         }
 
-        // Try smart close (handles sub-tabs first, then outer tabs)
-        ws.update(cx, |ws, cx| ws.close_tab(cx));
-
-        // Check if workspace is now empty — if so, close it
+        // If workspace already has zero tabs, Cmd+W means "close workspace"
         if ws.read(cx).total_tab_count(cx) == 0 {
             self.remove_active_workspace(cx);
+            return;
         }
+
+        // Try smart close (handles sub-tabs first, then outer tabs)
+        ws.update(cx, |ws, cx| ws.close_tab(cx));
+        // Leave the workspace open even if tabs reach 0
+        cx.notify();
     }
 
     fn next_tab(&mut self, _: &NextTab, _window: &mut Window, cx: &mut Context<Self>) {

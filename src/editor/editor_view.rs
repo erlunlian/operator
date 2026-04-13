@@ -138,10 +138,11 @@ impl EditorView {
             let entity_close = entity.clone();
 
             let file_icon = util::icon_for_file(&file.title);
+            let icon_color = util::file_icon_color(&file.title);
             let tab_title = if is_dirty {
-                format!("{file_icon} {} *", file.title)
+                format!("{} *", file.title)
             } else {
-                format!("{file_icon} {}", file.title)
+                file.title.to_string()
             };
 
             let mut tab_el = div()
@@ -179,6 +180,14 @@ impl EditorView {
                         cx.notify();
                     });
                 })
+                .child(
+                    div()
+                        .font_family(util::ICON_FONT)
+                        .text_size(px(13.0))
+                        .text_color(icon_color)
+                        .flex_shrink_0()
+                        .child(file_icon),
+                )
                 .child(tab_title);
 
             // Close button

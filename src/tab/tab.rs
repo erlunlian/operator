@@ -2,8 +2,10 @@ use gpui::*;
 use std::path::PathBuf;
 
 use crate::editor::EditorView;
+use crate::tab::tab_bar::TabIcon;
 use crate::terminal::TerminalModel;
 use crate::terminal::terminal_view::TerminalView;
+use crate::theme::colors;
 use crate::workspace::workspace::ClaudeStatus;
 
 pub enum TabContent {
@@ -21,7 +23,7 @@ impl Tab {
         let terminal = cx.new(|cx| TerminalModel::new(cx));
         let terminal_view = cx.new(|cx| TerminalView::new(terminal, cx));
         Self {
-            title: SharedString::from(format!("\u{1F4BB} {title}")), // 💻
+            title: SharedString::from(title.to_string()),
             content: TabContent::Terminal(terminal_view),
         }
     }
@@ -29,8 +31,21 @@ impl Tab {
     pub fn new_editor(title: &str, root_dir: PathBuf, cx: &mut App) -> Self {
         let editor = cx.new(|cx| EditorView::new(root_dir, cx));
         Self {
-            title: SharedString::from(format!("\u{1F4C2} {title}")), // 📂
+            title: SharedString::from(title.to_string()),
             content: TabContent::Editor(editor),
+        }
+    }
+
+    pub fn icon(&self) -> TabIcon {
+        match &self.content {
+            TabContent::Terminal(_) => TabIcon {
+                glyph: "\u{e795}", //  terminal
+                color: colors::text_muted(),
+            },
+            TabContent::Editor(_) => TabIcon {
+                glyph: "\u{f07c}", //  folder open
+                color: colors::text_muted(),
+            },
         }
     }
 

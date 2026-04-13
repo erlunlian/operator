@@ -176,19 +176,22 @@ impl FileTree {
 
             if entry.is_dir {
                 let is_expanded = self.expanded_dirs.contains(&entry.path);
-                let chevron = if is_expanded { "▼" } else { "▶" };
+                let chevron = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
                 let dir_icon = if is_expanded { util::dir_icon_open() } else { util::dir_icon() };
 
                 row = row
                     .child(
                         div()
                             .text_color(colors::text_muted())
-                            .w(px(12.0))
+                            .text_size(px(8.0))
+                            .w(px(10.0))
                             .child(chevron),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(14.0))
+                            .text_color(colors::text_muted())
                             .mr(px(4.0))
                             .child(dir_icon),
                     )
@@ -200,13 +203,17 @@ impl FileTree {
                     on_dir_toggle(path.clone(), window, cx);
                 });
             } else {
-                // File: no chevron, just indented name
                 let icon = util::icon_for_file(&entry.name);
+                let icon_color = util::file_icon_color(&entry.name);
                 row = row
                     .child(div().w(px(12.0)))
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(14.0))
+                            .text_color(icon_color)
+                            .w(px(16.0))
+                            .flex_shrink_0()
                             .mr(px(4.0))
                             .child(icon),
                     )

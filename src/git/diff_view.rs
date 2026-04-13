@@ -303,9 +303,9 @@ impl GitDiffPanel {
             })
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(8.0))
                     .text_color(colors::text_muted())
-                    .w(px(12.0))
+                    .w(px(10.0))
                     .child(chevron.to_string()),
             )
             .child(
@@ -367,14 +367,16 @@ impl GitDiffPanel {
                             })
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(8.0))
                                     .text_color(colors::text_muted())
-                                    .w(px(12.0))
+                                    .w(px(10.0))
                                     .child(chevron.to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.0))
+                                    .font_family(util::ICON_FONT)
+                                    .text_size(px(14.0))
+                                    .text_color(colors::text_muted())
                                     .ml_1()
                                     .child(dir_icon),
                             )
@@ -486,6 +488,7 @@ impl GitDiffPanel {
                             })
                             .child({
                                 let file_icon = util::icon_for_file(name);
+                                let icon_color = util::file_icon_color(name);
                                 div()
                                     .flex()
                                     .flex_row()
@@ -493,7 +496,11 @@ impl GitDiffPanel {
                                     .gap_1()
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
+                                            .font_family(util::ICON_FONT)
+                                            .text_size(px(14.0))
+                                            .text_color(icon_color)
+                                            .w(px(16.0))
+                                            .flex_shrink_0()
                                             .child(file_icon),
                                     )
                                     .child(

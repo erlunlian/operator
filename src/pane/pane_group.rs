@@ -2,7 +2,7 @@ use gpui::*;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::tab::{Tab, TabBar, TabDragPayload};
+use crate::tab::{Tab, TabBar, TabDragPayload, tab_bar::TabIcon};
 use crate::theme::colors;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -536,10 +536,19 @@ impl PaneGroup {
             .iter()
             .map(|t| t.read(cx).title.clone())
             .collect();
+        let tab_icons: Vec<TabIcon> = group
+            .tabs
+            .iter()
+            .map(|t| {
+                let tab = t.read(cx);
+                tab.icon()
+            })
+            .collect();
         let active_ix = group.active_tab_ix;
 
         let tab_bar = TabBar::render(
             &tab_titles,
+            &tab_icons,
             active_ix,
             group_id,
             Rc::new(move |ix, _window, cx| {

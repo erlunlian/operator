@@ -2,6 +2,14 @@ use gpui::*;
 use std::rc::Rc;
 
 use crate::theme::colors;
+use crate::util;
+
+/// Icon info for a tab.
+#[derive(Clone)]
+pub struct TabIcon {
+    pub glyph: &'static str,
+    pub color: Rgba,
+}
 
 #[derive(Clone)]
 pub struct TabDragPayload {
@@ -32,6 +40,7 @@ pub struct TabBar;
 impl TabBar {
     pub fn render(
         tab_titles: &[SharedString],
+        tab_icons: &[TabIcon],
         active_ix: usize,
         group_id: usize,
         on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
@@ -119,8 +128,21 @@ impl TabBar {
             tab_el = tab_el
                 .on_click(move |_, window, cx| {
                     on_select(ix, window, cx);
-                })
-                .child(title.clone());
+                });
+
+            // Icon
+            if let Some(icon) = tab_icons.get(ix) {
+                tab_el = tab_el.child(
+                    div()
+                        .font_family(util::ICON_FONT)
+                        .text_size(px(14.0))
+                        .text_color(icon.color)
+                        .flex_shrink_0()
+                        .child(icon.glyph),
+                );
+            }
+
+            tab_el = tab_el.child(title.clone());
 
             // Close button
             if let Some(on_close) = &on_close {

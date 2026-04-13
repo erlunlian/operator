@@ -1,4 +1,12 @@
-.PHONY: dev run release install clean
+.PHONY: help dev run release install open clean
+
+help:
+	@echo "make dev       Dev build with auto-reload on save"
+	@echo "make run       Single build and run"
+	@echo "make release   Build optimized .app bundle"
+	@echo "make open      Build release and open the app"
+	@echo "make install   Build release and copy to /Applications"
+	@echo "make clean     Remove all build artifacts"
 
 # Dev with auto-reload on save + full backtraces
 dev:

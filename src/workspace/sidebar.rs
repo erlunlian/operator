@@ -2,6 +2,7 @@ use gpui::*;
 use std::rc::Rc;
 
 use crate::theme::colors;
+use crate::util;
 use crate::workspace::workspace::ClaudeStatus;
 
 /// Data for rendering a single workspace card in the sidebar
@@ -12,6 +13,39 @@ pub struct WorkspaceCardData {
     pub claude_status: ClaudeStatus,
 }
 
+#[derive(Clone)]
+pub struct WorkspaceDragPayload {
+    pub ix: usize,
+    pub name: SharedString,
+}
+
+struct WorkspaceDragGhost {
+    name: SharedString,
+}
+
+impl Render for WorkspaceDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .bg(colors::surface_hover())
+            .rounded_md()
+            .text_color(colors::text())
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(self.name.clone())
+    }
+}
+
+/// A thin accent-colored line shown between cards during drag reorder.
+fn drop_indicator() -> Div {
+    div()
+        .h(px(2.0))
+        .w_full()
+        .bg(colors::accent())
+        .rounded_full()
+}
+
 pub struct WorkspaceSidebar;
 
 impl WorkspaceSidebar {
@@ -20,17 +54,33 @@ impl WorkspaceSidebar {
         active_ix: usize,
         on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
         on_new: Rc<dyn Fn(&mut Window, &mut App)>,
+        on_close: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
+        on_reorder: Option<Rc<dyn Fn(usize, usize, &mut Window, &mut App)>>,
     ) -> Stateful<Div> {
-        Self::render_with_width(workspaces, active_ix, on_select, on_new, 260.0)
+        Self::render_with_width(
+            workspaces, active_ix, on_select, on_new, on_close, on_reorder,
+            None,
+            Rc::new(|_, _, _| {}),
+            Rc::new(|_, _| {}),
+            260.0,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_with_width(
         workspaces: &[WorkspaceCardData],
         active_ix: usize,
         on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
         on_new: Rc<dyn Fn(&mut Window, &mut App)>,
+        on_close: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
+        on_reorder: Option<Rc<dyn Fn(usize, usize, &mut Window, &mut App)>>,
+        drop_index: Option<usize>,
+        on_drop_index_change: Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>,
+        on_drag_end: Rc<dyn Fn(&mut Window, &mut App)>,
         width: f32,
     ) -> Stateful<Div> {
+        let on_drag_end2 = on_drag_end.clone();
+
         let mut sidebar = div()
             .id("workspace-sidebar")
             .flex()
@@ -44,14 +94,35 @@ impl WorkspaceSidebar {
             .border_color(colors::border())
             .overflow_hidden()
             .pt(px(36.0))
-            .pb_1();
+            .pb_1()
+            .on_mouse_up(MouseButton::Left, move |_, window, cx| {
+                on_drag_end2(window, cx);
+            });
 
         for (ix, ws) in workspaces.iter().enumerate() {
             let is_active = ix == active_ix;
             let on_select = on_select.clone();
+            let on_close = on_close.clone();
+            let on_reorder = on_reorder.clone();
+            let on_drop_index_change = on_drop_index_change.clone();
+            let on_drag_end = on_drag_end.clone();
 
-            let card = Self::render_card(ws, is_active, ix, on_select);
+            // Show drop indicator line before this card
+            if drop_index == Some(ix) {
+                sidebar = sidebar.child(drop_indicator());
+            }
+
+            let card = Self::render_card(
+                ws, is_active, ix, workspaces.len(),
+                on_select, on_close, on_reorder,
+                on_drop_index_change, on_drag_end,
+            );
             sidebar = sidebar.child(card);
+        }
+
+        // Show drop indicator at the end (after last card)
+        if drop_index == Some(workspaces.len()) {
+            sidebar = sidebar.child(drop_indicator());
         }
 
         // Spacer to push content to top
@@ -93,11 +164,17 @@ impl WorkspaceSidebar {
         sidebar
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_card(
         ws: &WorkspaceCardData,
         is_active: bool,
         ix: usize,
+        _total: usize,
         on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+        on_close: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
+        on_reorder: Option<Rc<dyn Fn(usize, usize, &mut Window, &mut App)>>,
+        on_drop_index_change: Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>,
+        on_drag_end: Rc<dyn Fn(&mut Window, &mut App)>,
     ) -> Stateful<Div> {
         let active_bg = if is_active {
             colors::surface_hover()
@@ -128,6 +205,7 @@ impl WorkspaceSidebar {
 
         let mut card = div()
             .id(ElementId::Name(format!("ws-card-{ix}").into()))
+            .group("ws-card")
             .flex()
             .flex_row()
             .gap_2()
@@ -137,7 +215,49 @@ impl WorkspaceSidebar {
             .bg(active_bg)
             .border_l_2()
             .border_color(active_border)
-            .cursor_pointer();
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()));
+
+        // Drag support
+        let payload = WorkspaceDragPayload {
+            ix,
+            name: ws.name.clone(),
+        };
+        card = card.on_drag(payload, move |payload, _offset, _window, cx| {
+            cx.new(|_cx| WorkspaceDragGhost {
+                name: payload.name.clone(),
+            })
+        });
+
+        // Track drag position for drop indicator
+        {
+            let on_change = on_drop_index_change.clone();
+            card = card.on_drag_move::<WorkspaceDragPayload>(
+                move |event: &DragMoveEvent<WorkspaceDragPayload>, window, cx| {
+                    let bounds = event.bounds;
+                    let pos = event.event.position;
+                    let mid_y = bounds.origin.y + bounds.size.height / 2.0;
+                    let target = if pos.y < mid_y { ix } else { ix + 1 };
+                    // Don't show indicator right next to the dragged item (no-op position)
+                    let source = event.drag(cx).ix;
+                    let effective = if target == source || target == source + 1 {
+                        None
+                    } else {
+                        Some(target)
+                    };
+                    on_change(effective, window, cx);
+                },
+            );
+        }
+
+        // Drop support (reorder)
+        if let Some(on_reorder) = on_reorder {
+            let on_drag_end = on_drag_end.clone();
+            card = card.on_drop(move |payload: &WorkspaceDragPayload, window, cx| {
+                on_reorder(payload.ix, ix, window, cx);
+                on_drag_end(window, cx);
+            });
+        }
 
         // Status dot
         card = card.child(
@@ -184,6 +304,38 @@ impl WorkspaceSidebar {
         );
 
         card = card.child(text_col);
+
+        // Close button (visible on hover)
+        if let Some(on_close) = on_close {
+            let close_ix = ix;
+            card = card.child(
+                div()
+                    .id(ElementId::Name(format!("ws-close-{ix}").into()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .mt(px(2.0))
+                    .rounded_sm()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .invisible()
+                    .group_hover("ws-card", |s| s.visible())
+                    .hover(|s| s.bg(colors::surface_hover()).text_color(colors::text()))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        on_close(close_ix, window, cx);
+                    })
+                    .child(
+                        div()
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(12.0))
+                            .child("\u{f00d}"), // nf-fa-close (×)
+                    ),
+            );
+        }
 
         card.on_click(move |_, window, cx| {
             on_select(ix, window, cx);

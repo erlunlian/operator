@@ -33,6 +33,8 @@ pub struct OperatorApp {
     recent_projects: RecentProjects,
     /// When true, shows a quit confirmation dialog.
     quit_requested: bool,
+    /// Drop indicator index for workspace sidebar drag reorder.
+    ws_drop_index: Option<usize>,
 }
 
 impl OperatorApp {
@@ -70,6 +72,7 @@ impl OperatorApp {
             window_bounds: None,
             recent_projects: RecentProjects::load(),
             quit_requested: false,
+            ws_drop_index: None,
         }
     }
 
@@ -124,6 +127,7 @@ impl OperatorApp {
             window_bounds,
             recent_projects: RecentProjects::load(),
             quit_requested: false,
+            ws_drop_index: None,
         }
     }
 
@@ -819,8 +823,11 @@ impl Render for OperatorApp {
         let app_entity2 = app_entity.clone();
         let app_entity3 = app_entity.clone();
         let app_entity4 = app_entity.clone();
+        let app_entity5 = app_entity.clone();
+        let app_entity6 = app_entity.clone();
 
         let sidebar_width = self.sidebar_width;
+        let ws_drop_index = self.ws_drop_index;
         let sidebar = if !self.sidebar_collapsed {
             Some(WorkspaceSidebar::render_with_width(
                 &ws_cards,
@@ -884,9 +891,27 @@ impl Render for OperatorApp {
                         } else if from_ix > app.active_workspace_ix && to_ix <= app.active_workspace_ix {
                             app.active_workspace_ix += 1;
                         }
+                        app.ws_drop_index = None;
                         cx.notify();
                     });
                 })),
+                ws_drop_index,
+                Rc::new(move |ix: Option<usize>, _window: &mut Window, cx: &mut App| {
+                    app_entity5.update(cx, |app, cx| {
+                        if app.ws_drop_index != ix {
+                            app.ws_drop_index = ix;
+                            cx.notify();
+                        }
+                    });
+                }),
+                Rc::new(move |_window: &mut Window, cx: &mut App| {
+                    app_entity6.update(cx, |app, cx| {
+                        if app.ws_drop_index.is_some() {
+                            app.ws_drop_index = None;
+                            cx.notify();
+                        }
+                    });
+                }),
                 sidebar_width,
             ))
         } else {

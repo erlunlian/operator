@@ -601,7 +601,7 @@ impl Render for TerminalView {
                 let path_strs: Vec<String> = paths
                     .paths()
                     .iter()
-                    .map(|p| p.to_string_lossy().to_string())
+                    .filter_map(|p| shlex::try_quote(&p.to_string_lossy()).ok().map(|s| s.into_owned()))
                     .collect();
                 if !path_strs.is_empty() {
                     let joined = path_strs.join(" ");

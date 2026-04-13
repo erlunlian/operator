@@ -3908,6 +3908,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "shlex",
  "tree-sitter",
  "tree-sitter-highlight",
  "tree-sitter-json",

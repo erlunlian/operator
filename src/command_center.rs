@@ -368,6 +368,7 @@ impl CommandCenter {
                 "--smart-case",
                 "--max-filesize", "1M",
                 "-g", "!.git",
+                "--",
                 query,
             ])
             .current_dir(root)
@@ -420,6 +421,7 @@ impl CommandCenter {
                 "--exclude-dir=.next",
                 "--exclude-dir=vendor",
                 "--exclude-dir=__pycache__",
+                "--",
                 query,
                 &root.to_string_lossy(),
             ])

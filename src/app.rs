@@ -627,10 +627,16 @@ impl OperatorApp {
     fn toggle_command_center(
         &mut self,
         _: &ToggleCommandCenter,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.command_center.update(cx, |cc, cx| cc.toggle(cx));
+        let prev = window.focused(cx);
+        self.command_center.update(cx, |cc, cx| {
+            if !cc.visible {
+                cc.previous_focus = prev;
+            }
+            cc.toggle(cx);
+        });
     }
 
     fn request_quit(
@@ -646,7 +652,7 @@ impl OperatorApp {
     fn search_workspace(
         &mut self,
         _: &SearchWorkspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let dir = self
@@ -654,7 +660,9 @@ impl OperatorApp {
             .read(cx)
             .directory
             .clone();
+        let prev = window.focused(cx);
         self.command_center.update(cx, |cc, cx| {
+            cc.previous_focus = prev;
             cc.search_root = dir;
             cc.show_workspace_search_mode(cx);
         });
@@ -663,7 +671,7 @@ impl OperatorApp {
     fn find_file(
         &mut self,
         _: &FindFile,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let dir = self
@@ -671,7 +679,9 @@ impl OperatorApp {
             .read(cx)
             .directory
             .clone();
+        let prev = window.focused(cx);
         self.command_center.update(cx, |cc, cx| {
+            cc.previous_focus = prev;
             cc.search_root = dir;
             cc.show_file_search_mode(cx);
         });
@@ -823,6 +833,10 @@ impl OperatorApp {
             self.active_workspace_ix = self.workspaces.len() - 1;
         }
         self.update_right_panel_dir(dir, cx);
+        // Invalidate the file search index so it rebuilds for the new directory
+        self.command_center.update(cx, |cc, _cx| {
+            cc.invalidate_file_index();
+        });
         cx.notify();
     }
 
@@ -1121,12 +1135,20 @@ impl OperatorApp {
 impl Render for OperatorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // When the command center closes, its TextInput's focus handle is
-        // orphaned (no longer in the rendered tree). Restore focus to the app
-        // root so global keybindings (Cmd+P, Cmd+K, etc.) keep working.
+        // orphaned (no longer in the rendered tree). Restore focus to the
+        // pane that was focused before the command center opened.
         if !self.command_center.read(cx).visible
             && !self.focus_handle.contains_focused(window, cx)
         {
-            self.focus_handle.focus(window);
+            let prev = self.command_center.read(cx).previous_focus.clone();
+            if let Some(handle) = prev {
+                handle.focus(window);
+            } else {
+                self.focus_handle.focus(window);
+            }
+            self.command_center.update(cx, |cc, _cx| {
+                cc.previous_focus = None;
+            });
         }
 
         // Cache window bounds for session persistence

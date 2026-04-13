@@ -2,6 +2,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::text_input::TextInput;
 use crate::theme::colors;
@@ -58,6 +59,8 @@ enum SearchDisplayRow {
 
 pub struct CommandCenter {
     pub visible: bool,
+    /// Focus handle to restore when the command center closes.
+    pub previous_focus: Option<FocusHandle>,
     pub mode: CommandCenterMode,
     pub query: String,
     pub selected_ix: usize,
@@ -95,10 +98,15 @@ pub struct CommandCenter {
     pub file_results: Vec<PathBuf>,
     /// The file the user selected from file search.
     pub pending_file_path: Option<PathBuf>,
-    /// Receiver for streaming file search results from the worker thread.
-    file_search_rx: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
     /// Virtualized scroll handle for file search results.
     file_scroll_handle: UniformListScrollHandle,
+    /// Pre-built in-memory file index for instant Cmd+P search.
+    /// Relative paths from search_root, populated once when the project opens.
+    file_index: Arc<Vec<String>>,
+    /// The root that file_index was built for (to detect when we need to rebuild).
+    file_index_root: Option<PathBuf>,
+    /// Whether the file index is currently being built.
+    file_index_building: bool,
 }
 
 impl CommandCenter {
@@ -152,26 +160,8 @@ impl CommandCenter {
                         cc.search_debounce = Some(task);
                     }
                 } else if cc.mode == CommandCenterMode::FileSearch {
-                    cc.file_results.clear();
-                    cc.search_debounce = None;
-                    if new_text.trim().is_empty() {
-                        cc.status_message = None;
-                    } else {
-                        cc.status_message = Some("Searching...".into());
-                        let task = cx.spawn(async |entity, cx| {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(100))
-                                .await;
-                            let _ = cx.update(|cx| {
-                                let _ = entity.update(cx, |cc, cx| {
-                                    cc.search_debounce = None;
-                                    let q = cc.query.clone();
-                                    cc.run_file_search(q, cx);
-                                });
-                            });
-                        });
-                        cc.search_debounce = Some(task);
-                    }
+                    // In-memory filter — no debounce needed, it's instant.
+                    cc.filter_file_index(&new_text);
                 }
                 cx.notify();
             }
@@ -180,6 +170,7 @@ impl CommandCenter {
 
         Self {
             visible: false,
+            previous_focus: None,
             mode: CommandCenterMode::Commands,
             query: String::new(),
             selected_ix: 0,
@@ -201,8 +192,10 @@ impl CommandCenter {
             search_display_rows: Vec::new(),
             file_results: Vec::new(),
             pending_file_path: None,
-            file_search_rx: None,
             file_scroll_handle: UniformListScrollHandle::new(),
+            file_index: Arc::new(Vec::new()),
+            file_index_root: None,
+            file_index_building: false,
         }
     }
 
@@ -261,7 +254,6 @@ impl CommandCenter {
         // Cancel any in-flight search (drops rx → worker thread exits)
         self.search_task = None;
         self.search_rx = None;
-        self.file_search_rx = None;
         self.file_results.clear();
         self.searching = false;
         // Defer the input clear to avoid a double-lease panic when
@@ -312,6 +304,8 @@ impl CommandCenter {
         self.input.update(cx, |inp, _cx| {
             inp.set_placeholder("Search files by name...");
         });
+        // Build file index if needed (first open or directory changed)
+        self.ensure_file_index(cx);
         cx.notify();
     }
 
@@ -389,9 +383,8 @@ impl CommandCenter {
                     self.pending_file_path =
                         Some(self.file_results[ix].clone());
                 } else {
-                    self.search_debounce = None;
                     let query = self.query.clone();
-                    self.run_file_search(query, cx);
+                    self.filter_file_index(&query);
                 }
             }
         }
@@ -544,101 +537,121 @@ impl CommandCenter {
         false
     }
 
-    pub fn run_file_search(&mut self, query: String, cx: &mut Context<Self>) {
-        if query.trim().is_empty() {
-            return;
-        }
+    /// Build (or rebuild) the in-memory file index if needed.
+    fn ensure_file_index(&mut self, cx: &mut Context<Self>) {
         let root = match &self.search_root {
             Some(r) => r.clone(),
             None => return,
         };
-        self.search_task = None;
-        self.file_search_rx = None;
-        self.searching = true;
-        self.file_results.clear();
-        self.status_message = Some("Searching...".into());
+        // Already built for this root, or currently building
+        if self.file_index_root.as_ref() == Some(&root) || self.file_index_building {
+            return;
+        }
+        self.file_index_building = true;
+        self.status_message = Some("Indexing files...".into());
         cx.notify();
 
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
-        self.file_search_rx = Some(rx);
+        cx.spawn(async move |entity, cx| {
+            let index = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    async move { build_file_index(&root) }
+                })
+                .await;
 
-        std::thread::spawn(move || {
-            file_search_worker(&query, &root, tx);
-        });
-
-        let task = cx.spawn(async |entity, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(32))
-                    .await;
-                let should_stop = cx
-                    .update(|cx| {
-                        entity
-                            .update(cx, |cc, cx| cc.drain_file_batches(cx))
-                            .unwrap_or(true)
-                    })
-                    .unwrap_or(true);
-                if should_stop {
-                    return;
-                }
-            }
-        });
-        self.search_task = Some(task);
+            let _ = cx.update(|cx| {
+                let _ = entity.update(cx, |cc, cx| {
+                    cc.file_index = Arc::new(index);
+                    cc.file_index_root = Some(root);
+                    cc.file_index_building = false;
+                    // If the user already typed a query while we were indexing,
+                    // apply the filter now.
+                    let q = cc.query.clone();
+                    cc.filter_file_index(&q);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
-    fn drain_file_batches(&mut self, cx: &mut Context<Self>) -> bool {
-        let rx = match &self.file_search_rx {
-            Some(rx) => rx,
-            None => return true,
+    /// Invalidate the file index so it rebuilds on next Cmd+P.
+    /// Call this when files are created, deleted, or renamed.
+    pub fn invalidate_file_index(&mut self) {
+        self.file_index_root = None;
+    }
+
+    /// Filter the pre-built file index in memory — instant, no I/O.
+    fn filter_file_index(&mut self, query: &str) {
+        self.file_results.clear();
+        self.selected_ix = 0;
+
+        if query.trim().is_empty() {
+            self.status_message = None;
+            return;
+        }
+
+        let root = match &self.search_root {
+            Some(r) => r,
+            None => return,
         };
 
-        let mut got_batch = false;
-        let mut disconnected = false;
+        if self.file_index_building {
+            self.status_message = Some("Indexing files...".into());
+            return;
+        }
 
-        loop {
-            match rx.try_recv() {
-                Ok(batch) => {
-                    self.file_results.extend(batch);
-                    got_batch = true;
+        let query_lower = query.to_lowercase();
+        let query_parts: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut scored: Vec<(i64, &str)> = self
+            .file_index
+            .iter()
+            .filter_map(|path| {
+                let path_lower = path.to_lowercase();
+                // All query parts must match somewhere in the path
+                if !query_parts.iter().all(|part| path_lower.contains(part)) {
+                    return None;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
+                // Score: prefer filename matches over deep path matches
+                let filename = path.rsplit('/').next().unwrap_or(path);
+                let filename_lower = filename.to_lowercase();
+                let mut score: i64 = 0;
+                // Bonus for filename containing the full query
+                if filename_lower.contains(&query_lower) {
+                    score += 100;
+                    // Extra bonus for prefix match
+                    if filename_lower.starts_with(&query_lower) {
+                        score += 50;
+                    }
+                    // Bonus for exact filename match
+                    if filename_lower == query_lower {
+                        score += 200;
+                    }
                 }
-            }
-        }
+                // Prefer shorter paths (less deeply nested)
+                score -= (path.matches('/').count() as i64) * 2;
+                // Prefer shorter filenames
+                score -= filename.len() as i64;
+                Some((score, path.as_str()))
+            })
+            .collect();
 
-        if got_batch {
-            let count = self.file_results.len();
-            self.selected_ix = self.selected_ix.min(count.saturating_sub(1));
-            self.status_message = Some(format!(
-                "{} file{}{}",
-                count,
-                if count == 1 { "" } else { "s" },
-                if disconnected { "" } else { "..." }
-            ));
-            cx.notify();
-        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-        if disconnected {
-            self.searching = false;
-            self.file_search_rx = None;
-            let count = self.file_results.len();
-            self.status_message = if count == 0 {
-                Some("No files found".into())
-            } else {
-                Some(format!(
-                    "{} file{}",
-                    count,
-                    if count == 1 { "" } else { "s" }
-                ))
-            };
-            cx.notify();
-            return true;
-        }
+        let count = scored.len();
+        self.file_results = scored
+            .into_iter()
+            .take(1000)
+            .map(|(_, p)| root.join(p))
+            .collect();
 
-        false
+        self.status_message = Some(format!(
+            "{} file{}",
+            count,
+            if count == 1 { "" } else { "s" }
+        ));
     }
 
     pub fn clone_repo(&mut self, url: String, cx: &mut Context<Self>) {
@@ -758,6 +771,32 @@ fn spawn_rg(query: &str, root: &PathBuf) -> Option<std::process::Child> {
             "--smart-case",
             "--max-filesize", "1M",
             "-g", "!.git",
+            "-g", "!.venv",
+            "-g", "!venv",
+            "-g", "!__pycache__",
+            "-g", "!.mypy_cache",
+            "-g", "!.pytest_cache",
+            "-g", "!.tox",
+            "-g", "!.ruff_cache",
+            "-g", "!.eggs",
+            "-g", "!*.egg-info",
+            "-g", "!node_modules",
+            "-g", "!target",
+            "-g", "!dist",
+            "-g", "!build",
+            "-g", "!.next",
+            "-g", "!.turbo",
+            "-g", "!.cache",
+            "-g", "!vendor",
+            "-g", "!coverage",
+            "-g", "!.parcel-cache",
+            "-g", "!.nyc_output",
+            "-g", "!.svelte-kit",
+            "-g", "!.nuxt",
+            "-g", "!.output",
+            "-g", "!.angular",
+            "-g", "!storybook-static",
+            "-g", "!bower_components",
             "--",
             query,
         ])
@@ -803,6 +842,24 @@ fn spawn_grep(query: &str, root: &PathBuf) -> Option<std::process::Child> {
             "--exclude-dir=.next",
             "--exclude-dir=vendor",
             "--exclude-dir=__pycache__",
+            "--exclude-dir=.venv",
+            "--exclude-dir=venv",
+            "--exclude-dir=.mypy_cache",
+            "--exclude-dir=.pytest_cache",
+            "--exclude-dir=.tox",
+            "--exclude-dir=.ruff_cache",
+            "--exclude-dir=.eggs",
+            "--exclude-dir=.turbo",
+            "--exclude-dir=.cache",
+            "--exclude-dir=coverage",
+            "--exclude-dir=.parcel-cache",
+            "--exclude-dir=.nyc_output",
+            "--exclude-dir=.svelte-kit",
+            "--exclude-dir=.nuxt",
+            "--exclude-dir=.output",
+            "--exclude-dir=.angular",
+            "--exclude-dir=storybook-static",
+            "--exclude-dir=bower_components",
             "--",
             query,
             &root.to_string_lossy(),
@@ -835,105 +892,35 @@ fn parse_search_line(line: &str, relative_root: Option<&PathBuf>) -> Option<Sear
 
 // ── File search worker (runs on a background std::thread) ──
 
-fn file_search_worker(
-    query: &str,
-    root: &PathBuf,
-    tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
-) {
-    use std::io::BufRead;
+// ── File index builder (uses the `ignore` crate — same engine as ripgrep) ──
 
-    let mut child = if let Some(c) = spawn_fd(query, root) {
-        c
-    } else if let Some(c) = spawn_find_files(query, root) {
-        c
-    } else {
-        return;
-    };
+/// Walk the directory tree once, respecting .gitignore, and return all
+/// relative file paths as strings. This runs on a background thread.
+fn build_file_index(root: &PathBuf) -> Vec<String> {
+    use ignore::WalkBuilder;
 
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => return,
-    };
+    let mut files = Vec::new();
+    let walker = WalkBuilder::new(root)
+        .hidden(true)         // skip hidden files by default
+        .git_ignore(true)     // respect .gitignore
+        .git_global(true)     // respect global gitignore
+        .git_exclude(true)    // respect .git/info/exclude
+        .follow_links(false)
+        .build();
 
-    let reader = std::io::BufReader::new(stdout);
-    let mut batch = Vec::new();
-    let mut count = 0usize;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
             Err(_) => continue,
         };
-        let line = line.trim_start_matches("./");
-        if line.is_empty() {
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
             continue;
         }
-        batch.push(root.join(line));
-        count += 1;
-        if batch.len() >= 20 {
-            if tx.send(std::mem::take(&mut batch)).is_err() {
-                break;
-            }
-        }
-        if count >= 1000 {
-            break;
+        if let Ok(rel) = entry.path().strip_prefix(root) {
+            files.push(rel.to_string_lossy().to_string());
         }
     }
-
-    if !batch.is_empty() {
-        let _ = tx.send(batch);
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn spawn_fd(query: &str, root: &PathBuf) -> Option<std::process::Child> {
-    std::process::Command::new("fd")
-        .args([
-            "--type",
-            "f",
-            "--color",
-            "never",
-            "--fixed-strings",
-            query,
-        ])
-        .current_dir(root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()
-}
-
-fn spawn_find_files(query: &str, root: &PathBuf) -> Option<std::process::Child> {
-    std::process::Command::new("find")
-        .args([
-            ".",
-            "-type",
-            "f",
-            "-not",
-            "-path",
-            "*/.git/*",
-            "-not",
-            "-path",
-            "*/node_modules/*",
-            "-not",
-            "-path",
-            "*/target/*",
-            "-not",
-            "-path",
-            "*/__pycache__/*",
-            "-not",
-            "-path",
-            "*/.build/*",
-            "-iname",
-            &format!("*{}*", query),
-        ])
-        .current_dir(root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()
+    files
 }
 
 fn extract_repo_name(url: &str) -> String {

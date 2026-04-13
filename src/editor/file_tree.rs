@@ -27,6 +27,31 @@ const IGNORED_NAMES: &[&str] = &[
     ".DS_Store",
     "__pycache__",
     ".build",
+    // Python
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    ".ruff_cache",
+    ".eggs",
+    // JS/TS
+    ".next",
+    "dist",
+    "build",
+    ".turbo",
+    ".cache",
+    ".parcel-cache",
+    "coverage",
+    ".nyc_output",
+    ".svelte-kit",
+    ".nuxt",
+    ".output",
+    ".angular",
+    "storybook-static",
+    "bower_components",
+    // Misc
+    "vendor",
 ];
 
 impl FileTree {

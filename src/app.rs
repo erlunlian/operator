@@ -477,7 +477,20 @@ impl OperatorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_right_panel_tab(RightPanelTab::Git, cx);
+        if self.right_panel_collapsed {
+            self.show_right_panel_tab(RightPanelTab::Git, cx);
+        } else {
+            let current = self.right_panel.read(cx).active_tab;
+            match current {
+                RightPanelTab::Git => self.show_right_panel_tab(RightPanelTab::Pr, cx),
+                RightPanelTab::Pr => {
+                    self.right_panel_collapsed = true;
+                    self.focus_region = FocusRegion::Center;
+                    cx.notify();
+                }
+                _ => self.show_right_panel_tab(RightPanelTab::Git, cx),
+            }
+        }
     }
 
     fn toggle_files_panel(

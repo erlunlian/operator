@@ -18,5 +18,6 @@ actions!(
         ToggleCommandCenter,
         FindInFile,
         SearchWorkspace,
+        Quit,
     ]
 );

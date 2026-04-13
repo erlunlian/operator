@@ -81,6 +81,14 @@ pub struct GitDiffPanel {
     _copied_timer: Option<Task<()>>,
     /// Index to scroll to after next render.
     scroll_to_file: Option<usize>,
+    /// When set, shows a confirmation dialog before reverting.
+    pending_revert: Option<RevertTarget>,
+}
+
+#[derive(Clone, Copy)]
+enum RevertTarget {
+    Single(usize),
+    All,
 }
 
 impl std::hash::Hash for DiffSection {
@@ -111,6 +119,7 @@ impl GitDiffPanel {
             copied_file_key: None,
             _copied_timer: None,
             scroll_to_file: None,
+            pending_revert: None,
         }
     }
 
@@ -156,6 +165,7 @@ impl GitDiffPanel {
             copied_file_key: None,
             _copied_timer: None,
             scroll_to_file: None,
+            pending_revert: None,
         }
     }
 
@@ -198,10 +208,45 @@ impl GitDiffPanel {
         if let Some(repo) = &self.repo {
             if let Some(file) = self.unstaged_files.get(file_idx) {
                 let path = file.path.clone();
-                if repo.revert_file(&path).is_ok() {
+                let status = file.status.clone();
+                if repo.revert_file(&path, &status).is_ok() {
                     self.refresh();
                 }
             }
+        }
+    }
+
+    fn revert_all_files(&mut self) {
+        if let Some(repo) = &self.repo {
+            let files: Vec<_> = self
+                .unstaged_files
+                .iter()
+                .map(|f| (f.path.clone(), f.status.clone()))
+                .collect();
+            for (path, status) in &files {
+                let _ = repo.revert_file(path, status);
+            }
+            self.refresh();
+        }
+    }
+
+    fn stage_all_files(&mut self) {
+        if let Some(repo) = &self.repo {
+            let paths: Vec<_> = self.unstaged_files.iter().map(|f| f.path.clone()).collect();
+            for path in &paths {
+                let _ = repo.stage_file(path);
+            }
+            self.refresh();
+        }
+    }
+
+    fn unstage_all_files(&mut self) {
+        if let Some(repo) = &self.repo {
+            let paths: Vec<_> = self.staged_files.iter().map(|f| f.path.clone()).collect();
+            for path in &paths {
+                let _ = repo.unstage_file(path);
+            }
+            self.refresh();
         }
     }
 
@@ -273,11 +318,13 @@ impl GitDiffPanel {
             DiffSection::Unstaged => "tree-section-unstaged",
         };
 
-        div()
+        let mut header = div()
             .id(ElementId::Name(id_str.into()))
+            .group("section-header")
             .flex()
             .flex_row()
             .items_center()
+            .justify_between()
             .w_full()
             .h(px(28.0))
             .px_2()
@@ -288,12 +335,10 @@ impl GitDiffPanel {
             .hover(|s| s.bg(colors::surface_hover()))
             .on_click(move |_, _window, cx| {
                 entity.update(cx, |panel, cx| {
-                    // Toggle collapsed state of the section header
                     match section {
                         DiffSection::Staged => panel.staged_tree_collapsed = !panel.staged_tree_collapsed,
                         DiffSection::Unstaged => panel.unstaged_tree_collapsed = !panel.unstaged_tree_collapsed,
                     }
-                    // Also switch active section to this one (so diffs update)
                     if count > 0 {
                         panel.active_section = section;
                         panel.expanded_context.clear();
@@ -303,19 +348,81 @@ impl GitDiffPanel {
             })
             .child(
                 div()
-                    .text_size(px(8.0))
-                    .text_color(colors::text_muted())
-                    .w(px(10.0))
-                    .child(chevron.to_string()),
-            )
-            .child(
-                div()
-                    .ml_1()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors::text())
-                    .child(label),
-            )
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(colors::text_muted())
+                            .w(px(10.0))
+                            .child(chevron.to_string()),
+                    )
+                    .child(
+                        div()
+                            .ml_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors::text())
+                            .child(label),
+                    ),
+            );
+
+        // Bulk action buttons (shown on hover, only when section has files)
+        if count > 0 {
+            let mut actions = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .flex_shrink_0()
+                .opacity(0.0)
+                .group_hover("section-header", |s| s.opacity(1.0));
+
+            match section {
+                DiffSection::Unstaged => {
+                    let entity_revert_all = cx.entity().clone();
+                    actions = actions.child(
+                        action_btn("tree-revert-all".to_string(), "\u{21BA}")
+                            .on_click(move |_, _window, cx| {
+                                entity_revert_all.update(cx, |panel, cx| {
+                                    panel.pending_revert = Some(RevertTarget::All);
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            }),
+                    );
+                    let entity_stage_all = cx.entity().clone();
+                    actions = actions.child(
+                        action_btn("tree-stage-all".to_string(), "+")
+                            .on_click(move |_, _window, cx| {
+                                entity_stage_all.update(cx, |panel, cx| {
+                                    panel.stage_all_files();
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            }),
+                    );
+                }
+                DiffSection::Staged => {
+                    let entity_unstage_all = cx.entity().clone();
+                    actions = actions.child(
+                        action_btn("tree-unstage-all".to_string(), "\u{2212}")
+                            .on_click(move |_, _window, cx| {
+                                entity_unstage_all.update(cx, |panel, cx| {
+                                    panel.unstage_all_files();
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            }),
+                    );
+                }
+            }
+
+            header = header.child(actions);
+        }
+
+        header
     }
 
     fn render_tree_nodes(
@@ -418,13 +525,13 @@ impl GitDiffPanel {
 
                     match section {
                         DiffSection::Unstaged => {
-                            // Revert button
+                            // Revert button (shows confirmation dialog)
                             let entity_revert = cx.entity().clone();
                             actions = actions.child(
                                 action_btn(format!("tree-revert-{idx}"), "\u{21BA}")
                                     .on_click(move |_, _window, cx| {
                                         entity_revert.update(cx, |panel, cx| {
-                                            panel.revert_file(idx);
+                                            panel.pending_revert = Some(RevertTarget::Single(idx));
                                             cx.notify();
                                         });
                                         cx.stop_propagation();
@@ -697,7 +804,7 @@ impl GitDiffPanel {
                                 action_btn(format!("hdr-revert-{file_idx}"), "\u{21BA}")
                                     .on_click(move |_, _window, cx| {
                                         entity_revert.update(cx, |panel, cx| {
-                                            panel.revert_file(file_idx);
+                                            panel.pending_revert = Some(RevertTarget::Single(file_idx));
                                             cx.notify();
                                         });
                                         cx.stop_propagation();
@@ -735,8 +842,25 @@ impl GitDiffPanel {
 
         // Diff body — only when expanded
         if !is_collapsed {
-            let all_lines = self.flatten_file_lines(file, file_idx, section);
-            container = container.child(self.render_line_blocks(&all_lines, file_idx, section, cx));
+            if file.hunks.is_empty() {
+                container = container.child(
+                    div()
+                        .w_full()
+                        .px_3()
+                        .py_3()
+                        .bg(colors::surface())
+                        .border_1()
+                        .border_t_0()
+                        .border_color(colors::border())
+                        .rounded_b_md()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .child("This file has no content"),
+                );
+            } else {
+                let all_lines = self.flatten_file_lines(file, file_idx, section);
+                container = container.child(self.render_line_blocks(&all_lines, file_idx, section, cx));
+            }
         }
 
         container
@@ -1093,7 +1217,6 @@ impl Render for GitDiffPanel {
             .min_w(px(200.0))
             .h_full()
             .flex_shrink_0()
-            .pt(px(36.0))
             .bg(colors::surface())
             .border_l_1()
             .border_color(colors::border())
@@ -1259,6 +1382,131 @@ impl Render for GitDiffPanel {
 
         body = body.child(diff_content);
         panel = panel.child(body);
+
+        // ── Revert confirmation dialog ──
+        if let Some(revert_target) = self.pending_revert {
+            let (message, action_label) = match revert_target {
+                RevertTarget::Single(idx) => {
+                    if let Some(file) = self.unstaged_files.get(idx) {
+                        let name = file.path.rsplit('/').next().unwrap_or(&file.path).to_string();
+                        if matches!(file.status, FileStatus::Added) {
+                            (format!("Delete \"{name}\"? This file is untracked and will be permanently removed."), "Delete")
+                        } else {
+                            (format!("Revert \"{name}\"? All unsaved changes will be lost."), "Revert")
+                        }
+                    } else {
+                        ("Revert this file?".to_string(), "Revert")
+                    }
+                }
+                RevertTarget::All => {
+                    let count = self.unstaged_files.len();
+                    (format!("Revert all {count} unstaged files? All unsaved changes will be lost and untracked files will be deleted."), "Revert All")
+                }
+            };
+
+            let entity_confirm = cx.entity().clone();
+            let entity_cancel = cx.entity().clone();
+            let entity_backdrop = cx.entity().clone();
+
+            panel = panel.child(
+                div()
+                    .id("revert-confirm-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(0x00000088u32))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(move |_, _window, cx| {
+                        entity_backdrop.update(cx, |panel, cx| {
+                            panel.pending_revert = None;
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .id("revert-confirm-dialog")
+                            .w(px(320.0))
+                            .bg(colors::surface())
+                            .border_1()
+                            .border_color(colors::border())
+                            .rounded(px(8.0))
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .on_click(|_, _window, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors::text())
+                                    .child("Confirm"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors::text_muted())
+                                    .child(message),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("revert-cancel-btn")
+                                            .px_3()
+                                            .py(px(6.0))
+                                            .rounded(px(4.0))
+                                            .text_xs()
+                                            .text_color(colors::text_muted())
+                                            .bg(colors::surface_hover())
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(colors::text()))
+                                            .child("Cancel")
+                                            .on_click(move |_, _window, cx| {
+                                                entity_cancel.update(cx, |panel, cx| {
+                                                    panel.pending_revert = None;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("revert-confirm-btn")
+                                            .px_3()
+                                            .py(px(6.0))
+                                            .rounded(px(4.0))
+                                            .text_xs()
+                                            .text_color(gpui::rgb(0xffffff))
+                                            .bg(colors::diff_removed())
+                                            .cursor_pointer()
+                                            .hover(|s| s.opacity(0.8))
+                                            .child(action_label)
+                                            .on_click(move |_, _window, cx| {
+                                                entity_confirm.update(cx, |panel, cx| {
+                                                    if let Some(target) = panel.pending_revert.take() {
+                                                        match target {
+                                                            RevertTarget::Single(idx) => panel.revert_file(idx),
+                                                            RevertTarget::All => panel.revert_all_files(),
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    ),
+            );
+        }
+
         panel
     }
 }

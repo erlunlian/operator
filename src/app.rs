@@ -30,6 +30,8 @@ pub struct OperatorApp {
     pub window_bounds: Option<(f32, f32, f32, f32)>,
     /// Cached recent projects (avoid disk reads in render path).
     recent_projects: RecentProjects,
+    /// When true, shows a quit confirmation dialog.
+    quit_requested: bool,
 }
 
 impl OperatorApp {
@@ -66,6 +68,7 @@ impl OperatorApp {
             focus_handle: cx.focus_handle(),
             window_bounds: None,
             recent_projects: RecentProjects::load(),
+            quit_requested: false,
         }
     }
 
@@ -119,6 +122,7 @@ impl OperatorApp {
             focus_handle: cx.focus_handle(),
             window_bounds,
             recent_projects: RecentProjects::load(),
+            quit_requested: false,
         }
     }
 
@@ -375,6 +379,16 @@ impl OperatorApp {
         cx: &mut Context<Self>,
     ) {
         self.command_center.update(cx, |cc, cx| cc.toggle(cx));
+    }
+
+    fn request_quit(
+        &mut self,
+        _: &Quit,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quit_requested = true;
+        cx.notify();
     }
 
     fn search_workspace(
@@ -877,6 +891,7 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_command_center))
             .on_action(cx.listener(Self::new_editor_tab))
             .on_action(cx.listener(Self::search_workspace))
+            .on_action(cx.listener(Self::request_quit))
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 app_resize_move.update(cx, |app, cx| {
                     let x = f32::from(event.position.x);
@@ -915,7 +930,7 @@ impl Render for OperatorApp {
                 div()
                     .id("sidebar-resize-handle")
                     .w(px(12.0))
-                    .mx(px(-4.0))
+                    .mx(px(-6.0))
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
@@ -935,7 +950,6 @@ impl Render for OperatorApp {
                 .min_w(px(100.0))
                 .h_full()
                 .overflow_hidden()
-                .pt(px(36.0))
                 .child(center),
         );
         if let Some(dp) = diff_panel {
@@ -945,7 +959,7 @@ impl Render for OperatorApp {
                 div()
                     .id("diff-resize-handle")
                     .w(px(12.0))
-                    .mx(px(-4.0))
+                    .mx(px(-6.0))
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
@@ -962,6 +976,105 @@ impl Render for OperatorApp {
         // Command center overlay (always rendered on top)
         let cc = self.command_center.clone();
         root = root.child(cc);
+
+        // Quit confirmation dialog
+        if self.quit_requested {
+            let entity_confirm = cx.entity().clone();
+            let entity_cancel = cx.entity().clone();
+            let entity_backdrop = cx.entity().clone();
+
+            root = root.child(
+                div()
+                    .id("quit-confirm-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(0x00000088u32))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(move |_, _window, cx| {
+                        entity_backdrop.update(cx, |app, cx| {
+                            app.quit_requested = false;
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .id("quit-confirm-dialog")
+                            .w(px(320.0))
+                            .bg(colors::surface())
+                            .border_1()
+                            .border_color(colors::border())
+                            .rounded(px(8.0))
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .on_click(|_, _window, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors::text())
+                                    .child("Quit Operator?"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors::text_muted())
+                                    .child("Are you sure you want to quit? Your session will be saved."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("quit-cancel-btn")
+                                            .px_3()
+                                            .py(px(6.0))
+                                            .rounded(px(4.0))
+                                            .text_xs()
+                                            .text_color(colors::text_muted())
+                                            .bg(colors::surface_hover())
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(colors::text()))
+                                            .child("Cancel")
+                                            .on_click(move |_, _window, cx| {
+                                                entity_cancel.update(cx, |app, cx| {
+                                                    app.quit_requested = false;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("quit-confirm-btn")
+                                            .px_3()
+                                            .py(px(6.0))
+                                            .rounded(px(4.0))
+                                            .text_xs()
+                                            .text_color(rgb(0xffffff))
+                                            .bg(colors::diff_removed())
+                                            .cursor_pointer()
+                                            .hover(|s| s.opacity(0.8))
+                                            .child("Quit")
+                                            .on_click(move |_, _window, cx| {
+                                                entity_confirm.update(cx, |_app, cx| {
+                                                    cx.quit();
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    ),
+            );
+        }
 
         root
     }

@@ -72,7 +72,9 @@ fn main() {
             KeyBinding::new("cmd-,", ToggleSettings, None),
             KeyBinding::new("cmd-k", ToggleCommandCenter, None),
             KeyBinding::new("cmd-w", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
+            KeyBinding::new("cmd-q", Quit, None),
         ]);
+
 
         let saved = crate::session::load_session();
 

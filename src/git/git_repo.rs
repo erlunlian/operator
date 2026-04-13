@@ -87,14 +87,47 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Revert a file to index state (git checkout -- file).
-    pub fn revert_file(&self, path: &str) -> Result<(), git2::Error> {
-        self.repo.checkout_head(Some(
-            git2::build::CheckoutBuilder::new()
-                .force()
-                .path(path),
-        ))?;
-        Ok(())
+    /// Revert a file to HEAD state (git checkout -- file).
+    /// For untracked files, removes them from disk instead.
+    pub fn revert_file(&self, path: &str, status: &super::diff_model::FileStatus) -> Result<(), Box<dyn std::error::Error>> {
+        match status {
+            super::diff_model::FileStatus::Added => {
+                // Untracked / newly added file — delete from disk
+                if let Some(workdir) = self.repo.workdir() {
+                    let full_path = workdir.join(path);
+                    if full_path.is_file() {
+                        std::fs::remove_file(&full_path)?;
+                    } else if full_path.is_dir() {
+                        std::fs::remove_dir_all(&full_path)?;
+                    }
+                    // Clean up empty parent directories
+                    let mut parent = full_path.parent();
+                    while let Some(dir) = parent {
+                        if let Some(workdir) = self.repo.workdir() {
+                            if dir == workdir {
+                                break;
+                            }
+                        }
+                        if dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(false) {
+                            let _ = std::fs::remove_dir(dir);
+                            parent = dir.parent();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                // Modified / deleted / renamed — checkout from HEAD
+                self.repo.checkout_head(Some(
+                    git2::build::CheckoutBuilder::new()
+                        .force()
+                        .path(path),
+                ))?;
+                Ok(())
+            }
+        }
     }
 
     fn extract_files(diff: &Diff) -> Vec<DiffFile> {

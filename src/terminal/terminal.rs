@@ -79,6 +79,8 @@ pub struct TerminalModel {
     event_loop_sender: EventLoopSender,
     _listener: JsonListener,
     pub claude_status: Arc<std::sync::Mutex<DetectedClaudeStatus>>,
+    /// True when Claude finished responding but the user hasn't focused this tab yet.
+    has_unread_response: Arc<std::sync::Mutex<bool>>,
     /// Pending PTY resize, debounced to avoid SIGWINCH storms during interactive split resizing.
     /// Tuple: (rows, cols, timestamp of last change).
     pending_pty_resize: Arc<std::sync::Mutex<Option<(u16, u16, std::time::Instant)>>>,
@@ -141,6 +143,7 @@ impl TerminalModel {
         let _join_handle = event_loop.spawn();
 
         let claude_status = Arc::new(std::sync::Mutex::new(DetectedClaudeStatus::NotRunning));
+        let has_unread_response = Arc::new(std::sync::Mutex::new(false));
         let pending_pty_resize: Arc<std::sync::Mutex<Option<(u16, u16, std::time::Instant)>>> =
             Arc::new(std::sync::Mutex::new(None));
 
@@ -148,11 +151,13 @@ impl TerminalModel {
         let term_clone = term.clone();
         let listener_clone = listener.clone();
         let claude_status_clone = claude_status.clone();
+        let unread_clone = has_unread_response.clone();
         let pending_resize_clone = pending_pty_resize.clone();
         let sender_clone = event_loop_sender.clone();
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx| {
             let mut last_content_hash: u64 = 0;
+            let mut prev_claude_status = DetectedClaudeStatus::NotRunning;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(16))
@@ -197,14 +202,8 @@ impl TerminalModel {
                     });
                 }
 
-                // Process events from terminal
-                let events = listener_clone.take_events();
-                let has_events = !events.is_empty();
-
-                // Skip expensive work when terminal is idle
-                if !has_events {
-                    continue;
-                }
+                // Drain events from terminal listener to keep buffer clear
+                let _ = listener_clone.take_events();
 
                 // Compute a hash of visible terminal content to detect changes
                 let content_changed;
@@ -242,6 +241,20 @@ impl TerminalModel {
                     }
                     detect_claude_state(&bottom_lines, &claude_status_clone);
 
+                    // Track state transitions for unread response tracking
+                    {
+                        let new_status = claude_status_clone.lock().unwrap().clone();
+                        if prev_claude_status == DetectedClaudeStatus::Working
+                            && new_status == DetectedClaudeStatus::WaitingForInput
+                        {
+                            *unread_clone.lock().unwrap() = true;
+                        }
+                        if new_status == DetectedClaudeStatus::Working {
+                            *unread_clone.lock().unwrap() = false;
+                        }
+                        prev_claude_status = new_status;
+                    }
+
                     let new_hash = hasher.finish();
                     content_changed = new_hash != last_content_hash;
                     last_content_hash = new_hash;
@@ -268,6 +281,7 @@ impl TerminalModel {
             event_loop_sender,
             _listener: listener,
             claude_status,
+            has_unread_response,
             pending_pty_resize,
         }
     }
@@ -289,8 +303,25 @@ impl TerminalModel {
         *self.pending_pty_resize.lock().unwrap() = Some((rows, cols, std::time::Instant::now()));
     }
 
+    /// Returns the display-ready status, factoring in whether the user has read the response.
     pub fn get_claude_status(&self) -> DetectedClaudeStatus {
-        self.claude_status.lock().unwrap().clone()
+        let raw = self.claude_status.lock().unwrap().clone();
+        match raw {
+            DetectedClaudeStatus::Working => DetectedClaudeStatus::Working,
+            DetectedClaudeStatus::WaitingForInput => {
+                if *self.has_unread_response.lock().unwrap() {
+                    DetectedClaudeStatus::WaitingForInput
+                } else {
+                    DetectedClaudeStatus::NotRunning
+                }
+            }
+            DetectedClaudeStatus::NotRunning => DetectedClaudeStatus::NotRunning,
+        }
+    }
+
+    /// Clear the unread flag — called when the user focuses on this terminal's tab.
+    pub fn mark_claude_as_read(&self) {
+        *self.has_unread_response.lock().unwrap() = false;
     }
 }
 
@@ -300,7 +331,7 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
     }
 
     let mut found_shell_prompt = false;
-    let mut found_claude_prompt = false;
+    let mut found_claude_running = false; // Claude Code status bar is visible
     let mut found_working = false;
 
     for line in bottom_lines {
@@ -309,25 +340,23 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
             continue;
         }
 
-        // Claude Code input prompt: just ">" on its own
-        if trimmed == ">" {
-            found_claude_prompt = true;
+        // ── Working indicators ──
+
+        // Claude Code thinking label: "Infusing…", "Tomfoolering…", etc.
+        // Always a single word ending in "ing" + ellipsis.
+        if trimmed.ends_with("ing\u{2026}") || trimmed.ends_with("ing...") {
+            found_working = true;
             continue;
         }
 
-        // Shell prompt detection (zsh %, bash $, fish ❯)
-        // Only match if it looks like a prompt line, not Claude output
-        if !trimmed.contains("claude") && !trimmed.contains("Read(") && !trimmed.contains("Edit(") {
-            if trimmed.ends_with('%') || trimmed.ends_with("$ ")
-                || trimmed.ends_with('$') || trimmed.ends_with("% ")
-                || trimmed.ends_with("❯")
-            {
-                found_shell_prompt = true;
-                continue;
-            }
+        // "esc to interrupt" only appears in the status bar during active work
+        if trimmed.contains("esc to interrupt") {
+            found_working = true;
+            found_claude_running = true;
+            continue;
         }
 
-        // Tool call patterns and working indicators
+        // Tool call patterns visible on screen
         if trimmed.contains("Read(")
             || trimmed.contains("Edit(")
             || trimmed.contains("Write(")
@@ -336,27 +365,42 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
             || trimmed.contains("Grep(")
             || trimmed.contains("Glob(")
             || trimmed.contains("Skill(")
-            || trimmed.contains("WebSearch(")
-            || trimmed.contains("WebFetch(")
-            || trimmed.contains("TaskCreate(")
-            || trimmed.contains("TaskUpdate(")
             || trimmed.contains("Cooked for")
             || trimmed.contains("Compiling")
         {
             found_working = true;
+            continue;
+        }
+
+        // ── Claude running (but idle) indicators ──
+
+        // Status bar mode text — present whenever Claude Code is running
+        if trimmed.contains("auto mode on")
+            || trimmed.contains("plan mode")
+            || trimmed.contains("shift+tab to cycle")
+        {
+            found_claude_running = true;
+            continue;
+        }
+
+        // ── Shell prompt detection ──
+        if trimmed.ends_with('%') || trimmed.ends_with("$ ")
+            || trimmed.ends_with('$') || trimmed.ends_with("% ")
+        {
+            found_shell_prompt = true;
         }
     }
 
     let mut s = status.lock().unwrap();
 
-    if found_shell_prompt && !found_claude_prompt && !found_working {
-        *s = DetectedClaudeStatus::NotRunning;
-    } else if found_claude_prompt {
-        *s = DetectedClaudeStatus::WaitingForInput;
-    } else if found_working {
+    if found_working {
         *s = DetectedClaudeStatus::Working;
+    } else if found_claude_running {
+        *s = DetectedClaudeStatus::WaitingForInput;
+    } else if found_shell_prompt {
+        *s = DetectedClaudeStatus::NotRunning;
     }
-    // Otherwise keep current state — don't change on ambiguous content
+    // Otherwise keep current state
 }
 
 // ── Color conversion ──

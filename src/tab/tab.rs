@@ -82,6 +82,13 @@ impl Tab {
         }
     }
 
+    pub fn mark_claude_as_read(&self, cx: &App) {
+        if let TabContent::Terminal(terminal_view) = &self.content {
+            let view = terminal_view.read(cx);
+            view.terminal.read(cx).mark_claude_as_read();
+        }
+    }
+
     pub fn render_content(&self) -> AnyElement {
         match &self.content {
             TabContent::Terminal(terminal_view) => {

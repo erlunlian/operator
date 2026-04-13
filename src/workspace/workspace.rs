@@ -33,7 +33,8 @@ pub struct Workspace {
     pub name: SharedString,
     pub directory: Option<PathBuf>,
     pub git_branch: Option<String>,
-    pub claude_status: ClaudeStatus,
+    /// Per-pane Claude statuses (only non-idle entries are stored).
+    pub pane_statuses: Vec<ClaudeStatus>,
     pub layout: Option<Entity<PaneGroup>>,
     /// Editor files cached when switching away from this workspace.
     pub cached_editor_files: Vec<PathBuf>,
@@ -57,7 +58,7 @@ impl Workspace {
             name: SharedString::from(name.to_string()),
             directory: Some(directory),
             git_branch,
-            claude_status: ClaudeStatus::Idle,
+            pane_statuses: Vec::new(),
             layout: Some(layout),
             cached_editor_files: Vec::new(),
             cached_right_panel_tab: None,
@@ -74,7 +75,7 @@ impl Workspace {
             name: SharedString::from("New Workspace".to_string()),
             directory: None,
             git_branch: None,
-            claude_status: ClaudeStatus::Idle,
+            pane_statuses: Vec::new(),
             layout: None,
             cached_editor_files: Vec::new(),
             cached_right_panel_tab: None,
@@ -135,10 +136,10 @@ impl Workspace {
         }
     }
 
-    pub fn refresh_claude_status(&mut self, cx: &App) {
+    pub fn refresh_claude_status(&mut self, is_active_workspace: bool, cx: &App) {
         if let Some(layout) = &self.layout {
             let layout = layout.read(cx);
-            self.claude_status = layout.get_claude_status(cx);
+            self.pane_statuses = layout.collect_pane_statuses(is_active_workspace, cx);
         }
     }
 

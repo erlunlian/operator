@@ -24,7 +24,6 @@ release:
 # Copy to /Applications
 install: release
 	cp -r target/release/Operator.app /Applications/
-	@echo "Installed to /Applications/Operator.app"
 
 # Open the built .app (-n forces new instance even if already running)
 open: release

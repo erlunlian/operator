@@ -286,7 +286,6 @@ impl Render for EditorView {
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
-                    .hover(|s| s.bg(gpui::rgba(0x89b4fa22)))
                     .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                         entity_resize_down.update(cx, |view, cx| {
                             view.resizing_tree = true;

@@ -65,15 +65,13 @@ impl WorkspaceSidebar {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .mx_2()
-                .mb_2()
+                .w_full()
                 .px_3()
                 .py_2()
-                .rounded_md()
-                .border_1()
+                .mb_1()
+                .border_t_1()
                 .border_color(colors::border())
                 .cursor_pointer()
-                .hover(|s| s.bg(colors::surface_hover()))
                 .child(
                     div()
                         .text_sm()
@@ -132,16 +130,13 @@ impl WorkspaceSidebar {
             .flex()
             .flex_row()
             .gap_2()
-            .mx_2()
-            .my(px(1.0))
+            .w_full()
             .px_3()
             .py_2()
-            .rounded_md()
             .bg(active_bg)
             .border_l_2()
             .border_color(active_border)
-            .cursor_pointer()
-            .hover(|s| s.bg(colors::surface_hover()));
+            .cursor_pointer();
 
         // Status dot
         card = card.child(

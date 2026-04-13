@@ -20,10 +20,16 @@ pub struct SettingsState {
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     pub diff_panel_collapsed: bool,
+    #[serde(default = "default_diff_panel_width")]
+    pub diff_panel_width: f32,
     pub window_x: Option<f32>,
     pub window_y: Option<f32>,
     pub window_width: Option<f32>,
     pub window_height: Option<f32>,
+}
+
+fn default_diff_panel_width() -> f32 {
+    360.0
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -99,6 +105,7 @@ impl SessionState {
                 sidebar_collapsed: app.sidebar_collapsed,
                 sidebar_width: app.sidebar_width,
                 diff_panel_collapsed: app.diff_panel_collapsed,
+                diff_panel_width: app.diff_panel.read(cx).width,
                 window_x: app.window_bounds.map(|b| b.0),
                 window_y: app.window_bounds.map(|b| b.1),
                 window_width: app.window_bounds.map(|b| b.2),
@@ -234,7 +241,12 @@ impl SessionState {
             .min(workspaces.len().saturating_sub(1));
 
         let work_dir = std::env::current_dir().unwrap_or_default();
-        let diff_panel = cx.new(|_cx| crate::git::GitDiffPanel::new(work_dir));
+        let diff_panel_width = self.settings.diff_panel_width;
+        let diff_panel = cx.new(|_cx| {
+            let mut panel = crate::git::GitDiffPanel::new(work_dir);
+            panel.width = diff_panel_width;
+            panel
+        });
         let settings_panel = cx.new(|cx| crate::settings::settings_panel::SettingsPanel::new(cx));
 
         crate::app::OperatorApp::from_restored(

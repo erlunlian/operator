@@ -19,6 +19,7 @@ pub struct OperatorApp {
     resizing_sidebar: bool,
     pub diff_panel_collapsed: bool,
     pub diff_panel: Entity<GitDiffPanel>,
+    resizing_diff_panel: bool,
     pub settings_panel_open: bool,
     pub settings_panel: Entity<SettingsPanel>,
     pub command_center: Entity<CommandCenter>,
@@ -46,6 +47,7 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
+        Self::start_diff_watcher(diff_panel.clone(), cx);
 
         Self {
             workspaces: vec![ws],
@@ -55,6 +57,7 @@ impl OperatorApp {
             resizing_sidebar: false,
             diff_panel_collapsed: false,
             diff_panel,
+            resizing_diff_panel: false,
             settings_panel_open: false,
             settings_panel,
             command_center,
@@ -96,6 +99,7 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
+        Self::start_diff_watcher(diff_panel.clone(), cx);
 
         Self {
             workspaces,
@@ -105,6 +109,7 @@ impl OperatorApp {
             resizing_sidebar: false,
             diff_panel_collapsed,
             diff_panel,
+            resizing_diff_panel: false,
             settings_panel_open: false,
             settings_panel,
             command_center,
@@ -137,6 +142,83 @@ impl OperatorApp {
                     })
                     .unwrap_or(false);
                 if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) {
+        // Get the .git directory to watch
+        let git_dir = diff_panel.read(cx).git_dir();
+        let Some(git_dir) = git_dir else { return };
+
+        // Create a channel-based file watcher using the `notify` crate.
+        // We watch the .git dir for changes to index, HEAD, refs, etc.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    // Only care about writes/creates/removes
+                    use notify::EventKind;
+                    match event.kind {
+                        EventKind::Create(_)
+                        | EventKind::Modify(_)
+                        | EventKind::Remove(_) => {
+                            let _ = tx.send(());
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        ) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+
+        // Watch the .git directory (index, HEAD, refs changes)
+        use notify::Watcher;
+        let _ = watcher.watch(&git_dir, notify::RecursiveMode::Recursive);
+
+        // Spawn a background thread that blocks on the watcher channel,
+        // then pokes the UI when something changes.
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        cx.spawn(async move |_app, cx| {
+            // Keep the watcher alive for the lifetime of this task
+            let _watcher = watcher;
+            loop {
+                let rx = rx.clone();
+                let got_event = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let rx = rx.lock().unwrap();
+                        // Wait for first event (blocking)
+                        if rx.recv().is_err() {
+                            return false;
+                        }
+                        // Drain any queued events to coalesce
+                        while rx.try_recv().is_ok() {}
+                        true
+                    })
+                    .await;
+
+                if !got_event {
+                    break;
+                }
+
+                // Small debounce so rapid FS events don't cause excessive refreshes
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+
+                let ok = cx.update(|cx| {
+                    diff_panel.update(cx, |panel, cx| {
+                        panel.refresh();
+                        cx.notify();
+                    })
+                });
+                if ok.is_err() {
                     break;
                 }
             }
@@ -752,19 +834,30 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_command_center))
             .on_action(cx.listener(Self::new_editor_tab))
             .on_action(cx.listener(Self::search_workspace))
-            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
+            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 app_resize_move.update(cx, |app, cx| {
+                    let x = f32::from(event.position.x);
                     if app.resizing_sidebar {
-                        let new_width = f32::from(event.position.x);
-                        app.sidebar_width = new_width.clamp(120.0, 500.0);
+                        app.sidebar_width = x.clamp(120.0, 500.0);
+                        cx.notify();
+                    }
+                    if app.resizing_diff_panel {
+                        // Diff panel is on the right: width = window_width - mouse_x
+                        let window_width = f32::from(window.bounds().size.width);
+                        let new_width = (window_width - x).clamp(200.0, window_width - 100.0);
+                        app.diff_panel.update(cx, |panel, cx| {
+                            panel.width = new_width;
+                            cx.notify();
+                        });
                         cx.notify();
                     }
                 });
             })
             .on_mouse_up(MouseButton::Left, move |_event: &MouseUpEvent, _window, cx| {
                 app_resize_up.update(cx, |app, cx| {
-                    if app.resizing_sidebar {
+                    if app.resizing_sidebar || app.resizing_diff_panel {
                         app.resizing_sidebar = false;
+                        app.resizing_diff_panel = false;
                         cx.notify();
                     }
                 });
@@ -783,7 +876,6 @@ impl Render for OperatorApp {
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
-                    .hover(|s| s.bg(gpui::rgba(0x89b4fa22)))
                     .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                         app_resize_down.update(cx, |app, cx| {
                             app.resizing_sidebar = true;
@@ -796,12 +888,29 @@ impl Render for OperatorApp {
             div()
                 .flex()
                 .flex_1()
-                .min_w(px(200.0))
+                .min_w(px(100.0))
                 .h_full()
                 .overflow_hidden()
                 .child(center),
         );
         if let Some(dp) = diff_panel {
+            // Resize handle for diff panel (on its left edge)
+            let app_resize_diff = cx.entity().clone();
+            root = root.child(
+                div()
+                    .id("diff-resize-handle")
+                    .w(px(12.0))
+                    .mx(px(-4.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor_col_resize()
+                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                        app_resize_diff.update(cx, |app, cx| {
+                            app.resizing_diff_panel = true;
+                            cx.notify();
+                        });
+                    }),
+            );
             root = root.child(dp);
         }
 

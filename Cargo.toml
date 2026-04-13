@@ -19,9 +19,10 @@ dirs = "6"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+notify = "7"
 
 [profile.dev]
-opt-level = 0
+opt-level = 1       # basic optimization for smooth UI (0 is noticeably laggy)
 debug = 0           # skip DWARF — big speed win
 split-debuginfo = "unpacked"
 

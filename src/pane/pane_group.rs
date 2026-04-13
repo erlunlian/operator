@@ -462,6 +462,14 @@ impl PaneGroup {
                 editor.update(cx, |editor, cx| {
                     editor.close_file(ix, cx);
                 });
+                // If that was the last open file, close the editor tab too
+                if editor.read(cx).open_files.is_empty() {
+                    close_tab_in_focused_group(&mut self.root, group_id);
+                    prune_empty_leaves(&mut self.root);
+                    if find_group_mut(&mut self.root, group_id).is_none() {
+                        self.focused_group_id = first_group_id(&self.root);
+                    }
+                }
                 return true;
             }
         }

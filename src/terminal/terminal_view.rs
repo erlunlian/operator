@@ -9,9 +9,14 @@ use alacritty_terminal::term::Term;
 use crate::terminal::terminal::{alac_color_to_gpui, JsonListener, TerminalModel};
 use crate::theme::colors;
 
+const CELL_WIDTH_PX: f32 = 8.0;
+const CELL_HEIGHT_PX: f32 = 18.0;
+const PADDING_PX: f32 = 8.0; // p_2 = 0.5rem = 8px
+
 pub struct TerminalView {
     pub terminal: Entity<TerminalModel>,
     focus_handle: FocusHandle,
+    last_size: Arc<std::sync::Mutex<Option<(u16, u16)>>>,
 }
 
 impl TerminalView {
@@ -21,6 +26,7 @@ impl TerminalView {
         Self {
             terminal,
             focus_handle: cx.focus_handle(),
+            last_size: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -125,8 +131,33 @@ impl Render for TerminalView {
         let terminal = self.terminal.read(cx);
         let term = terminal.term.clone();
 
+        // Resize detection: use a zero-size canvas overlay to measure bounds
+        let terminal_entity = self.terminal.clone();
+        let last_size = self.last_size.clone();
+        let size_detector = canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
+                let w = bounds.size.width / px(1.0);
+                let h = bounds.size.height / px(1.0);
+                let cols = ((w - PADDING_PX * 2.0) / CELL_WIDTH_PX).max(1.0) as u16;
+                let rows = ((h - PADDING_PX * 2.0) / CELL_HEIGHT_PX).max(1.0) as u16;
+
+                let mut cached = last_size.lock().unwrap();
+                if *cached != Some((rows, cols)) {
+                    *cached = Some((rows, cols));
+                    let term = terminal_entity.read(cx);
+                    term.resize(rows, cols);
+                }
+            },
+            |_bounds, _state: (), _window, _cx| {},
+        )
+        .size_full()
+        .absolute()
+        .top_0()
+        .left_0();
+
         div()
             .id("terminal-view")
+            .relative()
             .flex()
             .flex_1()
             .size_full()
@@ -134,71 +165,99 @@ impl Render for TerminalView {
             .p_2()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
+            .child(size_detector)
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                let term = this.terminal.read(cx);
+                let lines = match event.delta {
+                    ScrollDelta::Lines(delta) => -delta.y as i32,
+                    ScrollDelta::Pixels(delta) => {
+                        let dy = delta.y / px(1.0);
+                        (-dy / CELL_HEIGHT_PX) as i32
+                    }
+                };
+                if lines > 0 {
+                    for _ in 0..lines.min(10) {
+                        term.write_to_pty(b"\x1b[A");
+                    }
+                } else if lines < 0 {
+                    for _ in 0..(-lines).min(10) {
+                        term.write_to_pty(b"\x1b[B");
+                    }
+                }
+            }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
                 let keystroke = &event.keystroke;
 
-                // Let Cmd+key pass through to app actions
+                // ── Cmd (platform) key combos ──
                 if keystroke.modifiers.platform {
+                    let term = this.terminal.read(cx);
+                    match keystroke.key.as_str() {
+                        // Cmd+V: paste with bracket paste mode
+                        "v" => {
+                            if let Some(clipboard) = cx.read_from_clipboard() {
+                                if let Some(text) = clipboard.text() {
+                                    if !text.is_empty() {
+                                        term.write_to_pty(b"\x1b[200~");
+                                        term.write_str_to_pty(&text);
+                                        term.write_to_pty(b"\x1b[201~");
+                                    }
+                                }
+                            }
+                        }
+                        // Cmd+Backspace: delete to beginning of line (Ctrl+U)
+                        "backspace" => { term.write_to_pty(b"\x15"); }
+                        // Cmd+Delete: delete to end of line (Ctrl+K)
+                        "delete" => { term.write_to_pty(b"\x0b"); }
+                        // Cmd+Left: move to beginning of line (Home)
+                        "left" => { term.write_to_pty(b"\x01"); }
+                        // Cmd+Right: move to end of line (End)
+                        "right" => { term.write_to_pty(b"\x05"); }
+                        // Let other Cmd+key pass through to app actions
+                        _ => { return; }
+                    }
                     return;
                 }
 
                 let term = this.terminal.read(cx);
 
-                // Handle special keys first
-                match keystroke.key.as_str() {
-                    "enter" => {
-                        term.write_to_pty(b"\r");
+                // ── Option (alt) key combos ──
+                if keystroke.modifiers.alt {
+                    match keystroke.key.as_str() {
+                        // Option+Backspace: delete word backward (ESC + DEL)
+                        "backspace" => { term.write_to_pty(b"\x1b\x7f"); return; }
+                        // Option+Delete: delete word forward (ESC + d)
+                        "delete" => { term.write_to_pty(b"\x1bd"); return; }
+                        // Option+Left: move word backward (ESC + b)
+                        "left" => { term.write_to_pty(b"\x1bb"); return; }
+                        // Option+Right: move word forward (ESC + f)
+                        "right" => { term.write_to_pty(b"\x1bf"); return; }
+                        _ => {}
+                    }
+                    // Generic Alt+key: send ESC prefix
+                    if let Some(key_char) = &keystroke.key_char {
+                        let mut seq = vec![0x1b_u8];
+                        seq.extend_from_slice(key_char.as_bytes());
+                        term.write_to_pty(&seq);
                         return;
                     }
-                    "backspace" => {
-                        term.write_to_pty(b"\x7f");
+                    let key = keystroke.key.as_str();
+                    if key.len() == 1 {
+                        let mut seq = vec![0x1b_u8];
+                        seq.extend_from_slice(key.as_bytes());
+                        term.write_to_pty(&seq);
                         return;
                     }
-                    "tab" => {
-                        term.write_to_pty(b"\t");
-                        return;
-                    }
-                    "escape" => {
-                        term.write_to_pty(b"\x1b");
-                        return;
-                    }
-                    "up" => {
-                        term.write_to_pty(b"\x1b[A");
-                        return;
-                    }
-                    "down" => {
-                        term.write_to_pty(b"\x1b[B");
-                        return;
-                    }
-                    "right" => {
-                        term.write_to_pty(b"\x1b[C");
-                        return;
-                    }
-                    "left" => {
-                        term.write_to_pty(b"\x1b[D");
-                        return;
-                    }
-                    "home" => {
-                        term.write_to_pty(b"\x1b[H");
-                        return;
-                    }
-                    "end" => {
-                        term.write_to_pty(b"\x1b[F");
-                        return;
-                    }
-                    "delete" => {
-                        term.write_to_pty(b"\x1b[3~");
-                        return;
-                    }
-                    "space" => {
-                        term.write_to_pty(b" ");
-                        return;
-                    }
-                    _ => {}
                 }
 
-                // Handle Ctrl+key
+                // ── Ctrl key combos ──
                 if keystroke.modifiers.control {
+                    match keystroke.key.as_str() {
+                        "left" => { term.write_to_pty(b"\x1b[1;5D"); return; }
+                        "right" => { term.write_to_pty(b"\x1b[1;5C"); return; }
+                        "up" => { term.write_to_pty(b"\x1b[1;5A"); return; }
+                        "down" => { term.write_to_pty(b"\x1b[1;5B"); return; }
+                        _ => {}
+                    }
                     let key = keystroke.key.as_str();
                     if key.len() == 1 {
                         let ch = key.chars().next().unwrap();
@@ -208,6 +267,46 @@ impl Render for TerminalView {
                             return;
                         }
                     }
+                }
+
+                // ── Shift key combos ──
+                if keystroke.modifiers.shift {
+                    match keystroke.key.as_str() {
+                        "tab" => { term.write_to_pty(b"\x1b[Z"); return; }
+                        _ => {}
+                    }
+                }
+
+                // ── Special keys (no modifiers) ──
+                match keystroke.key.as_str() {
+                    "enter" => { term.write_to_pty(b"\r"); return; }
+                    "backspace" => { term.write_to_pty(b"\x7f"); return; }
+                    "tab" => { term.write_to_pty(b"\t"); return; }
+                    "escape" => { term.write_to_pty(b"\x1b"); return; }
+                    "up" => { term.write_to_pty(b"\x1b[A"); return; }
+                    "down" => { term.write_to_pty(b"\x1b[B"); return; }
+                    "right" => { term.write_to_pty(b"\x1b[C"); return; }
+                    "left" => { term.write_to_pty(b"\x1b[D"); return; }
+                    "home" => { term.write_to_pty(b"\x1b[H"); return; }
+                    "end" => { term.write_to_pty(b"\x1b[F"); return; }
+                    "delete" => { term.write_to_pty(b"\x1b[3~"); return; }
+                    "space" => { term.write_to_pty(b" "); return; }
+                    "pageup" => { term.write_to_pty(b"\x1b[5~"); return; }
+                    "pagedown" => { term.write_to_pty(b"\x1b[6~"); return; }
+                    "insert" => { term.write_to_pty(b"\x1b[2~"); return; }
+                    "f1" => { term.write_to_pty(b"\x1bOP"); return; }
+                    "f2" => { term.write_to_pty(b"\x1bOQ"); return; }
+                    "f3" => { term.write_to_pty(b"\x1bOR"); return; }
+                    "f4" => { term.write_to_pty(b"\x1bOS"); return; }
+                    "f5" => { term.write_to_pty(b"\x1b[15~"); return; }
+                    "f6" => { term.write_to_pty(b"\x1b[17~"); return; }
+                    "f7" => { term.write_to_pty(b"\x1b[18~"); return; }
+                    "f8" => { term.write_to_pty(b"\x1b[19~"); return; }
+                    "f9" => { term.write_to_pty(b"\x1b[20~"); return; }
+                    "f10" => { term.write_to_pty(b"\x1b[21~"); return; }
+                    "f11" => { term.write_to_pty(b"\x1b[23~"); return; }
+                    "f12" => { term.write_to_pty(b"\x1b[24~"); return; }
+                    _ => {}
                 }
 
                 // Regular character input

@@ -163,44 +163,45 @@ impl TerminalModel {
                     continue;
                 }
 
-                // Compute a simple hash of visible terminal content to detect changes
-                let mut content_changed = true;
+                // Compute a hash of visible terminal content to detect changes
+                let content_changed;
                 {
                     let term = term_clone.lock();
                     let grid = term.grid();
                     let screen_lines = grid.screen_lines();
+                    let cols = grid.columns();
 
-                    // Fast content hash using cursor position + last few lines
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     let cursor = term.grid().cursor.point;
                     cursor.line.0.hash(&mut hasher);
                     cursor.column.0.hash(&mut hasher);
 
-                    // Hash last few visible lines for Claude status detection
+                    // Hash ALL visible lines for accurate change detection
                     let mut last_lines = String::new();
-                    for line_idx in (screen_lines.saturating_sub(5))..screen_lines {
+                    for line_idx in 0..screen_lines {
                         let row = &grid[alacritty_terminal::index::Line(line_idx as i32)];
                         let mut line_text = String::new();
-                        for col_idx in 0..grid.columns() {
+                        for col_idx in 0..cols {
                             let cell = &row[alacritty_terminal::index::Column(col_idx)];
+                            cell.c.hash(&mut hasher);
                             if cell.c != ' ' && cell.c != '\0' {
                                 line_text.push(cell.c);
                             }
-                            cell.c.hash(&mut hasher);
                         }
-                        let trimmed = line_text.trim();
-                        if !trimmed.is_empty() {
-                            last_lines = trimmed.to_string();
+                        // Claude status: track last non-empty line near bottom
+                        if line_idx >= screen_lines.saturating_sub(5) {
+                            let trimmed = line_text.trim();
+                            if !trimmed.is_empty() {
+                                last_lines = trimmed.to_string();
+                            }
                         }
                     }
                     detect_claude_state(&last_lines, &claude_status_clone);
 
                     let new_hash = hasher.finish();
-                    if new_hash != last_content_hash {
-                        content_changed = true;
-                        last_content_hash = new_hash;
-                    }
+                    content_changed = new_hash != last_content_hash;
+                    last_content_hash = new_hash;
                 }
 
                 // Only notify the UI when content actually changed
@@ -235,6 +236,21 @@ impl TerminalModel {
 
     pub fn write_str_to_pty(&self, text: &str) {
         self.write_to_pty(text.as_bytes());
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let dims = TermDimensions {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
+        self.term.lock().resize(dims);
+        let window_size = WindowSize {
+            num_lines: rows,
+            num_cols: cols,
+            cell_width: CELL_WIDTH,
+            cell_height: CELL_HEIGHT,
+        };
+        let _ = self.event_loop_sender.send(Msg::Resize(window_size));
     }
 
     pub fn get_claude_status(&self) -> DetectedClaudeStatus {

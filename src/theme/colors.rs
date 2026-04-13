@@ -317,12 +317,14 @@ pub const ALL_THEMES: &[Theme] = &[
     CATPPUCCIN_LATTE,
 ];
 
+pub const DEFAULT_THEME: Theme = GITHUB_DARK;
+
 // ── Active theme ──
 
 static ACTIVE_THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
 
 fn active() -> &'static RwLock<Theme> {
-    ACTIVE_THEME.get_or_init(|| RwLock::new(CATPPUCCIN_MOCHA))
+    ACTIVE_THEME.get_or_init(|| RwLock::new(DEFAULT_THEME))
 }
 
 pub fn current_theme() -> Theme {

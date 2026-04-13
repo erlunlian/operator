@@ -31,7 +31,7 @@ pub struct SettingsState {
 }
 
 fn default_theme() -> String {
-    "Catppuccin Mocha".to_string()
+    crate::theme::colors::DEFAULT_THEME.name.to_string()
 }
 
 fn default_diff_panel_width() -> f32 {

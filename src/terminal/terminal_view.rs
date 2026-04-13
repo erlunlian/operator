@@ -9,8 +9,34 @@ use alacritty_terminal::term::Term;
 use crate::terminal::terminal::{alac_color_to_gpui, JsonListener, TerminalModel};
 use crate::theme::colors;
 
+/// Save clipboard image bytes to a temp file and return the path.
+fn save_clipboard_image_to_temp(image: &Image) -> Option<String> {
+    let ext = match image.format() {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+    };
+    let dir = std::env::temp_dir().join("operator-images");
+    std::fs::create_dir_all(&dir).ok()?;
+    let filename = format!(
+        "paste-{}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        ext
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, image.bytes()).ok()?;
+    Some(path.to_string_lossy().to_string())
+}
+
 const CELL_WIDTH_PX: f32 = 8.0;
-const CELL_HEIGHT_PX: f32 = 18.0;
+const CELL_HEIGHT_PX: f32 = 16.0;
 const PADDING_PX: f32 = 8.0; // p_2 = 0.5rem = 8px
 
 pub struct TerminalView {
@@ -44,12 +70,12 @@ impl TerminalView {
             .flex_col()
             .font_family("Menlo")
             .text_size(px(13.0))
-            .line_height(px(18.0));
+            .line_height(px(16.0));
 
         for line_idx in 0..num_lines {
             let line = Line(line_idx as i32);
             let row = &grid[line];
-            let mut line_el = div().flex().flex_row().h(px(18.0));
+            let mut line_el = div().flex().flex_row().h(px(16.0));
 
             // Group cells into runs of same style
             let mut runs: Vec<(String, Rgba, Rgba, bool, bool)> = Vec::new();
@@ -192,14 +218,27 @@ impl Render for TerminalView {
                 if keystroke.modifiers.platform {
                     let term = this.terminal.read(cx);
                     match keystroke.key.as_str() {
-                        // Cmd+V: paste with bracket paste mode
+                        // Cmd+V: paste with bracket paste mode (text or image)
                         "v" => {
                             if let Some(clipboard) = cx.read_from_clipboard() {
+                                // Try text first
                                 if let Some(text) = clipboard.text() {
                                     if !text.is_empty() {
                                         term.write_to_pty(b"\x1b[200~");
                                         term.write_str_to_pty(&text);
                                         term.write_to_pty(b"\x1b[201~");
+                                        return;
+                                    }
+                                }
+                                // Fall back to image: save to temp file and paste path
+                                for entry in clipboard.entries() {
+                                    if let ClipboardEntry::Image(image) = entry {
+                                        if let Some(path) = save_clipboard_image_to_temp(image) {
+                                            term.write_to_pty(b"\x1b[200~");
+                                            term.write_str_to_pty(&path);
+                                            term.write_to_pty(b"\x1b[201~");
+                                            return;
+                                        }
                                     }
                                 }
                             }

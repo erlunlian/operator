@@ -21,10 +21,30 @@ use gpui::*;
 use crate::actions::*;
 use crate::app::OperatorApp;
 
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use cocoa::appkit::{NSApp, NSApplication, NSImage};
+    use cocoa::base::nil;
+    use cocoa::foundation::NSData;
+    use objc::runtime::Object;
+
+    unsafe {
+        let icon_data: &[u8] = include_bytes!("../resources/app_icon_dock.png");
+        let ns_data: *mut Object =
+            NSData::dataWithBytes_length_(nil, icon_data.as_ptr() as *const _, icon_data.len() as u64);
+        let ns_image: *mut Object = NSImage::initWithData_(NSImage::alloc(nil), ns_data);
+        let app = NSApp();
+        app.setApplicationIconImage_(ns_image);
+    }
+}
+
 fn main() {
     env_logger::init();
 
     Application::new().run(|cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
+
         // Load bundled icon font (Nerd Font Symbols)
         let icon_font = std::borrow::Cow::Borrowed(
             include_bytes!("../resources/icons.ttf").as_slice(),

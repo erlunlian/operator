@@ -16,7 +16,7 @@ impl AppSettings {
     pub fn init(cx: &mut App) {
         cx.set_global(AppSettings {
             vim_mode: false,
-            theme: colors::CATPPUCCIN_MOCHA.name.to_string(),
+            theme: colors::DEFAULT_THEME.name.to_string(),
         });
     }
 

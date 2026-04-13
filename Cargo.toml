@@ -21,6 +21,10 @@ log = "0.4"
 env_logger = "0.11"
 notify = "7"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
 [profile.dev]
 opt-level = 1       # basic optimization for smooth UI (0 is noticeably laggy)
 debug = 0           # skip DWARF — big speed win

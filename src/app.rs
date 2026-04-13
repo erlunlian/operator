@@ -1116,6 +1116,15 @@ impl OperatorApp {
 
 impl Render for OperatorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // When the command center closes, its TextInput's focus handle is
+        // orphaned (no longer in the rendered tree). Restore focus to the app
+        // root so global keybindings (Cmd+P, Cmd+K, etc.) keep working.
+        if !self.command_center.read(cx).visible
+            && !self.focus_handle.contains_focused(window, cx)
+        {
+            self.focus_handle.focus(window);
+        }
+
         // Cache window bounds for session persistence
         let bounds = window.bounds();
         self.window_bounds = Some((

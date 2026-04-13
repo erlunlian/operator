@@ -2,6 +2,7 @@ use gpui::*;
 
 use crate::settings::AppSettings;
 use crate::theme::colors;
+use crate::theme::colors::ALL_THEMES;
 
 actions!(settings_panel, [CloseSettingsWindow]);
 
@@ -25,6 +26,7 @@ impl Render for SettingsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vim_enabled = AppSettings::vim_mode(cx);
         let entity = cx.entity().clone();
+        let current_theme_name = AppSettings::get(cx).theme.clone();
 
         div()
             .id("settings-panel")
@@ -58,7 +60,9 @@ impl Render for SettingsPanel {
                     .flex()
                     .flex_col()
                     .p_4()
-                    .gap_4()
+                    .gap_6()
+                    // Theme selector
+                    .child(Self::render_theme_selector(&current_theme_name, entity.clone()))
                     // Vim Mode toggle
                     .child(Self::render_toggle(
                         "Vim Mode",
@@ -67,7 +71,7 @@ impl Render for SettingsPanel {
                         {
                             let entity = entity.clone();
                             move |_window, cx| {
-                                let _ = entity; // keep alive
+                                let _ = entity;
                                 cx.update_global::<AppSettings, _>(|settings, _cx| {
                                     settings.vim_mode = !settings.vim_mode;
                                 });
@@ -79,6 +83,114 @@ impl Render for SettingsPanel {
 }
 
 impl SettingsPanel {
+    fn render_theme_selector(
+        current_theme_name: &str,
+        entity: Entity<SettingsPanel>,
+    ) -> Div {
+        let mut container = div()
+            .flex()
+            .flex_col()
+            .gap_2();
+
+        // Label
+        container = container.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(colors::text())
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Theme"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .child("Choose a color theme for the editor"),
+                ),
+        );
+
+        // Theme grid
+        let mut grid = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2();
+
+        for theme in ALL_THEMES {
+            let is_active = theme.name == current_theme_name;
+            let entity = entity.clone();
+
+            let mut chip = div()
+                .id(ElementId::Name(format!("theme-{}", theme.name).into()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py(px(6.0))
+                .rounded_md()
+                .cursor_pointer()
+                .text_xs();
+
+            if is_active {
+                chip = chip
+                    .bg(colors::accent())
+                    .text_color(gpui::rgb(0x000000));
+            } else {
+                chip = chip
+                    .bg(colors::surface_hover())
+                    .text_color(colors::text())
+                    .hover(|s| s.bg(colors::border()));
+            }
+
+            // Color preview dots
+            let preview = div()
+                .flex()
+                .flex_row()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded(px(4.0))
+                        .bg(gpui::rgb(theme.bg)),
+                )
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded(px(4.0))
+                        .bg(gpui::rgb(theme.accent)),
+                )
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded(px(4.0))
+                        .bg(gpui::rgb(theme.syn_keyword)),
+                );
+
+            chip = chip
+                .child(preview)
+                .child(theme.name);
+
+            let theme_name = theme.name;
+            chip = chip.on_click(move |_, _window, cx| {
+                let _ = &entity;
+                AppSettings::set_theme(theme_name, cx);
+            });
+
+            grid = grid.child(chip);
+        }
+
+        container = container.child(grid);
+        container
+    }
+
     fn render_toggle(
         label: &str,
         description: &str,

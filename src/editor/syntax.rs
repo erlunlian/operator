@@ -1,4 +1,4 @@
-use gpui::{rgb, Rgba};
+use gpui::Rgba;
 use std::ops::Range;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -33,18 +33,18 @@ const HIGHLIGHT_NAMES: &[&str] = &[
 
 fn highlight_color(index: usize) -> Rgba {
     match HIGHLIGHT_NAMES.get(index).copied().unwrap_or("") {
-        "comment" => rgb(0x6c7086),
-        "keyword" => rgb(0xcba6f7),
-        "string" | "string.special" => rgb(0xa6e3a1),
-        "number" | "constant" | "constant.builtin" => rgb(0xfab387),
-        "function" | "function.builtin" | "function.macro" => rgb(0x89b4fa),
-        "type" | "type.builtin" | "constructor" => rgb(0xf9e2af),
-        "variable" | "variable.parameter" => rgb(0xcdd6f4),
-        "variable.builtin" => rgb(0xf38ba8),
-        "operator" => rgb(0x89dceb),
-        "punctuation" | "punctuation.bracket" | "punctuation.delimiter" => rgb(0x9399b2),
-        "property" | "label" => rgb(0x89b4fa),
-        "attribute" | "tag" => rgb(0xf5c2e7),
+        "comment" => colors::syn_comment(),
+        "keyword" => colors::syn_keyword(),
+        "string" | "string.special" => colors::syn_string(),
+        "number" | "constant" | "constant.builtin" => colors::syn_number(),
+        "function" | "function.builtin" | "function.macro" => colors::syn_function(),
+        "type" | "type.builtin" | "constructor" => colors::syn_type(),
+        "variable" | "variable.parameter" => colors::syn_variable(),
+        "variable.builtin" => colors::syn_variable_builtin(),
+        "operator" => colors::syn_operator(),
+        "punctuation" | "punctuation.bracket" | "punctuation.delimiter" => colors::syn_punctuation(),
+        "property" | "label" => colors::syn_property(),
+        "attribute" | "tag" => colors::syn_attribute(),
         _ => colors::text(),
     }
 }

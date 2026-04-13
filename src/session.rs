@@ -17,6 +17,8 @@ pub struct SessionState {
 #[derive(Serialize, Deserialize)]
 pub struct SettingsState {
     pub vim_mode: bool,
+    #[serde(default = "default_theme")]
+    pub theme: String,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     pub diff_panel_collapsed: bool,
@@ -26,6 +28,10 @@ pub struct SettingsState {
     pub window_y: Option<f32>,
     pub window_width: Option<f32>,
     pub window_height: Option<f32>,
+}
+
+fn default_theme() -> String {
+    "Catppuccin Mocha".to_string()
 }
 
 fn default_diff_panel_width() -> f32 {
@@ -102,6 +108,7 @@ impl SessionState {
             active_workspace_ix: app.active_workspace_ix,
             settings: SettingsState {
                 vim_mode: settings.vim_mode,
+                theme: settings.theme.clone(),
                 sidebar_collapsed: app.sidebar_collapsed,
                 sidebar_width: app.sidebar_width,
                 diff_panel_collapsed: app.diff_panel_collapsed,
@@ -176,8 +183,12 @@ impl SessionState {
     /// a `Context<OperatorApp>` (i.e., inside `cx.new(|cx| ...)`).
     pub fn restore(self, cx: &mut gpui::Context<crate::app::OperatorApp>) -> crate::app::OperatorApp {
         // Restore settings
+        let vim_mode = self.settings.vim_mode;
+        let theme_name = self.settings.theme.clone();
+        crate::theme::colors::set_theme_by_name(&theme_name);
         cx.update_global::<crate::settings::AppSettings, _>(|settings, _cx| {
-            settings.vim_mode = self.settings.vim_mode;
+            settings.vim_mode = vim_mode;
+            settings.theme = theme_name;
         });
 
         let sidebar_collapsed = self.settings.sidebar_collapsed;

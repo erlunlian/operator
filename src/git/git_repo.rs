@@ -1,4 +1,4 @@
-use git2::{Delta, Diff, DiffOptions, Repository};
+use git2::{BranchType, Delta, Diff, DiffOptions, Repository};
 use std::path::{Path, PathBuf};
 
 use super::diff_model::*;
@@ -121,6 +121,104 @@ impl GitRepo {
                 Ok(())
             }
         }
+    }
+
+    /// Diff current HEAD against merge-base with the given base ref.
+    /// This produces the same diff as a PR would show.
+    pub fn branch_diff(&self, base_ref: &str) -> Vec<DiffFile> {
+        let head_commit = match self.repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        // Resolve base ref: try local branch, remote tracking, then general revparse
+        let base_oid = self
+            .repo
+            .find_branch(base_ref, BranchType::Local)
+            .ok()
+            .and_then(|b| b.get().peel_to_commit().ok())
+            .map(|c| c.id())
+            .or_else(|| {
+                let remote_ref = format!("origin/{base_ref}");
+                self.repo
+                    .find_branch(&remote_ref, BranchType::Remote)
+                    .ok()
+                    .and_then(|b| b.get().peel_to_commit().ok())
+                    .map(|c| c.id())
+            })
+            .or_else(|| {
+                self.repo
+                    .revparse_single(base_ref)
+                    .ok()
+                    .and_then(|obj| obj.peel_to_commit().ok())
+                    .map(|c| c.id())
+            });
+
+        let base_oid = match base_oid {
+            Some(oid) => oid,
+            None => return Vec::new(),
+        };
+
+        let merge_base = match self.repo.merge_base(base_oid, head_commit.id()) {
+            Ok(oid) => oid,
+            Err(_) => return Vec::new(),
+        };
+
+        let base_tree = self
+            .repo
+            .find_commit(merge_base)
+            .ok()
+            .and_then(|c| c.tree().ok());
+        let head_tree = head_commit.tree().ok();
+
+        let diff = match (base_tree.as_ref(), head_tree.as_ref()) {
+            (Some(bt), Some(ht)) => self.repo.diff_tree_to_tree(Some(bt), Some(ht), None).ok(),
+            _ => return Vec::new(),
+        };
+
+        match diff {
+            Some(d) => Self::extract_files(&d),
+            None => Vec::new(),
+        }
+    }
+
+    /// Detect the default branch (main/master).
+    pub fn default_branch(&self) -> String {
+        // Try refs/remotes/origin/HEAD (set by `git clone`)
+        if let Ok(reference) = self.repo.find_reference("refs/remotes/origin/HEAD") {
+            if let Some(target) = reference.symbolic_target() {
+                // target is like "refs/remotes/origin/main"
+                if let Some(branch) = target.strip_prefix("refs/remotes/origin/") {
+                    return branch.to_string();
+                }
+            }
+        }
+
+        // Fall back to checking if main or master exist
+        for name in &["main", "master"] {
+            if self
+                .repo
+                .find_branch(name, BranchType::Local)
+                .is_ok()
+                || self
+                    .repo
+                    .find_branch(&format!("origin/{name}"), BranchType::Remote)
+                    .is_ok()
+            {
+                return name.to_string();
+            }
+        }
+
+        "main".to_string()
+    }
+
+    /// Get HEAD commit SHA.
+    pub fn head_sha(&self) -> Option<String> {
+        self.repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .map(|c| c.id().to_string())
     }
 
     fn extract_files(diff: &Diff) -> Vec<DiffFile> {

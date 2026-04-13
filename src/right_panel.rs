@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::editor::EditorView;
 use crate::git::GitDiffPanel;
+use crate::git::PrDiffPanel;
 use crate::theme::colors;
 use crate::util;
 
@@ -25,20 +26,23 @@ fn start_window_drag_native() {}
 pub enum RightPanelTab {
     Files,
     Git,
+    Pr,
 }
 
 pub struct RightPanel {
     pub active_tab: RightPanelTab,
     pub diff_panel: Entity<GitDiffPanel>,
+    pub pr_diff_panel: Entity<PrDiffPanel>,
     pub editor: Option<Entity<EditorView>>,
     pub width: f32,
 }
 
 impl RightPanel {
-    pub fn new(diff_panel: Entity<GitDiffPanel>) -> Self {
+    pub fn new(diff_panel: Entity<GitDiffPanel>, pr_diff_panel: Entity<PrDiffPanel>) -> Self {
         Self {
             active_tab: RightPanelTab::Git,
             diff_panel,
+            pr_diff_panel,
             editor: None,
             width: 400.0,
         }
@@ -122,8 +126,10 @@ impl Render for RightPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let entity2 = cx.entity().clone();
+        let entity3 = cx.entity().clone();
         let is_git = self.active_tab == RightPanelTab::Git;
         let is_files = self.active_tab == RightPanelTab::Files;
+        let is_pr = self.active_tab == RightPanelTab::Pr;
 
         // Tab switcher bar at top
         let tab_bar = div()
@@ -151,6 +157,13 @@ impl Render for RightPanel {
                 entity2,
                 RightPanelTab::Git,
             ))
+            .child(Self::render_tab_button(
+                "right-panel-tab-pr",
+                "\u{e726}", // nf-dev-git_pull_request
+                is_pr,
+                entity3,
+                RightPanelTab::Pr,
+            ))
             .child(
                 div()
                     .id("right-panel-drag")
@@ -176,6 +189,16 @@ impl Render for RightPanel {
                     .size_full()
                     .overflow_hidden()
                     .child(dp)
+                    .into_any_element()
+            }
+            RightPanelTab::Pr => {
+                let pr = self.pr_diff_panel.clone();
+                div()
+                    .flex()
+                    .flex_1()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(pr)
                     .into_any_element()
             }
             RightPanelTab::Files => {

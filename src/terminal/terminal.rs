@@ -107,8 +107,17 @@ impl TerminalModel {
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
 
+        // Use the user's preferred shell and start it as a login shell
+        // so that PATH and other profile-level config are loaded.
+        let user_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let login_flag = if user_shell.ends_with("fish") {
+            "--login".to_string()
+        } else {
+            "-l".to_string()
+        };
+
         let pty_config = tty::Options {
-            shell: Some(tty::Shell::new("/bin/zsh".to_string(), vec![])),
+            shell: Some(tty::Shell::new(user_shell, vec![login_flag])),
             working_directory: Some(work_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default())),
             env,
             ..Default::default()

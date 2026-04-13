@@ -87,6 +87,7 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-g", ToggleDiffPanel, None),
             KeyBinding::new("cmd-e", ToggleFilesPanel, None),
+            KeyBinding::new("cmd-shift-r", TogglePrPanel, None),
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),

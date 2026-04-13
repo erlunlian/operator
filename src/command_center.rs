@@ -32,6 +32,7 @@ pub enum CommandAction {
     ToggleFilesPanel,
     ToggleSidebar,
     ToggleDiffPanel,
+    TogglePrPanel,
     ToggleSettings,
 }
 
@@ -180,6 +181,11 @@ impl CommandCenter {
                 label: "Toggle Diff Panel".into(),
                 description: "Show/hide git diff panel".into(),
                 action: CommandAction::ToggleDiffPanel,
+            },
+            CommandEntry {
+                label: "Toggle PR Panel".into(),
+                description: "Show pull request diff".into(),
+                action: CommandAction::TogglePrPanel,
             },
             CommandEntry {
                 label: "Settings".into(),

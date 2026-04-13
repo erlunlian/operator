@@ -1,3 +1,4 @@
+SHELL := /bin/zsh -l
 .PHONY: help dev run release install open clean
 
 help:

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::actions::*;
 use crate::command_center::{CommandAction, CommandCenter};
-use crate::git::GitDiffPanel;
+use crate::git::{GitDiffPanel, PrDiffPanel};
 use crate::recent_projects::RecentProjects;
 use crate::right_panel::{RightPanel, RightPanelTab};
 use crate::settings::AppSettings;
@@ -52,7 +52,8 @@ impl OperatorApp {
         cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
 
         let diff_panel = cx.new(|_cx| GitDiffPanel::empty());
-        let right_panel = cx.new(|_cx| RightPanel::new(diff_panel));
+        let pr_diff_panel = cx.new(|_cx| PrDiffPanel::empty());
+        let right_panel = cx.new(|_cx| RightPanel::new(diff_panel, pr_diff_panel));
 
         let settings_panel = cx.new(|cx| SettingsPanel::new(cx));
         let command_center = cx.new(|cx| CommandCenter::new(cx));
@@ -272,6 +273,10 @@ impl OperatorApp {
                     *panel = GitDiffPanel::empty();
                     cx.notify();
                 });
+                rp.pr_diff_panel.update(cx, |panel, cx| {
+                    *panel = PrDiffPanel::empty();
+                    cx.notify();
+                });
                 rp.editor = None;
                 cx.notify();
             });
@@ -429,6 +434,15 @@ impl OperatorApp {
         self.show_right_panel_tab(RightPanelTab::Files, cx);
     }
 
+    fn toggle_pr_panel(
+        &mut self,
+        _: &TogglePrPanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_right_panel_tab(RightPanelTab::Pr, cx);
+    }
+
     fn show_right_panel_tab(&mut self, tab: RightPanelTab, cx: &mut Context<Self>) {
         let is_same_tab = self.right_panel.read(cx).active_tab == tab;
         if !self.right_panel_collapsed && is_same_tab {
@@ -444,6 +458,11 @@ impl OperatorApp {
                     rp.diff_panel.update(cx, |panel, cx| {
                         panel.refresh();
                         cx.notify();
+                    });
+                }
+                if tab == RightPanelTab::Pr {
+                    rp.pr_diff_panel.update(cx, |panel, cx| {
+                        panel.refresh(cx);
                     });
                 }
                 cx.notify();
@@ -576,6 +595,9 @@ impl OperatorApp {
                 CommandAction::ToggleDiffPanel => {
                     self.show_right_panel_tab(RightPanelTab::Git, cx);
                 }
+                CommandAction::TogglePrPanel => {
+                    self.show_right_panel_tab(RightPanelTab::Pr, cx);
+                }
                 CommandAction::ToggleSettings => {
                     self.settings_panel_open = !self.settings_panel_open;
                     cx.notify();
@@ -635,6 +657,12 @@ impl OperatorApp {
             rp.diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
                 *panel = GitDiffPanel::new(dir.clone());
+                panel.width = w;
+                cx.notify();
+            });
+            rp.pr_diff_panel.update(cx, |panel, cx| {
+                let w = panel.width;
+                *panel = PrDiffPanel::new(dir.clone());
                 panel.width = w;
                 cx.notify();
             });
@@ -941,6 +969,10 @@ impl Render for OperatorApp {
                                     *panel = GitDiffPanel::empty();
                                     cx.notify();
                                 });
+                                rp.pr_diff_panel.update(cx, |panel, cx| {
+                                    *panel = PrDiffPanel::empty();
+                                    cx.notify();
+                                });
                                 rp.editor = None;
                                 cx.notify();
                             });
@@ -1050,6 +1082,7 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_diff_panel))
             .on_action(cx.listener(Self::toggle_files_panel))
+            .on_action(cx.listener(Self::toggle_pr_panel))
             .on_action(cx.listener(Self::toggle_settings))
             .on_action(cx.listener(Self::toggle_command_center))
             .on_action(cx.listener(Self::search_workspace))

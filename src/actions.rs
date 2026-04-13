@@ -11,6 +11,7 @@ actions!(
         ToggleSidebar,
         ToggleDiffPanel,
         ToggleFilesPanel,
+        TogglePrPanel,
         NextTab,
         PrevTab,
         SaveFile,

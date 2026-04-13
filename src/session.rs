@@ -131,6 +131,7 @@ impl SessionState {
         let right_panel_tab = match rp.active_tab {
             RightPanelTab::Files => "files",
             RightPanelTab::Git => "git",
+            RightPanelTab::Pr => "pr",
         };
 
         // Capture editor state from right panel
@@ -237,6 +238,7 @@ impl SessionState {
         };
         let right_panel_tab = match self.settings.right_panel_tab.as_str() {
             "files" => RightPanelTab::Files,
+            "pr" => RightPanelTab::Pr,
             _ => RightPanelTab::Git,
         };
         let window_bounds = match (
@@ -316,7 +318,14 @@ impl SessionState {
                     crate::git::GitDiffPanel::empty()
                 }
             });
-            let mut rp = RightPanel::new(diff_panel);
+            let pr_diff_panel = cx.new(|_cx| {
+                if let Some(dir) = &active_ws_dir {
+                    crate::git::PrDiffPanel::new(dir.clone())
+                } else {
+                    crate::git::PrDiffPanel::empty()
+                }
+            });
+            let mut rp = RightPanel::new(diff_panel, pr_diff_panel);
             rp.width = right_panel_width;
             rp.active_tab = right_panel_tab;
 

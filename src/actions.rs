@@ -17,6 +17,7 @@ actions!(
         SaveFile,
         ToggleSettings,
         ToggleCommandCenter,
+        FindFile,
         FindInFile,
         SearchWorkspace,
         Quit,

@@ -68,6 +68,18 @@ pub struct WorkspaceState {
     /// Files open in the editor for this workspace.
     #[serde(default)]
     pub open_files: Vec<PathBuf>,
+    /// Per-workspace right panel tab (files/git/pr).
+    #[serde(default)]
+    pub right_panel_tab: Option<String>,
+    /// Per-workspace right panel width.
+    #[serde(default)]
+    pub right_panel_width: Option<f32>,
+    /// Per-workspace: left sidebar collapsed.
+    #[serde(default)]
+    pub sidebar_collapsed: Option<bool>,
+    /// Per-workspace: right panel collapsed.
+    #[serde(default)]
+    pub right_panel_collapsed: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -142,11 +154,32 @@ impl SessionState {
                 } else {
                     ws.cached_editor_files.clone()
                 };
+                // Active workspace: use live right panel state; others: use cached
+                let (rp_tab, rp_width, sb_collapsed, rp_collapsed) =
+                    if i == app.active_workspace_ix {
+                        (
+                            Some(right_panel_tab.to_string()),
+                            Some(rp.width),
+                            Some(app.sidebar_collapsed),
+                            Some(app.right_panel_collapsed),
+                        )
+                    } else {
+                        (
+                            ws.cached_right_panel_tab.clone(),
+                            ws.cached_right_panel_width,
+                            ws.cached_sidebar_collapsed,
+                            ws.cached_right_panel_collapsed,
+                        )
+                    };
                 WorkspaceState {
                     name: ws.name.to_string(),
                     directory: ws.directory.clone(),
                     layout,
                     open_files,
+                    right_panel_tab: rp_tab,
+                    right_panel_width: rp_width,
+                    sidebar_collapsed: sb_collapsed,
+                    right_panel_collapsed: rp_collapsed,
                 }
             })
             .collect();
@@ -291,6 +324,10 @@ impl SessionState {
                             ws.layout = Some(layout);
                         }
                         ws.cached_editor_files = open_files;
+                        ws.cached_right_panel_tab = ws_state.right_panel_tab.clone();
+                        ws.cached_right_panel_width = ws_state.right_panel_width;
+                        ws.cached_sidebar_collapsed = ws_state.sidebar_collapsed;
+                        ws.cached_right_panel_collapsed = ws_state.right_panel_collapsed;
                         ws
                     })
                 } else {
@@ -327,6 +364,38 @@ impl SessionState {
         };
         let active_ws_dir_clone = active_ws_dir.clone();
 
+        // Prefer per-workspace panel state for the active workspace
+        let active_ws_panel = workspaces.get(active_workspace_ix).map(|ws| {
+            let ws = ws.read(cx);
+            (
+                ws.cached_right_panel_tab.clone(),
+                ws.cached_right_panel_width,
+                ws.cached_sidebar_collapsed,
+                ws.cached_right_panel_collapsed,
+            )
+        });
+        let effective_rp_tab = active_ws_panel
+            .as_ref()
+            .and_then(|(t, _, _, _)| t.as_ref())
+            .map(|t| match t.as_str() {
+                "files" => RightPanelTab::Files,
+                "pr" => RightPanelTab::Pr,
+                _ => RightPanelTab::Git,
+            })
+            .unwrap_or(right_panel_tab);
+        let effective_rp_width = active_ws_panel
+            .as_ref()
+            .and_then(|(_, w, _, _)| *w)
+            .unwrap_or(right_panel_width);
+        let effective_sb_collapsed = active_ws_panel
+            .as_ref()
+            .and_then(|(_, _, sc, _)| *sc)
+            .unwrap_or(sidebar_collapsed);
+        let effective_rp_collapsed = active_ws_panel
+            .as_ref()
+            .and_then(|(_, _, _, rc)| *rc)
+            .unwrap_or(right_panel_collapsed);
+
         let right_panel = cx.new(|cx| {
             let diff_panel = cx.new(|_cx| {
                 if let Some(dir) = &active_ws_dir {
@@ -343,8 +412,8 @@ impl SessionState {
                 }
             });
             let mut rp = RightPanel::new(diff_panel, pr_diff_panel);
-            rp.width = right_panel_width;
-            rp.active_tab = right_panel_tab;
+            rp.width = effective_rp_width;
+            rp.active_tab = effective_rp_tab;
 
             // Restore editor with open files for the active workspace
             if let Some(dir) = active_ws_dir_clone {
@@ -368,9 +437,9 @@ impl SessionState {
         crate::app::OperatorApp::from_restored(
             workspaces,
             active_workspace_ix,
-            sidebar_collapsed,
+            effective_sb_collapsed,
             sidebar_width,
-            right_panel_collapsed,
+            effective_rp_collapsed,
             window_bounds,
             right_panel,
             settings_panel,

@@ -319,6 +319,61 @@ impl OperatorApp {
         }
     }
 
+    /// Cache the right panel's active tab and width into the active workspace.
+    /// Cache the right panel and sidebar state into the active workspace.
+    fn cache_right_panel_state(&self, cx: &mut Context<Self>) {
+        let rp = self.right_panel.read(cx);
+        let tab = match rp.active_tab {
+            RightPanelTab::Files => "files",
+            RightPanelTab::Git => "git",
+            RightPanelTab::Pr => "pr",
+        };
+        let width = rp.width;
+        let sb_collapsed = self.sidebar_collapsed;
+        let rp_collapsed = self.right_panel_collapsed;
+        if let Some(ws) = self.workspaces.get(self.active_workspace_ix) {
+            ws.update(cx, |ws, _cx| {
+                ws.cached_right_panel_tab = Some(tab.to_string());
+                ws.cached_right_panel_width = Some(width);
+                ws.cached_sidebar_collapsed = Some(sb_collapsed);
+                ws.cached_right_panel_collapsed = Some(rp_collapsed);
+            });
+        }
+    }
+
+    /// Restore the right panel and sidebar state from the given workspace.
+    fn restore_right_panel_state(&mut self, ws_ix: usize, cx: &mut Context<Self>) {
+        let (tab, width, sb_collapsed, rp_collapsed) = {
+            let Some(ws) = self.workspaces.get(ws_ix) else { return };
+            let ws = ws.read(cx);
+            (
+                ws.cached_right_panel_tab.clone(),
+                ws.cached_right_panel_width,
+                ws.cached_sidebar_collapsed,
+                ws.cached_right_panel_collapsed,
+            )
+        };
+        self.right_panel.update(cx, |rp, cx| {
+            if let Some(ref tab_str) = tab {
+                rp.active_tab = match tab_str.as_str() {
+                    "files" => RightPanelTab::Files,
+                    "pr" => RightPanelTab::Pr,
+                    _ => RightPanelTab::Git,
+                };
+            }
+            if let Some(w) = width {
+                rp.width = w;
+            }
+            cx.notify();
+        });
+        if let Some(sc) = sb_collapsed {
+            self.sidebar_collapsed = sc;
+        }
+        if let Some(rc) = rp_collapsed {
+            self.right_panel_collapsed = rc;
+        }
+    }
+
     /// Restore cached editor files for the given workspace into the right panel editor.
     fn restore_editor_files_for_workspace(&self, ws_ix: usize, cx: &mut Context<Self>) {
         let (dir, files) = {
@@ -605,6 +660,23 @@ impl OperatorApp {
         });
     }
 
+    fn find_file(
+        &mut self,
+        _: &FindFile,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self
+            .active_workspace()
+            .read(cx)
+            .directory
+            .clone();
+        self.command_center.update(cx, |cc, cx| {
+            cc.search_root = dir;
+            cc.show_file_search_mode(cx);
+        });
+    }
+
     /// Called when the command center entity notifies (e.g. clone complete, action selected).
     fn handle_command_center_update(
         &mut self,
@@ -630,6 +702,17 @@ impl OperatorApp {
                 cc.dismiss(cx);
             });
             self.open_search_result(result, cx);
+            return;
+        }
+
+        // Check for pending file search result (Cmd+P)
+        let pending_file = cc.read(cx).pending_file_path.clone();
+        if let Some(path) = pending_file {
+            cc.update(cx, |cc, cx| {
+                cc.pending_file_path = None;
+                cc.dismiss(cx);
+            });
+            self.open_file_result(path, cx);
             return;
         }
 
@@ -696,6 +779,23 @@ impl OperatorApp {
         }
     }
 
+    /// Open a file from a file name search result (Cmd+P) in the editor.
+    fn open_file_result(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let ws = self.active_workspace().clone();
+        if !ws.read(cx).has_directory() {
+            return;
+        }
+
+        if let Some(dir) = ws.read(cx).directory.clone() {
+            self.right_panel_collapsed = false;
+            self.focus_region = FocusRegion::RightPanel;
+            self.right_panel.update(cx, |rp, cx| {
+                rp.open_file(path, dir, None, cx);
+            });
+            cx.notify();
+        }
+    }
+
     /// Open a directory in the active workspace (or set it if empty).
     pub fn open_directory(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         // Track in recent projects (update cached copy and persist)
@@ -728,8 +828,12 @@ impl OperatorApp {
             return;
         }
         self.cache_editor_files(cx);
+        self.cache_right_panel_state(cx);
         self.active_workspace_ix = ix;
         let dir = self.workspaces[ix].read(cx).directory.clone();
+        // Always restore sidebar/panel collapsed states
+        self.restore_right_panel_state(ix, cx);
+
         if let Some(dir) = dir {
             self.update_right_panel_dir(dir, cx);
             self.restore_editor_files_for_workspace(ix, cx);
@@ -1172,6 +1276,7 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_pr_panel))
             .on_action(cx.listener(Self::toggle_settings))
             .on_action(cx.listener(Self::toggle_command_center))
+            .on_action(cx.listener(Self::find_file))
             .on_action(cx.listener(Self::search_workspace))
             .on_action(cx.listener(Self::request_quit))
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {

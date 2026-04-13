@@ -12,6 +12,8 @@ use crate::util;
 const DEFAULT_CONTEXT: usize = 3;
 /// How many extra context lines to reveal per click.
 const EXPAND_STEP: usize = 20;
+/// How many files to render initially before showing "Load more".
+const FILE_RENDER_BATCH: usize = 20;
 
 // ── Colors specific to the diff view ──
 
@@ -83,6 +85,14 @@ pub struct GitDiffPanel {
     scroll_to_file: Option<usize>,
     /// When set, shows a confirmation dialog before reverting.
     pending_revert: Option<RevertTarget>,
+    /// Max number of files to render (grows when user clicks "Load more").
+    rendered_file_limit: usize,
+
+    // Line selection for copy
+    copy_selecting: bool,
+    copy_anchor_line: Option<usize>,
+    copy_end_line: Option<usize>,
+    copy_line_contents: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +130,11 @@ impl GitDiffPanel {
             _copied_timer: None,
             scroll_to_file: None,
             pending_revert: None,
+            rendered_file_limit: FILE_RENDER_BATCH,
+            copy_selecting: false,
+            copy_anchor_line: None,
+            copy_end_line: None,
+            copy_line_contents: Vec::new(),
         }
     }
 
@@ -166,11 +181,45 @@ impl GitDiffPanel {
             _copied_timer: None,
             scroll_to_file: None,
             pending_revert: None,
+            rendered_file_limit: FILE_RENDER_BATCH,
+            copy_selecting: false,
+            copy_anchor_line: None,
+            copy_end_line: None,
+            copy_line_contents: Vec::new(),
         }
     }
 
     pub fn git_dir(&self) -> Option<std::path::PathBuf> {
         self.repo.as_ref().map(|r| r.git_dir())
+    }
+
+    fn is_line_selected(&self, global_idx: usize) -> bool {
+        if let (Some(a), Some(e)) = (self.copy_anchor_line, self.copy_end_line) {
+            let lo = a.min(e);
+            let hi = a.max(e);
+            global_idx >= lo && global_idx <= hi
+        } else {
+            false
+        }
+    }
+
+    fn copy_selected_text(&self, cx: &mut Context<Self>) {
+        let (Some(a), Some(e)) = (self.copy_anchor_line, self.copy_end_line) else {
+            return;
+        };
+        let lo = a.min(e);
+        let hi = a.max(e);
+        let text: String = self
+            .copy_line_contents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= lo && *i <= hi)
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -179,6 +228,7 @@ impl GitDiffPanel {
             self.staged_files = repo.staged_diff();
             self.unstaged_files = repo.unstaged_diff();
             self.expanded_context.clear();
+            self.rendered_file_limit = FILE_RENDER_BATCH;
         }
     }
 
@@ -589,6 +639,10 @@ impl GitDiffPanel {
                                         panel.expanded_context.clear();
                                     }
                                     panel.collapsed_files.remove(&(section, idx));
+                                    // Ensure the file is within the rendered batch
+                                    if idx >= panel.rendered_file_limit {
+                                        panel.rendered_file_limit = idx + 1;
+                                    }
                                     panel.scroll_to_file = Some(idx);
                                     cx.notify();
                                 });
@@ -637,6 +691,8 @@ impl GitDiffPanel {
         file: &DiffFile,
         file_idx: usize,
         section: DiffSection,
+        line_counter: &std::cell::Cell<usize>,
+        line_texts: &std::cell::RefCell<Vec<String>>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let adds = file.additions();
@@ -859,7 +915,7 @@ impl GitDiffPanel {
                 );
             } else {
                 let all_lines = self.flatten_file_lines(file, file_idx, section);
-                container = container.child(self.render_line_blocks(&all_lines, file_idx, section, cx));
+                container = container.child(self.render_line_blocks(&all_lines, file_idx, section, line_counter, line_texts, cx));
             }
         }
 
@@ -937,6 +993,8 @@ impl GitDiffPanel {
         segments: &[LineSegment],
         file_idx: usize,
         section: DiffSection,
+        line_counter: &std::cell::Cell<usize>,
+        line_texts: &std::cell::RefCell<Vec<String>>,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut block = div()
@@ -953,7 +1011,12 @@ impl GitDiffPanel {
         for (seg_idx, seg) in segments.iter().enumerate() {
             match seg {
                 LineSegment::Line(line) => {
-                    block = block.child(self.render_diff_line(line));
+                    let gli = line_counter.get();
+                    line_counter.set(gli + 1);
+                    line_texts
+                        .borrow_mut()
+                        .push(line.content.trim_end().to_string());
+                    block = block.child(self.render_diff_line(line, gli, cx));
                 }
                 LineSegment::CollapsedContext {
                     count,
@@ -1022,7 +1085,7 @@ impl GitDiffPanel {
         block
     }
 
-    fn render_diff_line(&self, line: &DiffLine) -> Div {
+    fn render_diff_line(&self, line: &DiffLine, global_line_idx: usize, cx: &mut Context<Self>) -> Div {
         let (row_bg, gutter_bg_color, text_col, prefix) = match line.kind {
             DiffLineKind::Added => (
                 added_line_bg(),
@@ -1096,14 +1159,37 @@ impl GitDiffPanel {
                 .into_any_element()
         };
 
+        let line_selected = self.is_line_selected(global_line_idx);
+        let final_bg = if line_selected { rgba(0x89b4fa30) } else { row_bg };
+
+        let entity_sel_down = cx.entity().clone();
+        let entity_sel_move = cx.entity().clone();
+        let gli = global_line_idx;
+
         div()
             .flex()
             .flex_row()
             .w_full()
             .min_h(px(20.0))
-            .bg(row_bg)
+            .bg(final_bg)
             .font_family("Menlo")
             .text_xs()
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                entity_sel_down.update(cx, |panel, cx| {
+                    panel.copy_anchor_line = Some(gli);
+                    panel.copy_end_line = Some(gli);
+                    panel.copy_selecting = true;
+                    cx.notify();
+                });
+            })
+            .on_mouse_move(move |_, _window, cx| {
+                entity_sel_move.update(cx, |panel, cx| {
+                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
+                        panel.copy_end_line = Some(gli);
+                        cx.notify();
+                    }
+                });
+            })
             .child(
                 div()
                     .w(px(44.0))
@@ -1271,8 +1357,17 @@ impl Render for GitDiffPanel {
                 MouseButton::Left,
                 move |_: &MouseUpEvent, _window, cx| {
                     entity_up.update(cx, |panel, cx| {
+                        let mut changed = false;
                         if panel.resizing_tree {
                             panel.resizing_tree = false;
+                            changed = true;
+                        }
+                        if panel.copy_selecting {
+                            panel.copy_selecting = false;
+                            panel.copy_selected_text(cx);
+                            changed = true;
+                        }
+                        if changed {
                             cx.notify();
                         }
                     });
@@ -1394,9 +1489,13 @@ impl Render for GitDiffPanel {
                 }),
         );
 
-        // Diff content (scrollable) — only shows active section
+        // Diff content (scrollable) — only shows active section, paginated
         let section = self.active_section;
         let files = self.active_files().to_vec();
+        let render_limit = self.rendered_file_limit.min(files.len());
+        let line_counter = std::cell::Cell::new(0usize);
+        let line_texts = std::cell::RefCell::new(Vec::<String>::new());
+
         let mut diff_content = div()
             .id("diff-panel-content")
             .flex()
@@ -1407,8 +1506,48 @@ impl Render for GitDiffPanel {
             .track_scroll(&self.scroll_handle)
             .p_2();
 
-        for (idx, file) in files.iter().enumerate() {
-            diff_content = diff_content.child(self.render_file_diff(file, idx, section, cx));
+        for (idx, file) in files.iter().enumerate().take(render_limit) {
+            diff_content = diff_content.child(
+                self.render_file_diff(file, idx, section, &line_counter, &line_texts, cx),
+            );
+        }
+
+        self.copy_line_contents = line_texts.into_inner();
+
+        // Auto-load more files: show a sentinel and schedule the next batch
+        let remaining = files.len().saturating_sub(render_limit);
+        if remaining > 0 {
+            diff_content = diff_content.child(
+                div()
+                    .w_full()
+                    .py_2()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .child(format!("{remaining} more files...")),
+                    ),
+            );
+
+            // Schedule the next batch load after a brief delay
+            let entity_more = cx.entity().clone();
+            let total = files.len();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let _ = entity_more.update(cx, |panel, cx| {
+                        if panel.rendered_file_limit < total {
+                            panel.rendered_file_limit += FILE_RENDER_BATCH;
+                            cx.notify();
+                        }
+                    });
+                });
+            })
+            .detach();
         }
 
         // Handle scroll-to-file request

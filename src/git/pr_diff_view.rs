@@ -7,6 +7,7 @@ use std::rc::Rc;
 use super::diff_model::*;
 use super::git_repo::GitRepo;
 use super::github::{self, GhStatus, PrInfo, PrReviewComment};
+use super::markdown;
 use crate::text_input::TextInput;
 use crate::theme::colors;
 use crate::util;
@@ -15,6 +16,8 @@ use crate::util;
 const DEFAULT_CONTEXT: usize = 3;
 /// How many extra context lines to reveal per click.
 const EXPAND_STEP: usize = 20;
+/// How many files to render initially before showing "Load more".
+const FILE_RENDER_BATCH: usize = 20;
 
 // ── Colors specific to the diff view ──
 
@@ -107,6 +110,18 @@ pub struct PrDiffPanel {
     _copied_timer: Option<Task<()>>,
     /// Whether the initial async refresh (gh check + PR detection) has been triggered.
     needs_initial_refresh: bool,
+    /// Max number of files to render (grows when user clicks "Load more").
+    rendered_file_limit: usize,
+
+    // Line selection for copy
+    /// Whether user is currently dragging to select lines.
+    copy_selecting: bool,
+    /// Global line index where selection started.
+    copy_anchor_line: Option<usize>,
+    /// Global line index where selection currently ends.
+    copy_end_line: Option<usize>,
+    /// Rebuilt each render: global line index → text content for copy.
+    copy_line_contents: Vec<String>,
 }
 
 impl PrDiffPanel {
@@ -140,6 +155,11 @@ impl PrDiffPanel {
             copied_file_key: None,
             _copied_timer: None,
             needs_initial_refresh: false,
+            rendered_file_limit: FILE_RENDER_BATCH,
+            copy_selecting: false,
+            copy_anchor_line: None,
+            copy_end_line: None,
+            copy_line_contents: Vec::new(),
         }
     }
 
@@ -188,12 +208,46 @@ impl PrDiffPanel {
             copied_file_key: None,
             _copied_timer: None,
             needs_initial_refresh: true,
+            rendered_file_limit: FILE_RENDER_BATCH,
+            copy_selecting: false,
+            copy_anchor_line: None,
+            copy_end_line: None,
+            copy_line_contents: Vec::new(),
         }
     }
 
     #[allow(dead_code)]
     pub fn git_dir(&self) -> Option<PathBuf> {
         self.repo.as_ref().map(|r| r.git_dir())
+    }
+
+    fn is_line_selected(&self, global_idx: usize) -> bool {
+        if let (Some(a), Some(e)) = (self.copy_anchor_line, self.copy_end_line) {
+            let lo = a.min(e);
+            let hi = a.max(e);
+            global_idx >= lo && global_idx <= hi
+        } else {
+            false
+        }
+    }
+
+    fn copy_selected_text(&self, cx: &mut Context<Self>) {
+        let (Some(a), Some(e)) = (self.copy_anchor_line, self.copy_end_line) else {
+            return;
+        };
+        let lo = a.min(e);
+        let hi = a.max(e);
+        let text: String = self
+            .copy_line_contents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= lo && *i <= hi)
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
     }
 
     /// Refresh the branch diff and reload PR data asynchronously.
@@ -203,6 +257,7 @@ impl PrDiffPanel {
             self.branch = repo.current_branch();
             self.diff_files = repo.branch_diff(&self.base_ref);
             self.expanded_context.clear();
+            self.rendered_file_limit = FILE_RENDER_BATCH;
         }
 
         // Async: check gh and fetch PR data
@@ -486,6 +541,10 @@ impl PrDiffPanel {
                             .on_click(move |_, _window, cx| {
                                 entity.update(cx, |panel, cx| {
                                     panel.collapsed_files.remove(&idx);
+                                    // Ensure the file is within the rendered batch
+                                    if idx >= panel.rendered_file_limit {
+                                        panel.rendered_file_limit = idx + 1;
+                                    }
                                     panel.scroll_to_file = Some(idx);
                                     cx.notify();
                                 });
@@ -550,6 +609,8 @@ impl PrDiffPanel {
         &self,
         file: &DiffFile,
         file_idx: usize,
+        line_counter: &std::cell::Cell<usize>,
+        line_texts: &std::cell::RefCell<Vec<String>>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let adds = file.additions();
@@ -719,6 +780,8 @@ impl PrDiffPanel {
                     &all_lines,
                     file_idx,
                     &file.path,
+                    line_counter,
+                    line_texts,
                     cx,
                 ));
             }
@@ -795,6 +858,8 @@ impl PrDiffPanel {
         segments: &[LineSegment],
         file_idx: usize,
         file_path: &str,
+        line_counter: &std::cell::Cell<usize>,
+        line_texts: &std::cell::RefCell<Vec<String>>,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut block = div()
@@ -820,13 +885,21 @@ impl PrDiffPanel {
                         _ => CommentSide::Right,
                     };
 
-                    block = block.child(self.render_diff_line(line, file_path, line_num, side, cx));
+                    let gli = line_counter.get();
+                    line_counter.set(gli + 1);
+                    line_texts
+                        .borrow_mut()
+                        .push(line.content.trim_end().to_string());
+
+                    block = block
+                        .child(self.render_diff_line(line, file_path, line_num, side, gli, cx));
 
                     // Render inline comment form after the last line of the range
-                    if let Some((ref active_path, _start, end, _active_side)) =
+                    if let Some((ref active_path, _start, end, active_side)) =
                         self.active_comment_line
                     {
-                        if active_path == file_path && line_num == Some(end) {
+                        if active_path == file_path && line_num == Some(end) && side == active_side
+                        {
                             block = block.child(self.render_comment_form(cx));
                         }
                     }
@@ -914,6 +987,7 @@ impl PrDiffPanel {
         file_path: &str,
         line_num: Option<u32>,
         side: CommentSide,
+        global_line_idx: usize,
         cx: &mut Context<Self>,
     ) -> Div {
         let (row_bg, gutter_bg_color, text_col, prefix) = match line.kind {
@@ -1079,28 +1153,58 @@ impl PrDiffPanel {
 
         let drag_highlight = if in_drag { rgba(0x89b4fa15) } else { row_bg };
 
+        // Text selection highlight
+        let line_selected = self.is_line_selected(global_line_idx);
+        let final_bg = if line_selected {
+            rgba(0x89b4fa30)
+        } else {
+            drag_highlight
+        };
+
+        // Mouse handlers for line selection
+        let entity_sel_down = cx.entity().clone();
+        let entity_sel_move = cx.entity().clone();
+        let gli = global_line_idx;
+
         div()
             .group("pr-diff-line")
             .flex()
             .flex_row()
             .w_full()
             .min_h(px(20.0))
-            .bg(drag_highlight)
+            .bg(final_bg)
             .font_family("Menlo")
             .text_xs()
-            // Comment "+" button on the left
-            .child(comment_btn)
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                entity_sel_down.update(cx, |panel, cx| {
+                    panel.copy_anchor_line = Some(gli);
+                    panel.copy_end_line = Some(gli);
+                    panel.copy_selecting = true;
+                    cx.notify();
+                });
+            })
+            .on_mouse_move(move |_, _window, cx| {
+                entity_sel_move.update(cx, |panel, cx| {
+                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
+                        panel.copy_end_line = Some(gli);
+                        cx.notify();
+                    }
+                });
+            })
+            // Line number on the far left
             .child(
                 div()
                     .w(px(44.0))
                     .flex_shrink_0()
                     .text_right()
-                    .pr(px(8.0))
+                    .pr(px(4.0))
                     .pl(px(4.0))
                     .bg(gutter_bg_color)
                     .text_color(colors::text_muted())
                     .child(line_num_str),
             )
+            // Comment "+" button next to line number
+            .child(comment_btn)
             .child(
                 div()
                     .w(px(16.0))
@@ -1314,13 +1418,17 @@ impl PrDiffPanel {
                             .child(author.to_string()),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(colors::text_muted())
+            .child({
+                let mut body_el = div()
                     .pl(px(20.0))
-                    .child(body.to_string()),
-            )
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0));
+                for el in markdown::render_markdown(body) {
+                    body_el = body_el.child(el);
+                }
+                body_el
+            })
     }
 }
 
@@ -1462,6 +1570,12 @@ impl Render for PrDiffPanel {
                         if panel.comment_drag_start.is_some() {
                             panel.comment_drag_start = None;
                             panel.comment_drag_end = None;
+                            changed = true;
+                        }
+                        // End text selection and copy
+                        if panel.copy_selecting {
+                            panel.copy_selecting = false;
+                            panel.copy_selected_text(cx);
                             changed = true;
                         }
                         if changed {
@@ -1697,8 +1811,12 @@ impl Render for PrDiffPanel {
                 ),
         );
 
-        // Diff content (scrollable)
+        // Diff content (scrollable) — paginated for large diffs
         let files = self.diff_files.clone();
+        let render_limit = self.rendered_file_limit.min(files.len());
+        let line_counter = std::cell::Cell::new(0usize);
+        let line_texts = std::cell::RefCell::new(Vec::<String>::new());
+
         let mut diff_content = div()
             .id("pr-diff-panel-content")
             .flex()
@@ -1709,8 +1827,49 @@ impl Render for PrDiffPanel {
             .track_scroll(&self.scroll_handle)
             .p_2();
 
-        for (idx, file) in files.iter().enumerate() {
-            diff_content = diff_content.child(self.render_file_diff(file, idx, cx));
+        for (idx, file) in files.iter().enumerate().take(render_limit) {
+            diff_content = diff_content.child(
+                self.render_file_diff(file, idx, &line_counter, &line_texts, cx),
+            );
+        }
+
+        // Store collected line contents for copy support
+        self.copy_line_contents = line_texts.into_inner();
+
+        // Auto-load more files: show a sentinel and schedule the next batch
+        let remaining = files.len().saturating_sub(render_limit);
+        if remaining > 0 {
+            diff_content = diff_content.child(
+                div()
+                    .w_full()
+                    .py_2()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .child(format!("{remaining} more files...")),
+                    ),
+            );
+
+            // Schedule the next batch load after a brief delay
+            let entity_more = cx.entity().clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let _ = entity_more.update(cx, |panel, cx| {
+                        let total = panel.diff_files.len();
+                        if panel.rendered_file_limit < total {
+                            panel.rendered_file_limit += FILE_RENDER_BATCH;
+                            cx.notify();
+                        }
+                    });
+                });
+            })
+            .detach();
         }
 
         if let Some(target_idx) = self.scroll_to_file.take() {

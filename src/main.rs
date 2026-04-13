@@ -92,6 +92,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
             KeyBinding::new("cmd-f", FindInFile, Some("FileEditor")),
+            KeyBinding::new("cmd-p", FindFile, None),
             KeyBinding::new("cmd-shift-f", SearchWorkspace, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
             KeyBinding::new("cmd-k", ToggleCommandCenter, None),

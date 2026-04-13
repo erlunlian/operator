@@ -37,6 +37,14 @@ pub struct Workspace {
     pub layout: Option<Entity<PaneGroup>>,
     /// Editor files cached when switching away from this workspace.
     pub cached_editor_files: Vec<PathBuf>,
+    /// Right panel tab cached when switching away from this workspace.
+    pub cached_right_panel_tab: Option<String>,
+    /// Right panel width cached when switching away from this workspace.
+    pub cached_right_panel_width: Option<f32>,
+    /// Whether the left sidebar was collapsed when switching away.
+    pub cached_sidebar_collapsed: Option<bool>,
+    /// Whether the right panel was collapsed when switching away.
+    pub cached_right_panel_collapsed: Option<bool>,
 }
 
 impl Workspace {
@@ -52,6 +60,10 @@ impl Workspace {
             claude_status: ClaudeStatus::Idle,
             layout: Some(layout),
             cached_editor_files: Vec::new(),
+            cached_right_panel_tab: None,
+            cached_right_panel_width: None,
+            cached_sidebar_collapsed: None,
+            cached_right_panel_collapsed: None,
         }
     }
 
@@ -65,6 +77,10 @@ impl Workspace {
             claude_status: ClaudeStatus::Idle,
             layout: None,
             cached_editor_files: Vec::new(),
+            cached_right_panel_tab: None,
+            cached_right_panel_width: None,
+            cached_sidebar_collapsed: None,
+            cached_right_panel_collapsed: None,
         }
     }
 

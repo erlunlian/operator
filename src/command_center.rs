@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -14,6 +15,8 @@ pub enum CommandCenterMode {
     CloneRepo,
     /// Workspace grep search: user types a query, results show file:line matches.
     SearchWorkspace,
+    /// File name search (Cmd+P): user types a name, results show matching file paths.
+    FileSearch,
 }
 
 /// A single command entry in the palette.
@@ -88,6 +91,14 @@ pub struct CommandCenter {
     /// Flattened display rows for the search result list (file headers + result lines).
     /// Rebuilt whenever search_results changes.
     search_display_rows: Vec<SearchDisplayRow>,
+    /// File search results (Cmd+P).
+    pub file_results: Vec<PathBuf>,
+    /// The file the user selected from file search.
+    pub pending_file_path: Option<PathBuf>,
+    /// Receiver for streaming file search results from the worker thread.
+    file_search_rx: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
+    /// Virtualized scroll handle for file search results.
+    file_scroll_handle: UniformListScrollHandle,
 }
 
 impl CommandCenter {
@@ -140,6 +151,27 @@ impl CommandCenter {
                         });
                         cc.search_debounce = Some(task);
                     }
+                } else if cc.mode == CommandCenterMode::FileSearch {
+                    cc.file_results.clear();
+                    cc.search_debounce = None;
+                    if new_text.trim().is_empty() {
+                        cc.status_message = None;
+                    } else {
+                        cc.status_message = Some("Searching...".into());
+                        let task = cx.spawn(async |entity, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(100))
+                                .await;
+                            let _ = cx.update(|cx| {
+                                let _ = entity.update(cx, |cc, cx| {
+                                    cc.search_debounce = None;
+                                    let q = cc.query.clone();
+                                    cc.run_file_search(q, cx);
+                                });
+                            });
+                        });
+                        cc.search_debounce = Some(task);
+                    }
                 }
                 cx.notify();
             }
@@ -167,6 +199,10 @@ impl CommandCenter {
             scroll_handle: ScrollHandle::new(),
             search_scroll_handle: UniformListScrollHandle::new(),
             search_display_rows: Vec::new(),
+            file_results: Vec::new(),
+            pending_file_path: None,
+            file_search_rx: None,
+            file_scroll_handle: UniformListScrollHandle::new(),
         }
     }
 
@@ -225,6 +261,8 @@ impl CommandCenter {
         // Cancel any in-flight search (drops rx → worker thread exits)
         self.search_task = None;
         self.search_rx = None;
+        self.file_search_rx = None;
+        self.file_results.clear();
         self.searching = false;
         // Defer the input clear to avoid a double-lease panic when
         // reset_state is called from within a TextInput callback
@@ -267,11 +305,22 @@ impl CommandCenter {
         cx.notify();
     }
 
+    pub fn show_file_search_mode(&mut self, cx: &mut Context<Self>) {
+        self.visible = true;
+        self.reset_state(cx);
+        self.mode = CommandCenterMode::FileSearch;
+        self.input.update(cx, |inp, _cx| {
+            inp.set_placeholder("Search files by name...");
+        });
+        cx.notify();
+    }
+
     /// Number of visible items in the current results list.
     fn result_count(&self) -> usize {
         match &self.mode {
             CommandCenterMode::Commands => self.filtered_commands().len(),
             CommandCenterMode::SearchWorkspace => self.search_results.len(),
+            CommandCenterMode::FileSearch => self.file_results.len(),
             CommandCenterMode::CloneRepo => 0,
         }
     }
@@ -330,6 +379,19 @@ impl CommandCenter {
                     self.search_debounce = None;
                     let query = self.query.clone();
                     self.run_workspace_search(query, cx);
+                }
+            }
+            CommandCenterMode::FileSearch => {
+                if !self.file_results.is_empty() {
+                    let ix = self.selected_ix.min(
+                        self.file_results.len().saturating_sub(1),
+                    );
+                    self.pending_file_path =
+                        Some(self.file_results[ix].clone());
+                } else {
+                    self.search_debounce = None;
+                    let query = self.query.clone();
+                    self.run_file_search(query, cx);
                 }
             }
         }
@@ -396,6 +458,9 @@ impl CommandCenter {
                 }) {
                     self.search_scroll_handle.scroll_to_item(row_ix, ScrollStrategy::Center);
                 }
+            }
+            CommandCenterMode::FileSearch => {
+                self.file_scroll_handle.scroll_to_item(self.selected_ix, ScrollStrategy::Center);
             }
             _ => {
                 self.scroll_handle.scroll_to_item(self.selected_ix);
@@ -479,6 +544,102 @@ impl CommandCenter {
         false
     }
 
+    pub fn run_file_search(&mut self, query: String, cx: &mut Context<Self>) {
+        if query.trim().is_empty() {
+            return;
+        }
+        let root = match &self.search_root {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        self.search_task = None;
+        self.file_search_rx = None;
+        self.searching = true;
+        self.file_results.clear();
+        self.status_message = Some("Searching...".into());
+        cx.notify();
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+        self.file_search_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            file_search_worker(&query, &root, tx);
+        });
+
+        let task = cx.spawn(async |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(32))
+                    .await;
+                let should_stop = cx
+                    .update(|cx| {
+                        entity
+                            .update(cx, |cc, cx| cc.drain_file_batches(cx))
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(true);
+                if should_stop {
+                    return;
+                }
+            }
+        });
+        self.search_task = Some(task);
+    }
+
+    fn drain_file_batches(&mut self, cx: &mut Context<Self>) -> bool {
+        let rx = match &self.file_search_rx {
+            Some(rx) => rx,
+            None => return true,
+        };
+
+        let mut got_batch = false;
+        let mut disconnected = false;
+
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => {
+                    self.file_results.extend(batch);
+                    got_batch = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if got_batch {
+            let count = self.file_results.len();
+            self.selected_ix = self.selected_ix.min(count.saturating_sub(1));
+            self.status_message = Some(format!(
+                "{} file{}{}",
+                count,
+                if count == 1 { "" } else { "s" },
+                if disconnected { "" } else { "..." }
+            ));
+            cx.notify();
+        }
+
+        if disconnected {
+            self.searching = false;
+            self.file_search_rx = None;
+            let count = self.file_results.len();
+            self.status_message = if count == 0 {
+                Some("No files found".into())
+            } else {
+                Some(format!(
+                    "{} file{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ))
+            };
+            cx.notify();
+            return true;
+        }
+
+        false
+    }
 
     pub fn clone_repo(&mut self, url: String, cx: &mut Context<Self>) {
         if url.trim().is_empty() || self.cloning {
@@ -672,6 +833,109 @@ fn parse_search_line(line: &str, relative_root: Option<&PathBuf>) -> Option<Sear
     })
 }
 
+// ── File search worker (runs on a background std::thread) ──
+
+fn file_search_worker(
+    query: &str,
+    root: &PathBuf,
+    tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
+) {
+    use std::io::BufRead;
+
+    let mut child = if let Some(c) = spawn_fd(query, root) {
+        c
+    } else if let Some(c) = spawn_find_files(query, root) {
+        c
+    } else {
+        return;
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let reader = std::io::BufReader::new(stdout);
+    let mut batch = Vec::new();
+    let mut count = 0usize;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let line = line.trim_start_matches("./");
+        if line.is_empty() {
+            continue;
+        }
+        batch.push(root.join(line));
+        count += 1;
+        if batch.len() >= 20 {
+            if tx.send(std::mem::take(&mut batch)).is_err() {
+                break;
+            }
+        }
+        if count >= 1000 {
+            break;
+        }
+    }
+
+    if !batch.is_empty() {
+        let _ = tx.send(batch);
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_fd(query: &str, root: &PathBuf) -> Option<std::process::Child> {
+    std::process::Command::new("fd")
+        .args([
+            "--type",
+            "f",
+            "--color",
+            "never",
+            "--fixed-strings",
+            query,
+        ])
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+fn spawn_find_files(query: &str, root: &PathBuf) -> Option<std::process::Child> {
+    std::process::Command::new("find")
+        .args([
+            ".",
+            "-type",
+            "f",
+            "-not",
+            "-path",
+            "*/.git/*",
+            "-not",
+            "-path",
+            "*/node_modules/*",
+            "-not",
+            "-path",
+            "*/target/*",
+            "-not",
+            "-path",
+            "*/__pycache__/*",
+            "-not",
+            "-path",
+            "*/.build/*",
+            "-iname",
+            &format!("*{}*", query),
+        ])
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
 fn extract_repo_name(url: &str) -> String {
     let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
     url.rsplit('/')
@@ -708,6 +972,14 @@ impl Render for CommandCenter {
             });
 
         // Build modal content
+        // When search results exist, use a definite height so the uniform_list's
+        // flex_1() resolves to real pixels (uniform_list needs bounded height to
+        // know how many items to virtualize).
+        let has_virtual_list = (matches!(self.mode, CommandCenterMode::SearchWorkspace)
+            && !self.search_display_rows.is_empty())
+            || (matches!(self.mode, CommandCenterMode::FileSearch)
+                && !self.file_results.is_empty());
+
         let mut modal = div()
             .id("command-center-modal")
             .absolute()
@@ -716,6 +988,7 @@ impl Render for CommandCenter {
             .right_auto()
             .w(px(560.0))
             .max_h(px(600.0))
+            .when(has_virtual_list, |m: Stateful<Div>| m.h(px(600.0)))
             .bg(colors::surface())
             .border_1()
             .border_color(colors::border())
@@ -955,6 +1228,113 @@ impl Render for CommandCenter {
                     )
                     .flex_1()
                     .track_scroll(self.search_scroll_handle.clone());
+
+                    modal = modal.child(list);
+                }
+            }
+            CommandCenterMode::FileSearch => {
+                if self.file_results.is_empty() {
+                    if self.query.is_empty() && self.status_message.is_none() {
+                        modal = modal.child(
+                            div()
+                                .px_4()
+                                .py_6()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(colors::text_muted())
+                                .child("Type to search for files by name"),
+                        );
+                    }
+                } else {
+                    let selected =
+                        self.selected_ix.min(self.file_results.len().saturating_sub(1));
+                    let results = self.file_results.clone();
+                    let search_root = self.search_root.clone();
+                    let entity = cx.entity().clone();
+
+                    let list = uniform_list(
+                        "file-results-list",
+                        results.len(),
+                        move |range, _window, _cx| {
+                            range
+                                .map(|ix| {
+                                    let path = &results[ix];
+                                    let display = if let Some(root) = &search_root {
+                                        path.strip_prefix(root)
+                                            .unwrap_or(path)
+                                            .to_string_lossy()
+                                            .to_string()
+                                    } else {
+                                        path.to_string_lossy().to_string()
+                                    };
+
+                                    let is_selected = ix == selected;
+                                    let bg = if is_selected {
+                                        colors::surface_hover()
+                                    } else {
+                                        colors::surface()
+                                    };
+
+                                    let click_entity = entity.clone();
+                                    let click_path = path.clone();
+
+                                    // Split into filename and directory parts
+                                    let (dir_part, file_part) =
+                                        if let Some(pos) = display.rfind('/') {
+                                            (
+                                                Some(display[..=pos].to_string()),
+                                                display[pos + 1..].to_string(),
+                                            )
+                                        } else {
+                                            (None, display.clone())
+                                        };
+
+                                    let mut row = div()
+                                        .id(ElementId::Name(
+                                            format!("file-result-{ix}").into(),
+                                        ))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px_4()
+                                        .py(px(6.0))
+                                        .bg(bg)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(colors::surface_hover()))
+                                        .on_click(move |_, _window, cx| {
+                                            click_entity.update(cx, |cc, cx| {
+                                                cc.pending_file_path =
+                                                    Some(click_path.clone());
+                                                cx.notify();
+                                            });
+                                        });
+
+                                    row = row.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(colors::text())
+                                            .child(file_part),
+                                    );
+
+                                    if let Some(dir) = dir_part {
+                                        row = row.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(colors::text_muted())
+                                                .child(dir),
+                                        );
+                                    }
+
+                                    row.into_any_element()
+                                })
+                                .collect()
+                        },
+                    )
+                    .flex_1()
+                    .track_scroll(self.file_scroll_handle.clone());
 
                     modal = modal.child(list);
                 }

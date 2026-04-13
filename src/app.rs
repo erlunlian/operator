@@ -755,6 +755,10 @@ impl OperatorApp {
                 }
             }
         }
+
+        // Always re-render the app when the command center state changes,
+        // so focus restoration in render() fires after dismiss-via-Escape.
+        cx.notify();
     }
 
     /// Open a file from a workspace search result in the editor.

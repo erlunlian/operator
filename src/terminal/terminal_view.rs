@@ -9,32 +9,6 @@ use alacritty_terminal::term::Term;
 use crate::terminal::terminal::{alac_color_to_gpui, JsonListener, TerminalModel};
 use crate::theme::colors;
 
-/// Save clipboard image bytes to a temp file and return the path.
-fn save_clipboard_image_to_temp(image: &Image) -> Option<String> {
-    let ext = match image.format() {
-        ImageFormat::Png => "png",
-        ImageFormat::Jpeg => "jpg",
-        ImageFormat::Gif => "gif",
-        ImageFormat::Webp => "webp",
-        ImageFormat::Svg => "svg",
-        ImageFormat::Bmp => "bmp",
-        ImageFormat::Tiff => "tiff",
-    };
-    let dir = std::env::temp_dir().join("operator-images");
-    std::fs::create_dir_all(&dir).ok()?;
-    let filename = format!(
-        "paste-{}.{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        ext
-    );
-    let path = dir.join(filename);
-    std::fs::write(&path, image.bytes()).ok()?;
-    Some(path.to_string_lossy().to_string())
-}
-
 const CELL_WIDTH_PX: f32 = 8.0;
 const CELL_HEIGHT_PX: f32 = 16.0;
 const PADDING_PX: f32 = 8.0; // p_2 = 0.5rem = 8px
@@ -218,29 +192,17 @@ impl Render for TerminalView {
                 if keystroke.modifiers.platform {
                     let term = this.terminal.read(cx);
                     match keystroke.key.as_str() {
-                        // Cmd+V: paste with bracket paste mode (text or image)
+                        // Cmd+V: paste with bracket paste mode
+                        // Claude Code detects bracket paste and reads the system
+                        // clipboard itself (including images via pbpaste).
                         "v" => {
                             if let Some(clipboard) = cx.read_from_clipboard() {
-                                // Try text first
-                                if let Some(text) = clipboard.text() {
-                                    if !text.is_empty() {
-                                        term.write_to_pty(b"\x1b[200~");
-                                        term.write_str_to_pty(&text);
-                                        term.write_to_pty(b"\x1b[201~");
-                                        return;
-                                    }
+                                let text = clipboard.text().unwrap_or_default();
+                                term.write_to_pty(b"\x1b[200~");
+                                if !text.is_empty() {
+                                    term.write_str_to_pty(&text);
                                 }
-                                // Fall back to image: save to temp file and paste path
-                                for entry in clipboard.entries() {
-                                    if let ClipboardEntry::Image(image) = entry {
-                                        if let Some(path) = save_clipboard_image_to_temp(image) {
-                                            term.write_to_pty(b"\x1b[200~");
-                                            term.write_str_to_pty(&path);
-                                            term.write_to_pty(b"\x1b[201~");
-                                            return;
-                                        }
-                                    }
-                                }
+                                term.write_to_pty(b"\x1b[201~");
                             }
                         }
                         // Cmd+Backspace: delete to beginning of line (Ctrl+U)
@@ -351,6 +313,20 @@ impl Render for TerminalView {
                 // Regular character input
                 if let Some(key_char) = &keystroke.key_char {
                     term.write_str_to_pty(key_char);
+                }
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                let term = this.terminal.read(cx);
+                let path_strs: Vec<String> = paths
+                    .paths()
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                if !path_strs.is_empty() {
+                    let joined = path_strs.join(" ");
+                    term.write_to_pty(b"\x1b[200~");
+                    term.write_str_to_pty(&joined);
+                    term.write_to_pty(b"\x1b[201~");
                 }
             }))
             .child(self.render_grid(&term))

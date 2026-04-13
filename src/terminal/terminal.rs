@@ -221,26 +221,26 @@ impl TerminalModel {
                     cursor.column.0.hash(&mut hasher);
 
                     // Hash ALL visible lines for accurate change detection
-                    let mut last_lines = String::new();
+                    let mut bottom_lines: Vec<String> = Vec::new();
                     for line_idx in 0..screen_lines {
                         let row = &grid[alacritty_terminal::index::Line(line_idx as i32)];
-                        let mut line_text = String::new();
+                        let mut line_text_full = String::new();
                         for col_idx in 0..cols {
                             let cell = &row[alacritty_terminal::index::Column(col_idx)];
                             cell.c.hash(&mut hasher);
-                            if cell.c != ' ' && cell.c != '\0' {
-                                line_text.push(cell.c);
+                            if cell.c != '\0' {
+                                line_text_full.push(cell.c);
                             }
                         }
-                        // Claude status: track last non-empty line near bottom
-                        if line_idx >= screen_lines.saturating_sub(5) {
-                            let trimmed = line_text.trim();
+                        // Collect bottom lines (with spaces) for Claude status detection
+                        if line_idx >= screen_lines.saturating_sub(8) {
+                            let trimmed = line_text_full.trim();
                             if !trimmed.is_empty() {
-                                last_lines = trimmed.to_string();
+                                bottom_lines.push(trimmed.to_string());
                             }
                         }
                     }
-                    detect_claude_state(&last_lines, &claude_status_clone);
+                    detect_claude_state(&bottom_lines, &claude_status_clone);
 
                     let new_hash = hasher.finish();
                     content_changed = new_hash != last_content_hash;
@@ -294,35 +294,69 @@ impl TerminalModel {
     }
 }
 
-fn detect_claude_state(line: &str, status: &Arc<std::sync::Mutex<DetectedClaudeStatus>>) {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<DetectedClaudeStatus>>) {
+    if bottom_lines.is_empty() {
         return;
+    }
+
+    let mut found_shell_prompt = false;
+    let mut found_claude_prompt = false;
+    let mut found_working = false;
+
+    for line in bottom_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Claude Code input prompt: just ">" on its own
+        if trimmed == ">" {
+            found_claude_prompt = true;
+            continue;
+        }
+
+        // Shell prompt detection (zsh %, bash $, fish ❯)
+        // Only match if it looks like a prompt line, not Claude output
+        if !trimmed.contains("claude") && !trimmed.contains("Read(") && !trimmed.contains("Edit(") {
+            if trimmed.ends_with('%') || trimmed.ends_with("$ ")
+                || trimmed.ends_with('$') || trimmed.ends_with("% ")
+                || trimmed.ends_with("❯")
+            {
+                found_shell_prompt = true;
+                continue;
+            }
+        }
+
+        // Tool call patterns and working indicators
+        if trimmed.contains("Read(")
+            || trimmed.contains("Edit(")
+            || trimmed.contains("Write(")
+            || trimmed.contains("Bash(")
+            || trimmed.contains("Agent(")
+            || trimmed.contains("Grep(")
+            || trimmed.contains("Glob(")
+            || trimmed.contains("Skill(")
+            || trimmed.contains("WebSearch(")
+            || trimmed.contains("WebFetch(")
+            || trimmed.contains("TaskCreate(")
+            || trimmed.contains("TaskUpdate(")
+            || trimmed.contains("Cooked for")
+            || trimmed.contains("Compiling")
+        {
+            found_working = true;
+        }
     }
 
     let mut s = status.lock().unwrap();
 
-    if trimmed.ends_with('>') || trimmed.ends_with(')') || trimmed.contains("auto mode on") {
-        if trimmed.len() < 5 {
-            *s = DetectedClaudeStatus::WaitingForInput;
-        }
-    }
-
-    if trimmed.contains("Cooked for")
-        || trimmed.contains("Compiling")
-        || trimmed.contains("Running")
-        || trimmed.contains("Read(")
-        || trimmed.contains("Edit(")
-        || trimmed.contains("Write(")
-        || trimmed.contains("Bash(")
-        || trimmed.contains("Agent(")
-    {
+    if found_shell_prompt && !found_claude_prompt && !found_working {
+        *s = DetectedClaudeStatus::NotRunning;
+    } else if found_claude_prompt {
+        *s = DetectedClaudeStatus::WaitingForInput;
+    } else if found_working {
         *s = DetectedClaudeStatus::Working;
     }
-
-    if trimmed.contains("% ") && !trimmed.contains("claude") {
-        *s = DetectedClaudeStatus::NotRunning;
-    }
+    // Otherwise keep current state — don't change on ambiguous content
 }
 
 // ── Color conversion ──

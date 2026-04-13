@@ -15,7 +15,7 @@ impl ClaudeStatus {
     pub fn label(&self) -> &str {
         match self {
             ClaudeStatus::Idle => "",
-            ClaudeStatus::WaitingForInput => "Claude is waiting for your input",
+            ClaudeStatus::WaitingForInput => "Waiting for your response",
             ClaudeStatus::Working => "Claude is working...",
         }
     }

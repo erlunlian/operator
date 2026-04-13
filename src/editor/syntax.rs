@@ -61,6 +61,12 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "rs" => Some("rust"),
         "json" => Some("json"),
         "toml" => Some("rust"), // basic highlighting
+        "py" | "pyi" => Some("python"),
+        "js" | "mjs" | "cjs" => Some("javascript"),
+        "jsx" => Some("jsx"),
+        "ts" | "mts" | "cts" => Some("typescript"),
+        "tsx" => Some("tsx"),
+        "md" | "mdx" | "markdown" => Some("markdown"),
         _ => None,
     }
 }
@@ -76,6 +82,9 @@ fn make_config(
 }
 
 pub fn highlight_source(source: &str, lang: &str) -> Vec<HighlightSpan> {
+    // TypeScript extends JavaScript — its highlight query only covers TS-specific
+    // syntax, so we concatenate the JS base query with the TS additions.
+    let ts_highlights;
     let config = match lang {
         "rust" => make_config(
             tree_sitter_rust::LANGUAGE.into(),
@@ -84,6 +93,39 @@ pub fn highlight_source(source: &str, lang: &str) -> Vec<HighlightSpan> {
         "json" => make_config(
             tree_sitter_json::LANGUAGE.into(),
             tree_sitter_json::HIGHLIGHTS_QUERY,
+        ),
+        "python" => make_config(
+            tree_sitter_python::LANGUAGE.into(),
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+        ),
+        "javascript" => make_config(
+            tree_sitter_javascript::LANGUAGE.into(),
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+        ),
+        "jsx" => make_config(
+            tree_sitter_javascript::LANGUAGE.into(),
+            &format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            ),
+        ),
+        "typescript" | "tsx" => {
+            ts_highlights = format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            );
+            let language = if lang == "tsx" {
+                tree_sitter_typescript::LANGUAGE_TSX
+            } else {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+            };
+            make_config(language.into(), &ts_highlights)
+        }
+        "markdown" => make_config(
+            tree_sitter_md::LANGUAGE.into(),
+            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
         ),
         _ => return vec![],
     };

@@ -44,6 +44,15 @@ pub struct SearchResult {
     pub line_text: String,
 }
 
+/// A single row in the flattened search display list.
+#[derive(Clone)]
+enum SearchDisplayRow {
+    /// File path header — groups results under a filename.
+    FileHeader(String),
+    /// A search result line with its index into `search_results`.
+    Result(usize),
+}
+
 pub struct CommandCenter {
     pub visible: bool,
     pub mode: CommandCenterMode,
@@ -70,8 +79,15 @@ pub struct CommandCenter {
     search_task: Option<Task<()>>,
     /// Debounce task for search-as-you-type.
     search_debounce: Option<Task<()>>,
-    /// Scroll handle for the results list.
+    /// Receiver for streaming search results from the worker thread.
+    search_rx: Option<std::sync::mpsc::Receiver<Vec<SearchResult>>>,
+    /// Scroll handle for the commands list.
     scroll_handle: ScrollHandle,
+    /// Virtualized scroll handle for search results.
+    search_scroll_handle: UniformListScrollHandle,
+    /// Flattened display rows for the search result list (file headers + result lines).
+    /// Rebuilt whenever search_results changes.
+    search_display_rows: Vec<SearchDisplayRow>,
 }
 
 impl CommandCenter {
@@ -103,6 +119,7 @@ impl CommandCenter {
                 cc.selected_ix = 0;
                 if cc.mode == CommandCenterMode::SearchWorkspace {
                     cc.search_results.clear();
+                    cc.search_display_rows.clear();
                     // Debounce: cancel previous pending search, schedule a new one
                     cc.search_debounce = None;
                     if new_text.trim().is_empty() {
@@ -146,7 +163,10 @@ impl CommandCenter {
             searching: false,
             search_task: None,
             search_debounce: None,
+            search_rx: None,
             scroll_handle: ScrollHandle::new(),
+            search_scroll_handle: UniformListScrollHandle::new(),
+            search_display_rows: Vec::new(),
         }
     }
 
@@ -201,6 +221,11 @@ impl CommandCenter {
         self.query.clear();
         self.status_message = None;
         self.search_results.clear();
+        self.search_display_rows.clear();
+        // Cancel any in-flight search (drops rx → worker thread exits)
+        self.search_task = None;
+        self.search_rx = None;
+        self.searching = false;
         // Defer the input clear to avoid a double-lease panic when
         // reset_state is called from within a TextInput callback
         // (e.g. on_cancel/on_submit → dismiss → reset_state).
@@ -319,156 +344,141 @@ impl CommandCenter {
             Some(r) => r.clone(),
             None => return,
         };
-        // Cancel any in-flight search
+        // Cancel any in-flight search. Dropping search_rx causes the worker
+        // thread's tx.send() to fail, which makes it exit cleanly.
         self.search_task = None;
+        self.search_rx = None;
         self.searching = true;
         self.search_results.clear();
+        self.search_display_rows.clear();
         self.status_message = Some("Searching...".into());
         cx.notify();
 
-        let task = cx.spawn(async |entity, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    Self::exec_search(&query, &root)
-                })
-                .await;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<SearchResult>>();
+        self.search_rx = Some(rx);
 
-            let _ = cx.update(|cx| {
-                let _ = entity.update(cx, |cc, cx| {
-                    cc.searching = false;
-                    cc.search_task = None;
-                    match result {
-                        Ok(results) => {
-                            let count = results.len();
-                            cc.search_results = results;
-                            cc.selected_ix = 0;
-                            cc.status_message = if count == 0 {
-                                Some("No results found".into())
-                            } else {
-                                Some(format!("{} result{}", count, if count == 1 { "" } else { "s" }))
-                            };
-                        }
-                        Err(msg) => {
-                            cc.status_message = Some(format!("Error: {msg}"));
-                        }
-                    }
-                    cx.notify();
-                });
-            });
+        // Worker thread: blocking I/O reading from rg/grep, sends batches
+        std::thread::spawn(move || {
+            search_worker(&query, &root, tx);
+        });
+
+        // GPUI task: polls the entity's receiver and streams batches into the UI
+        let task = cx.spawn(async |entity, cx| {
+            loop {
+                // Brief sleep to batch up results and avoid UI thrashing
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(32))
+                    .await;
+
+                let should_stop = cx.update(|cx| {
+                    entity.update(cx, |cc, cx| {
+                        cc.drain_search_batches(cx)
+                    }).unwrap_or(true)
+                }).unwrap_or(true);
+
+                if should_stop {
+                    return;
+                }
+            }
         });
         self.search_task = Some(task);
     }
 
-    /// Run the search using ripgrep (fast) with a grep fallback.
-    fn exec_search(query: &str, root: &PathBuf) -> Result<Vec<SearchResult>, String> {
-        // Try ripgrep first — it respects .gitignore, skips binary files,
-        // and is an order of magnitude faster than grep.
-        let rg_result = std::process::Command::new("rg")
-            .args([
-                "--line-number",
-                "--max-count", "5",     // at most 5 matches per file
-                "--max-columns", "200", // skip extremely long lines
-                "--max-columns-preview",
-                "--color", "never",
-                "--smart-case",
-                "--max-filesize", "1M",
-                "-g", "!.git",
-                "--",
-                query,
-            ])
-            .current_dir(root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output();
-
-        if let Ok(out) = rg_result {
-            if out.status.success() || out.status.code() == Some(1) {
-                // rg exit 1 = no matches
-                return Ok(Self::parse_search_output(
-                    &String::from_utf8_lossy(&out.stdout),
-                    Some(root),
-                ));
+    /// Drain all available batches from the search receiver.
+    /// Returns `true` when the search is done (worker disconnected and queue empty).
+    /// Scroll the appropriate list to keep the selected item visible.
+    fn scroll_to_selected(&self) {
+        match &self.mode {
+            CommandCenterMode::SearchWorkspace => {
+                // Find the display row for the selected result index
+                if let Some(row_ix) = self.search_display_rows.iter().position(|row| {
+                    matches!(row, SearchDisplayRow::Result(i) if *i == self.selected_ix)
+                }) {
+                    self.search_scroll_handle.scroll_to_item(row_ix, ScrollStrategy::Center);
+                }
+            }
+            _ => {
+                self.scroll_handle.scroll_to_item(self.selected_ix);
             }
         }
-
-        // Fallback to grep
-        let output = std::process::Command::new("grep")
-            .args([
-                "-rn",
-                "-i",
-                "-m", "5",
-                "--include=*.rs",
-                "--include=*.ts",
-                "--include=*.tsx",
-                "--include=*.js",
-                "--include=*.jsx",
-                "--include=*.py",
-                "--include=*.go",
-                "--include=*.toml",
-                "--include=*.json",
-                "--include=*.yaml",
-                "--include=*.yml",
-                "--include=*.md",
-                "--include=*.css",
-                "--include=*.html",
-                "--include=*.sh",
-                "--include=*.c",
-                "--include=*.cpp",
-                "--include=*.h",
-                "--include=*.java",
-                "--include=*.rb",
-                "--include=*.swift",
-                "--exclude-dir=.git",
-                "--exclude-dir=node_modules",
-                "--exclude-dir=target",
-                "--exclude-dir=build",
-                "--exclude-dir=dist",
-                "--exclude-dir=.next",
-                "--exclude-dir=vendor",
-                "--exclude-dir=__pycache__",
-                "--",
-                query,
-                &root.to_string_lossy(),
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        Ok(Self::parse_search_output(
-            &String::from_utf8_lossy(&output.stdout),
-            None,
-        ))
     }
 
-    /// Parse grep/rg output lines of the form `file:line:content`.
-    fn parse_search_output(stdout: &str, relative_root: Option<&PathBuf>) -> Vec<SearchResult> {
-        let mut results = Vec::new();
-        for line in stdout.lines() {
-            if results.len() >= 100 {
-                break;
+    /// Rebuild the flattened display rows from `search_results`.
+    fn rebuild_search_display_rows(&mut self) {
+        let mut rows = Vec::new();
+        let mut last_path: Option<PathBuf> = None;
+        for (i, result) in self.search_results.iter().enumerate() {
+            if last_path.as_ref() != Some(&result.path) {
+                last_path = Some(result.path.clone());
+                let display_path = if let Some(root) = &self.search_root {
+                    result
+                        .path
+                        .strip_prefix(root)
+                        .unwrap_or(&result.path)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    result.path.to_string_lossy().to_string()
+                };
+                rows.push(SearchDisplayRow::FileHeader(display_path));
             }
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() >= 3 {
-                let file_path = parts[0];
-                if let Ok(line_num) = parts[1].parse::<usize>() {
-                    let content = parts[2].trim().to_string();
-                    let path = if let Some(root) = relative_root {
-                        root.join(file_path)
-                    } else {
-                        PathBuf::from(file_path)
-                    };
-                    results.push(SearchResult {
-                        path,
-                        line_num,
-                        line_text: content,
-                    });
+            rows.push(SearchDisplayRow::Result(i));
+        }
+        self.search_display_rows = rows;
+    }
+
+    fn drain_search_batches(&mut self, cx: &mut Context<Self>) -> bool {
+        let rx = match &self.search_rx {
+            Some(rx) => rx,
+            None => return true,
+        };
+
+        let mut got_batch = false;
+        let mut disconnected = false;
+
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => {
+                    self.search_results.extend(batch);
+                    got_batch = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
             }
         }
-        results
+
+        if got_batch {
+            self.rebuild_search_display_rows();
+            let count = self.search_results.len();
+            self.selected_ix = self.selected_ix.min(count.saturating_sub(1));
+            self.status_message = Some(format!(
+                "{} result{}{}",
+                count,
+                if count == 1 { "" } else { "s" },
+                if disconnected { "" } else { "..." }
+            ));
+            cx.notify();
+        }
+
+        if disconnected {
+            self.searching = false;
+            self.search_rx = None;
+            let count = self.search_results.len();
+            self.status_message = if count == 0 {
+                Some("No results found".into())
+            } else {
+                Some(format!("{} result{}", count, if count == 1 { "" } else { "s" }))
+            };
+            cx.notify();
+            return true;
+        }
+
+        false
     }
+
 
     pub fn clone_repo(&mut self, url: String, cx: &mut Context<Self>) {
         if url.trim().is_empty() || self.cloning {
@@ -524,6 +534,144 @@ impl CommandCenter {
     }
 }
 
+// ── Search worker (runs on a background std::thread) ──
+
+/// Blocking I/O worker: spawns rg (or grep fallback), reads stdout line-by-line,
+/// and sends batches of results through the channel. Exits when:
+/// - rg/grep finishes naturally (EOF)
+/// - the receiver is dropped (search cancelled by the UI)
+fn search_worker(query: &str, root: &PathBuf, tx: std::sync::mpsc::Sender<Vec<SearchResult>>) {
+    use std::io::BufRead;
+
+    let (mut child, is_rg) = if let Some(c) = spawn_rg(query, root) {
+        (c, true)
+    } else if let Some(c) = spawn_grep(query, root) {
+        (c, false)
+    } else {
+        return;
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let relative_root = if is_rg { Some(root) } else { None };
+    let reader = std::io::BufReader::new(stdout);
+    let mut batch = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if let Some(result) = parse_search_line(&line, relative_root) {
+            batch.push(result);
+        }
+        if batch.len() >= 20 {
+            if tx.send(std::mem::take(&mut batch)).is_err() {
+                // Receiver dropped — search was cancelled
+                break;
+            }
+        }
+    }
+
+    // Flush remaining results
+    if !batch.is_empty() {
+        let _ = tx.send(batch);
+    }
+
+    // Ensure the child process is fully reaped
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_rg(query: &str, root: &PathBuf) -> Option<std::process::Child> {
+    std::process::Command::new("rg")
+        .args([
+            "--line-number",
+            "--max-count", "5",     // at most 5 matches per file
+            "--max-columns", "200", // skip extremely long lines
+            "--max-columns-preview",
+            "--color", "never",
+            "--smart-case",
+            "--max-filesize", "1M",
+            "-g", "!.git",
+            "--",
+            query,
+        ])
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+fn spawn_grep(query: &str, root: &PathBuf) -> Option<std::process::Child> {
+    std::process::Command::new("grep")
+        .args([
+            "-rn",
+            "-i",
+            "-m", "5",
+            "--include=*.rs",
+            "--include=*.ts",
+            "--include=*.tsx",
+            "--include=*.js",
+            "--include=*.jsx",
+            "--include=*.py",
+            "--include=*.go",
+            "--include=*.toml",
+            "--include=*.json",
+            "--include=*.yaml",
+            "--include=*.yml",
+            "--include=*.md",
+            "--include=*.css",
+            "--include=*.html",
+            "--include=*.sh",
+            "--include=*.c",
+            "--include=*.cpp",
+            "--include=*.h",
+            "--include=*.java",
+            "--include=*.rb",
+            "--include=*.swift",
+            "--exclude-dir=.git",
+            "--exclude-dir=node_modules",
+            "--exclude-dir=target",
+            "--exclude-dir=build",
+            "--exclude-dir=dist",
+            "--exclude-dir=.next",
+            "--exclude-dir=vendor",
+            "--exclude-dir=__pycache__",
+            "--",
+            query,
+            &root.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Parse a single grep/rg output line of the form `file:line:content`.
+fn parse_search_line(line: &str, relative_root: Option<&PathBuf>) -> Option<SearchResult> {
+    let parts: Vec<&str> = line.splitn(3, ':').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let line_num = parts[1].parse::<usize>().ok()?;
+    let content = parts[2].trim().to_string();
+    let path = if let Some(root) = relative_root {
+        root.join(parts[0])
+    } else {
+        PathBuf::from(parts[0])
+    };
+    Some(SearchResult {
+        path,
+        line_num,
+        line_text: content,
+    })
+}
+
 fn extract_repo_name(url: &str) -> String {
     let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
     url.rsplit('/')
@@ -567,7 +715,7 @@ impl Render for CommandCenter {
             .left_auto()
             .right_auto()
             .w(px(560.0))
-            .max_h(px(420.0))
+            .max_h(px(600.0))
             .bg(colors::surface())
             .border_1()
             .border_color(colors::border())
@@ -584,7 +732,7 @@ impl Render for CommandCenter {
                             if cc.selected_ix > 0 {
                                 cc.selected_ix -= 1;
                             }
-                            cc.scroll_handle.scroll_to_item(cc.selected_ix);
+                            cc.scroll_to_selected();
                             cx.notify();
                         });
                     }
@@ -594,7 +742,7 @@ impl Render for CommandCenter {
                             if cc.selected_ix < max_ix {
                                 cc.selected_ix += 1;
                             }
-                            cc.scroll_handle.scroll_to_item(cc.selected_ix);
+                            cc.scroll_to_selected();
                             cx.notify();
                         });
                     }
@@ -702,7 +850,7 @@ impl Render for CommandCenter {
                 }
             }
             CommandCenterMode::SearchWorkspace => {
-                if self.search_results.is_empty() {
+                if self.search_display_rows.is_empty() {
                     if self.query.is_empty() && self.status_message.is_none() {
                         modal = modal.child(
                             div()
@@ -717,111 +865,96 @@ impl Render for CommandCenter {
                         );
                     }
                 } else {
-                    let count = self.search_results.len();
-                    let selected = self.selected_ix.min(count.saturating_sub(1));
+                    let selected = self.selected_ix.min(self.search_results.len().saturating_sub(1));
+                    let display_rows = self.search_display_rows.clone();
+                    let results = self.search_results.clone();
+                    let entity = cx.entity().clone();
 
-                    let mut list = div()
-                        .id("search-results-list")
-                        .flex()
-                        .flex_col()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll_handle)
-                        .max_h(px(340.0));
-
-                    // Group results by file — results are already ordered by file
-                    // from grep/rg output so consecutive entries share a path.
-                    let mut child_ix: usize = 0;
-                    let mut scroll_child_ix: Option<usize> = None;
-                    let mut last_path: Option<PathBuf> = None;
-
-                    for (result_ix, result) in self.search_results.iter().enumerate() {
-                        // Emit file header when the path changes
-                        if last_path.as_ref() != Some(&result.path) {
-                            last_path = Some(result.path.clone());
-
-                            let display_path = if let Some(root) = &self.search_root {
-                                result
-                                    .path
-                                    .strip_prefix(root)
-                                    .unwrap_or(&result.path)
-                                    .to_string_lossy()
-                                    .to_string()
-                            } else {
-                                result.path.to_string_lossy().to_string()
-                            };
-
-                            list = list.child(
-                                div()
-                                    .id(ElementId::Name(
-                                        format!("search-file-{child_ix}").into(),
-                                    ))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .px_3()
-                                    .pt(px(6.0))
-                                    .pb(px(2.0))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(colors::accent())
-                                            .overflow_x_hidden()
-                                            .child(display_path),
-                                    ),
-                            );
-                            child_ix += 1;
-                        }
-
-                        let is_selected = result_ix == selected;
-                        if is_selected {
-                            scroll_child_ix = Some(child_ix);
-                        }
-                        let bg = if is_selected {
-                            colors::surface_hover()
-                        } else {
-                            colors::surface()
-                        };
-
-                        list = list.child(
-                            div()
-                                .id(ElementId::Name(
-                                    format!("search-result-{child_ix}").into(),
-                                ))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .pl(px(20.0))
-                                .pr(px(12.0))
-                                .py_1()
-                                .bg(bg)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(colors::surface_hover()))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(colors::text_muted())
-                                        .flex_shrink_0()
-                                        .w(px(32.0))
-                                        .child(format!("{}", result.line_num)),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(colors::text())
-                                        .flex_1()
-                                        .overflow_x_hidden()
-                                        .child(result.line_text.clone()),
-                                ),
-                        );
-                        child_ix += 1;
-                    }
-
-                    // Scroll to the selected item's visual position
-                    if let Some(ci) = scroll_child_ix {
-                        self.scroll_handle.scroll_to_item(ci);
-                    }
+                    let list = uniform_list(
+                        "search-results-list",
+                        display_rows.len(),
+                        move |range, _window, _cx| {
+                            range
+                                .map(|row_ix| {
+                                    match &display_rows[row_ix] {
+                                        SearchDisplayRow::FileHeader(path) => {
+                                            div()
+                                                .id(ElementId::Name(
+                                                    format!("search-file-{row_ix}").into(),
+                                                ))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .px_3()
+                                                .pt(px(6.0))
+                                                .pb(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(colors::accent())
+                                                        .overflow_x_hidden()
+                                                        .child(path.clone()),
+                                                )
+                                                .into_any_element()
+                                        }
+                                        SearchDisplayRow::Result(result_ix) => {
+                                            let result_ix = *result_ix;
+                                            let result = &results[result_ix];
+                                            let is_selected = result_ix == selected;
+                                            let bg = if is_selected {
+                                                colors::surface_hover()
+                                            } else {
+                                                colors::surface()
+                                            };
+                                            let click_entity = entity.clone();
+                                            let click_result = result.clone();
+                                            div()
+                                                .id(ElementId::Name(
+                                                    format!("search-result-{row_ix}").into(),
+                                                ))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .pl(px(20.0))
+                                                .pr(px(12.0))
+                                                .py_1()
+                                                .bg(bg)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(colors::surface_hover()))
+                                                .on_click(move |_, _window, cx| {
+                                                    click_entity.update(cx, |cc, cx| {
+                                                        cc.pending_search_result =
+                                                            Some(click_result.clone());
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors::text_muted())
+                                                        .flex_shrink_0()
+                                                        .w(px(32.0))
+                                                        .child(format!("{}", result.line_num)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors::text())
+                                                        .flex_1()
+                                                        .overflow_x_hidden()
+                                                        .child(result.line_text.clone()),
+                                                )
+                                                .into_any_element()
+                                        }
+                                    }
+                                })
+                                .collect()
+                        },
+                    )
+                    .flex_1()
+                    .track_scroll(self.search_scroll_handle.clone());
 
                     modal = modal.child(list);
                 }

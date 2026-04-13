@@ -1,5 +1,6 @@
 use gpui::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
@@ -45,6 +46,8 @@ pub struct TerminalView {
     has_been_focused: bool,
     /// Accumulated scroll pixels for smooth trackpad scrolling.
     scroll_px: f32,
+    /// Set by prepaint when terminal dimensions change; scroll handler resets scroll_px.
+    size_changed: Arc<AtomicBool>,
 }
 
 impl TerminalView {
@@ -78,6 +81,7 @@ impl TerminalView {
             cell_width,
             has_been_focused: false,
             scroll_px: 0.0,
+            size_changed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -169,6 +173,7 @@ impl Render for TerminalView {
         let cell_width = self.cell_width;
 
         let last_bounds = self.last_bounds.clone();
+        let size_changed = self.size_changed.clone();
 
         let grid_canvas = canvas(
             // Prepaint: resize detection
@@ -176,17 +181,19 @@ impl Render for TerminalView {
                 let terminal_entity = terminal_entity.clone();
                 let last_size = last_size.clone();
                 let last_bounds = last_bounds.clone();
+                let size_changed = size_changed.clone();
                 move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
                     *last_bounds.lock().unwrap() = bounds;
 
-                    let w = bounds.size.width / px(1.0);
-                    let h = bounds.size.height / px(1.0);
-                    let cols = ((w - PADDING_PX * 2.0) / cell_width).max(1.0) as u16;
-                    let rows = ((h - PADDING_PX * 2.0) / CELL_HEIGHT_PX).max(1.0) as u16;
+                    let w = f32::from(bounds.size.width);
+                    let h = f32::from(bounds.size.height);
+                    let cols = ((w - PADDING_PX * 2.0) / cell_width).floor().max(1.0) as u16;
+                    let rows = ((h - PADDING_PX * 2.0) / CELL_HEIGHT_PX).floor().max(1.0) as u16;
 
                     let mut cached = last_size.lock().unwrap();
                     if *cached != Some((rows, cols)) {
                         *cached = Some((rows, cols));
+                        size_changed.store(true, Ordering::Release);
                         let term = terminal_entity.read(cx);
                         term.resize(rows, cols);
                     }
@@ -406,6 +413,11 @@ impl Render for TerminalView {
             }))
             // ── Scroll ──
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                // Reset accumulated scroll pixels if terminal was resized,
+                // since the old accumulation is based on stale dimensions.
+                if this.size_changed.swap(false, Ordering::Acquire) {
+                    this.scroll_px = 0.0;
+                }
                 let line_height = CELL_HEIGHT_PX;
                 let scroll_lines: Option<i32> = match event.delta {
                     ScrollDelta::Lines(delta) => {

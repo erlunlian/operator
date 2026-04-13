@@ -468,6 +468,7 @@ impl PaneGroup {
             &tab_icons,
             active_ix,
             group_id,
+            !has_splits,
             Rc::new(move |ix, _window, cx| {
                 pg.update(cx, |pg, cx| {
                     set_active_tab_in_group(&mut pg.root, group_id, ix);
@@ -701,6 +702,8 @@ impl PaneGroup {
                         handle_idx,
                         fraction,
                     );
+                    // Notify all terminal/file views so they detect new bounds
+                    notify_tab_contents(&pg.root, cx);
                     cx.notify();
                 });
             },
@@ -736,11 +739,11 @@ impl PaneGroup {
                     SplitAxis::Vertical => div()
                         .id(ElementId::Name(handle_id.into()))
                         .w_full()
-                        .h(px(12.0))
-                        .my(px(-6.0))
+                        .h(px(6.0))
+                        .my(px(-3.0))
                         .flex_shrink_0()
                         .cursor_row_resize()
-                        .justify_center()
+                        .items_center()
                         .child(
                             div()
                                 .w_full()
@@ -1232,6 +1235,30 @@ fn find_group(node: &SplitNode, group_id: usize) -> Option<&TabGroup> {
                 }
             }
             None
+        }
+    }
+}
+
+/// Notify all terminal views in the tree so they detect new bounds after a split resize.
+fn notify_tab_contents(node: &SplitNode, cx: &mut App) {
+    match node {
+        SplitNode::Leaf(group) => {
+            // Collect terminal view references first, then notify (avoids borrow conflict)
+            let terminals: Vec<Entity<crate::terminal::terminal_view::TerminalView>> =
+                group.tabs.iter().filter_map(|tab| {
+                    match &tab.read(cx).content {
+                        crate::tab::tab::TabContent::Terminal(tv) => Some(tv.clone()),
+                        _ => None,
+                    }
+                }).collect();
+            for tv in terminals {
+                tv.update(cx, |_tv, cx| cx.notify());
+            }
+        }
+        SplitNode::Split { children, .. } => {
+            for child in children {
+                notify_tab_contents(child, cx);
+            }
         }
     }
 }

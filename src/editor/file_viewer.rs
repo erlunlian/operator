@@ -1341,7 +1341,7 @@ impl FileViewer {
         self.jump_to_search_match();
     }
 
-    pub fn open_search_with_input(&mut self, cx: &mut Context<Self>) {
+    pub fn open_search_with_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_active = true;
         self.search_query.clear();
         self.search_matches.clear();
@@ -1361,9 +1361,9 @@ impl FileViewer {
                 });
             }));
 
-            inp.set_on_cancel(Rc::new(move |_window, cx| {
+            inp.set_on_cancel(Rc::new(move |window, cx| {
                 entity_cancel.update(cx, |fv, cx| {
-                    fv.close_search();
+                    fv.close_search(window);
                     cx.notify();
                 });
             }));
@@ -1383,16 +1383,18 @@ impl FileViewer {
         })
         .detach();
 
-        self.search_input = Some(input);
+        self.search_input = Some(input.clone());
+        input.read(cx).focus(window);
         cx.notify();
     }
 
-    pub fn close_search(&mut self) {
+    pub fn close_search(&mut self, window: &mut Window) {
         self.search_active = false;
         self.search_query.clear();
         self.search_input = None;
         self.search_matches.clear();
         self.search_match_ix = 0;
+        self.focus_handle.focus(window);
     }
 
     /// Navigate to a specific line (1-indexed).
@@ -1408,15 +1410,17 @@ impl FileViewer {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let ks = &event.keystroke;
 
-        // If search is active, Escape closes it
-        if self.search_active && ks.key.as_str() == "escape" {
-            self.close_search();
-            cx.notify();
+        // If search is active, Escape closes it; all other keys go to search input
+        if self.search_active {
+            if ks.key.as_str() == "escape" {
+                self.close_search(window);
+                cx.notify();
+            }
             return;
         }
 
@@ -1648,11 +1652,11 @@ impl FileViewer {
         }
     }
 
-    fn handle_find(&mut self, _: &FindInFile, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_find(&mut self, _: &FindInFile, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_active {
-            self.close_search();
+            self.close_search(window);
         } else {
-            self.open_search_with_input(cx);
+            self.open_search_with_input(window, cx);
         }
         cx.notify();
     }

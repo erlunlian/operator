@@ -25,9 +25,9 @@ release:
 install: release
 	cp -r target/release/Operator.app /Applications/
 
-# Open the built .app (-n forces new instance even if already running)
-open: release
-	open -n target/release/Operator.app
+# Open the installed app (-n forces new instance even if already running)
+open:
+	open -n /Applications/Operator.app
 
 # Clean build artifacts
 clean:

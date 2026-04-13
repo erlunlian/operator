@@ -65,6 +65,9 @@ pub struct WorkspaceState {
     pub name: String,
     pub directory: Option<PathBuf>,
     pub layout: Option<SplitNodeState>,
+    /// Files open in the editor for this workspace.
+    #[serde(default)]
+    pub open_files: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -110,22 +113,6 @@ pub struct EditorState {
 impl SessionState {
     pub fn capture(app: &crate::app::OperatorApp, cx: &gpui::App) -> Self {
         let settings = crate::settings::AppSettings::get(cx);
-        let workspaces = app
-            .workspaces
-            .iter()
-            .map(|ws_entity| {
-                let ws = ws_entity.read(cx);
-                let layout = ws.layout.as_ref().map(|pg_entity| {
-                    let pg = pg_entity.read(cx);
-                    Self::capture_split_node(&pg.root, cx)
-                });
-                WorkspaceState {
-                    name: ws.name.to_string(),
-                    directory: ws.directory.clone(),
-                    layout,
-                }
-            })
-            .collect();
 
         let rp = app.right_panel.read(cx);
         let right_panel_tab = match rp.active_tab {
@@ -134,16 +121,35 @@ impl SessionState {
             RightPanelTab::Pr => "pr",
         };
 
-        // Capture editor state from right panel
-        let (editor_open_files, editor_active_file_ix) = if let Some(editor) = &rp.editor {
-            let editor = editor.read(cx);
-            (
-                editor.all_open_files(cx),
-                0, // active file index not meaningful with split panes
-            )
-        } else {
-            (Vec::new(), 0)
-        };
+        // Get live editor files for the active workspace
+        let live_editor_files: Vec<PathBuf> = rp.editor.as_ref()
+            .map(|editor| editor.read(cx).all_open_files(cx))
+            .unwrap_or_default();
+
+        let workspaces: Vec<WorkspaceState> = app
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, ws_entity)| {
+                let ws = ws_entity.read(cx);
+                let layout = ws.layout.as_ref().map(|pg_entity| {
+                    let pg = pg_entity.read(cx);
+                    Self::capture_split_node(&pg.root, cx)
+                });
+                // Active workspace: use live editor files; others: use cached
+                let open_files = if i == app.active_workspace_ix {
+                    live_editor_files.clone()
+                } else {
+                    ws.cached_editor_files.clone()
+                };
+                WorkspaceState {
+                    name: ws.name.to_string(),
+                    directory: ws.directory.clone(),
+                    layout,
+                    open_files,
+                }
+            })
+            .collect();
 
         SessionState {
             workspaces,
@@ -162,8 +168,9 @@ impl SessionState {
                 window_y: app.window_bounds.map(|b| b.1),
                 window_width: app.window_bounds.map(|b| b.2),
                 window_height: app.window_bounds.map(|b| b.3),
-                editor_open_files,
-                editor_active_file_ix,
+                // Legacy: keep for backwards compat, populated from active workspace
+                editor_open_files: live_editor_files,
+                editor_active_file_ix: 0,
             },
         }
     }
@@ -259,6 +266,7 @@ impl SessionState {
                     let name = ws_state.name.clone();
                     let dir = dir.clone();
                     let layout_state = ws_state.layout.clone();
+                    let open_files = ws_state.open_files.clone();
                     cx.new(|cx: &mut gpui::Context<crate::workspace::Workspace>| {
                         let dir_for_layout = dir.clone();
                         let mut ws = crate::workspace::Workspace::new(
@@ -282,6 +290,7 @@ impl SessionState {
                                 .detach();
                             ws.layout = Some(layout);
                         }
+                        ws.cached_editor_files = open_files;
                         ws
                     })
                 } else {
@@ -306,8 +315,16 @@ impl SessionState {
             .get(active_workspace_ix)
             .and_then(|ws| ws.read(cx).directory.clone());
 
-        let editor_open_files = self.settings.editor_open_files.clone();
-        let _editor_active_file_ix = self.settings.editor_active_file_ix;
+        // Get editor files for active workspace: prefer per-workspace, fall back to legacy global
+        let active_ws_files: Vec<PathBuf> = workspaces
+            .get(active_workspace_ix)
+            .map(|ws| ws.read(cx).cached_editor_files.clone())
+            .unwrap_or_default();
+        let editor_open_files = if !active_ws_files.is_empty() {
+            active_ws_files
+        } else {
+            self.settings.editor_open_files.clone()
+        };
         let active_ws_dir_clone = active_ws_dir.clone();
 
         let right_panel = cx.new(|cx| {
@@ -329,7 +346,7 @@ impl SessionState {
             rp.width = right_panel_width;
             rp.active_tab = right_panel_tab;
 
-            // Restore editor with open files
+            // Restore editor with open files for the active workspace
             if let Some(dir) = active_ws_dir_clone {
                 rp.ensure_editor(dir, cx);
                 if let Some(editor) = &rp.editor {

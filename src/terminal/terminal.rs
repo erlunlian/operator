@@ -79,6 +79,9 @@ pub struct TerminalModel {
     event_loop_sender: EventLoopSender,
     _listener: JsonListener,
     pub claude_status: Arc<std::sync::Mutex<DetectedClaudeStatus>>,
+    /// Pending PTY resize, debounced to avoid SIGWINCH storms during interactive split resizing.
+    /// Tuple: (rows, cols, timestamp of last change).
+    pending_pty_resize: Arc<std::sync::Mutex<Option<(u16, u16, std::time::Instant)>>>,
 }
 
 impl TerminalModel {
@@ -138,11 +141,15 @@ impl TerminalModel {
         let _join_handle = event_loop.spawn();
 
         let claude_status = Arc::new(std::sync::Mutex::new(DetectedClaudeStatus::NotRunning));
+        let pending_pty_resize: Arc<std::sync::Mutex<Option<(u16, u16, std::time::Instant)>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         // Periodic render refresh — only notify when content changes
         let term_clone = term.clone();
         let listener_clone = listener.clone();
         let claude_status_clone = claude_status.clone();
+        let pending_resize_clone = pending_pty_resize.clone();
+        let sender_clone = event_loop_sender.clone();
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_this, cx| {
             let mut last_content_hash: u64 = 0;
@@ -150,6 +157,45 @@ impl TerminalModel {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(16))
                     .await;
+
+                // Flush debounced PTY resize after 200ms of stability.
+                // The grid was already resized (without reflow) in resize().
+                // Now do a proper Term::resize (with reflow) so the grid state
+                // is fully correct, then send SIGWINCH so the shell redraws.
+                let mut did_resize = false;
+                {
+                    let mut pending = pending_resize_clone.lock().unwrap();
+                    if let Some((rows, cols, when)) = *pending {
+                        if when.elapsed() >= std::time::Duration::from_millis(200) {
+                            // Final grid resize with proper reflow + bookkeeping
+                            let dims = TermDimensions {
+                                cols: cols as usize,
+                                rows: rows as usize,
+                            };
+                            term_clone.lock().resize(dims);
+
+                            // Send SIGWINCH so the shell redraws for the new size
+                            let window_size = WindowSize {
+                                num_lines: rows,
+                                num_cols: cols,
+                                cell_width: CELL_WIDTH,
+                                cell_height: CELL_HEIGHT,
+                            };
+                            let _ = sender_clone.send(Msg::Resize(window_size));
+                            *pending = None;
+                            did_resize = true;
+                        }
+                    }
+                }
+
+                if did_resize {
+                    let entity_clone = entity.clone();
+                    let _ = cx.update(|cx| {
+                        if let Some(e) = entity_clone.upgrade() {
+                            e.update(cx, |_this, cx| cx.notify());
+                        }
+                    });
+                }
 
                 // Process events from terminal
                 let events = listener_clone.take_events();
@@ -222,6 +268,7 @@ impl TerminalModel {
             event_loop_sender,
             _listener: listener,
             claude_status,
+            pending_pty_resize,
         }
     }
 
@@ -236,18 +283,10 @@ impl TerminalModel {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {
-        let dims = TermDimensions {
-            cols: cols as usize,
-            rows: rows as usize,
-        };
-        self.term.lock().resize(dims);
-        let window_size = WindowSize {
-            num_lines: rows,
-            num_cols: cols,
-            cell_width: CELL_WIDTH,
-            cell_height: CELL_HEIGHT,
-        };
-        let _ = self.event_loop_sender.send(Msg::Resize(window_size));
+        // Debounce both grid and PTY resize. The grid is NOT touched during the
+        // drag — Term::resize() (with full bookkeeping) runs once after 200ms of
+        // stability, followed by the PTY SIGWINCH so the shell redraws.
+        *self.pending_pty_resize.lock().unwrap() = Some((rows, cols, std::time::Instant::now()));
     }
 
     pub fn get_claude_status(&self) -> DetectedClaudeStatus {

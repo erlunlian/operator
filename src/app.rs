@@ -261,6 +261,7 @@ impl OperatorApp {
 
     /// Remove the active workspace, adjusting the index or quitting if none remain.
     fn remove_active_workspace(&mut self, cx: &mut Context<Self>) {
+        self.cache_editor_files(cx);
         self.workspaces.remove(self.active_workspace_ix);
         if self.workspaces.is_empty() {
             // Instead of quitting, create a fresh uninitialized workspace
@@ -286,6 +287,13 @@ impl OperatorApp {
         if self.active_workspace_ix >= self.workspaces.len() {
             self.active_workspace_ix = self.workspaces.len() - 1;
         }
+        // Restore editor files for the new active workspace
+        let new_ix = self.active_workspace_ix;
+        let dir = self.workspaces[new_ix].read(cx).directory.clone();
+        if let Some(dir) = dir {
+            self.update_right_panel_dir(dir, cx);
+            self.restore_editor_files_for_workspace(new_ix, cx);
+        }
         cx.notify();
     }
 
@@ -295,6 +303,47 @@ impl OperatorApp {
         self.workspaces.push(ws);
         self.active_workspace_ix = self.workspaces.len() - 1;
         cx.notify();
+    }
+
+    /// Cache the current editor's open files into the active workspace,
+    /// so they survive workspace switches and session saves.
+    fn cache_editor_files(&self, cx: &mut Context<Self>) {
+        let files = self.right_panel.read(cx)
+            .editor.as_ref()
+            .map(|e| e.read(cx).all_open_files(cx))
+            .unwrap_or_default();
+        if let Some(ws) = self.workspaces.get(self.active_workspace_ix) {
+            ws.update(cx, |ws, _cx| {
+                ws.cached_editor_files = files;
+            });
+        }
+    }
+
+    /// Restore cached editor files for the given workspace into the right panel editor.
+    fn restore_editor_files_for_workspace(&self, ws_ix: usize, cx: &mut Context<Self>) {
+        let (dir, files) = {
+            let Some(ws) = self.workspaces.get(ws_ix) else { return };
+            let ws = ws.read(cx);
+            match &ws.directory {
+                Some(dir) => (dir.clone(), ws.cached_editor_files.clone()),
+                None => return,
+            }
+        };
+        if files.is_empty() {
+            return;
+        }
+        self.right_panel.update(cx, |rp, cx| {
+            rp.ensure_editor(dir, cx);
+            if let Some(editor) = &rp.editor {
+                editor.update(cx, |editor, cx| {
+                    for file_path in &files {
+                        if file_path.exists() {
+                            editor.open_file(file_path.clone(), cx);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     /// Whether the file editor in the right panel is currently focused.
@@ -331,11 +380,14 @@ impl OperatorApp {
         }
     }
 
-    fn close_tab(&mut self, _: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor_focused() {
             self.with_editor_pane_group(cx, |pg, cx| {
                 pg.close_focused_tab(cx);
             });
+            // The closed tab's focus handle was destroyed — restore focus to the
+            // app root so subsequent Cmd+W keystrokes still dispatch.
+            self.focus_handle.focus(window);
             return;
         }
 
@@ -346,6 +398,7 @@ impl OperatorApp {
         if !ws.read(cx).has_directory() {
             if self.workspaces.len() > 1 {
                 self.remove_active_workspace(cx);
+                self.focus_handle.focus(window);
             }
             return;
         }
@@ -353,11 +406,13 @@ impl OperatorApp {
         // If workspace already has zero tabs, Cmd+W means "close workspace"
         if ws.read(cx).total_tab_count(cx) == 0 {
             self.remove_active_workspace(cx);
+            self.focus_handle.focus(window);
             return;
         }
 
         // Try smart close (handles sub-tabs first, then outer tabs)
         ws.update(cx, |ws, cx| ws.close_tab(cx));
+        self.focus_handle.focus(window);
         // Leave the workspace open even if tabs reach 0
         cx.notify();
     }
@@ -633,6 +688,9 @@ impl OperatorApp {
         // Track in recent projects (update cached copy and persist)
         self.recent_projects.add(dir.clone());
 
+        // Cache current editor files before changing directories
+        self.cache_editor_files(cx);
+
         let ws = self.active_workspace().clone();
         if !ws.read(cx).has_directory() {
             ws.update(cx, |ws, cx| ws.set_directory(dir.clone(), cx));
@@ -648,6 +706,34 @@ impl OperatorApp {
             self.active_workspace_ix = self.workspaces.len() - 1;
         }
         self.update_right_panel_dir(dir, cx);
+        cx.notify();
+    }
+
+    /// Switch to a different workspace, caching editor state and restoring the target's files.
+    fn switch_to_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix == self.active_workspace_ix {
+            return;
+        }
+        self.cache_editor_files(cx);
+        self.active_workspace_ix = ix;
+        let dir = self.workspaces[ix].read(cx).directory.clone();
+        if let Some(dir) = dir {
+            self.update_right_panel_dir(dir, cx);
+            self.restore_editor_files_for_workspace(ix, cx);
+        } else {
+            self.right_panel.update(cx, |rp, cx| {
+                rp.diff_panel.update(cx, |panel, cx| {
+                    *panel = GitDiffPanel::empty();
+                    cx.notify();
+                });
+                rp.pr_diff_panel.update(cx, |panel, cx| {
+                    *panel = PrDiffPanel::empty();
+                    cx.notify();
+                });
+                rp.editor = None;
+                cx.notify();
+            });
+        }
         cx.notify();
     }
 
@@ -959,25 +1045,7 @@ impl Render for OperatorApp {
                 self.active_workspace_ix,
                 Rc::new(move |ix, _window, cx| {
                     app_entity.update(cx, |app, cx| {
-                        app.active_workspace_ix = ix;
-                        let dir = app.workspaces[ix].read(cx).directory.clone();
-                        if let Some(dir) = dir {
-                            app.update_right_panel_dir(dir, cx);
-                        } else {
-                            app.right_panel.update(cx, |rp, cx| {
-                                rp.diff_panel.update(cx, |panel, cx| {
-                                    *panel = GitDiffPanel::empty();
-                                    cx.notify();
-                                });
-                                rp.pr_diff_panel.update(cx, |panel, cx| {
-                                    *panel = PrDiffPanel::empty();
-                                    cx.notify();
-                                });
-                                rp.editor = None;
-                                cx.notify();
-                            });
-                        }
-                        cx.notify();
+                        app.switch_to_workspace(ix, cx);
                     });
                 }),
                 Rc::new(move |_window, cx| {
@@ -994,6 +1062,10 @@ impl Render for OperatorApp {
                         if app.workspaces.len() <= 1 {
                             return; // Don't close the last workspace
                         }
+                        // Cache files before removing if closing the active workspace
+                        if ix == app.active_workspace_ix {
+                            app.cache_editor_files(cx);
+                        }
                         app.workspaces.remove(ix);
                         if app.active_workspace_ix >= app.workspaces.len() {
                             app.active_workspace_ix = app.workspaces.len() - 1;
@@ -1002,9 +1074,11 @@ impl Render for OperatorApp {
                         } else if app.active_workspace_ix == ix {
                             app.active_workspace_ix = app.active_workspace_ix.min(app.workspaces.len() - 1);
                         }
-                        let dir = app.workspaces[app.active_workspace_ix].read(cx).directory.clone();
+                        let new_ix = app.active_workspace_ix;
+                        let dir = app.workspaces[new_ix].read(cx).directory.clone();
                         if let Some(dir) = dir {
                             app.update_right_panel_dir(dir, cx);
+                            app.restore_editor_files_for_workspace(new_ix, cx);
                         }
                         cx.notify();
                     });

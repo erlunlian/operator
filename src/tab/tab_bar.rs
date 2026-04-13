@@ -62,6 +62,7 @@ impl TabBar {
         tab_icons: &[TabIcon],
         active_ix: usize,
         group_id: usize,
+        enable_window_drag: bool,
         on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
         on_new: Rc<dyn Fn(&mut Window, &mut App)>,
         on_drop: Option<Rc<dyn Fn(usize, usize, &mut Window, &mut App)>>,
@@ -209,15 +210,16 @@ impl TabBar {
                 .child("+"),
         );
 
-        // Spacer that fills remaining tab bar width — acts as a window drag region.
-        // Double-click to zoom is handled via titlebar_double_click.
-        bar = bar.child(
-            div()
-                .id(ElementId::Name(
-                    format!("tab-bar-drag-{group_id}").into(),
-                ))
-                .flex_1()
-                .h_full()
+        // Spacer that fills remaining tab bar width.
+        // Only the top-level tab bar (not split pane tab bars) acts as a window drag region.
+        let mut spacer = div()
+            .id(ElementId::Name(
+                format!("tab-bar-drag-{group_id}").into(),
+            ))
+            .flex_1()
+            .h_full();
+        if enable_window_drag {
+            spacer = spacer
                 .on_mouse_down(MouseButton::Left, |_event, _window, _cx| {
                     start_window_drag_native();
                 })
@@ -225,8 +227,9 @@ impl TabBar {
                     if event.click_count() == 2 {
                         window.titlebar_double_click();
                     }
-                }),
-        );
+                });
+        }
+        bar = bar.child(spacer);
 
         bar
     }

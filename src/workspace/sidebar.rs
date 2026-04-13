@@ -211,13 +211,8 @@ impl WorkspaceSidebar {
             ClaudeStatus::Working => rgb(0xa6e3a1),          // green
         };
 
-        // Build the info line: "branch · ~/path"
-        let mut info_parts: Vec<String> = Vec::new();
-        if let Some(branch) = &ws.git_branch {
-            info_parts.push(branch.clone());
-        }
-        info_parts.push(ws.directory.clone());
-        let info_line = info_parts.join(" \u{00B7} "); // middle dot separator
+        let git_branch = ws.git_branch.clone();
+        let directory = ws.directory.clone();
 
         let mut card = div()
             .id(ElementId::Name(format!("ws-card-{ix}").into()))
@@ -289,13 +284,14 @@ impl WorkspaceSidebar {
         // Text content
         let mut text_col = div().flex().flex_col().flex_1().overflow_x_hidden();
 
-        // Title (bold)
+        // Title (bold, truncated)
         text_col = text_col.child(
             div()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors::text())
                 .overflow_x_hidden()
+                .text_ellipsis()
                 .child(ws.name.clone()),
         );
 
@@ -306,17 +302,32 @@ impl WorkspaceSidebar {
                 div()
                     .text_xs()
                     .text_color(status_color)
+                    .overflow_x_hidden()
+                    .text_ellipsis()
                     .child(status_label.to_string()),
             );
         }
 
-        // Branch + directory line
+        // Branch line
+        if let Some(branch) = git_branch {
+            text_col = text_col.child(
+                div()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .child(branch),
+            );
+        }
+
+        // Directory line
         text_col = text_col.child(
             div()
                 .text_xs()
                 .text_color(colors::text_muted())
                 .overflow_x_hidden()
-                .child(info_line),
+                .text_ellipsis()
+                .child(directory),
         );
 
         card = card.child(text_col);

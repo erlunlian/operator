@@ -35,6 +35,8 @@ pub struct Workspace {
     pub git_branch: Option<String>,
     pub claude_status: ClaudeStatus,
     pub layout: Option<Entity<PaneGroup>>,
+    /// Editor files cached when switching away from this workspace.
+    pub cached_editor_files: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -49,6 +51,7 @@ impl Workspace {
             git_branch,
             claude_status: ClaudeStatus::Idle,
             layout: Some(layout),
+            cached_editor_files: Vec::new(),
         }
     }
 
@@ -61,6 +64,7 @@ impl Workspace {
             git_branch: None,
             claude_status: ClaudeStatus::Idle,
             layout: None,
+            cached_editor_files: Vec::new(),
         }
     }
 

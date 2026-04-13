@@ -41,7 +41,7 @@ impl Workspace {
     /// Create a workspace with a directory already selected (has terminal layout).
     pub fn new(name: &str, directory: PathBuf, cx: &mut Context<Self>) -> Self {
         let git_branch = Self::detect_git_branch(&directory);
-        let layout = cx.new(|cx| PaneGroup::new_terminal(cx));
+        let layout = cx.new(|cx| PaneGroup::new_terminal(Some(directory.clone()), cx));
         cx.observe(&layout, |_this, _layout, cx| cx.notify()).detach();
         Self {
             name: SharedString::from(name.to_string()),
@@ -72,7 +72,7 @@ impl Workspace {
             .unwrap_or_else(|| "Workspace".to_string());
         self.name = SharedString::from(dir_name);
         self.git_branch = Self::detect_git_branch(&directory);
-        let layout = cx.new(|cx| PaneGroup::new_terminal(cx));
+        let layout = cx.new(|cx| PaneGroup::new_terminal(Some(directory.clone()), cx));
         cx.observe(&layout, |_this, _layout, cx| cx.notify()).detach();
         self.layout = Some(layout);
 
@@ -123,7 +123,10 @@ impl Workspace {
     }
 
     pub fn add_tab(&mut self, cx: &mut Context<Self>) {
-        self.with_layout(cx, |pg, cx| pg.root.add_tab(cx));
+        self.with_layout(cx, |pg, cx| {
+            let dir = pg.work_dir.clone();
+            pg.root.add_tab(dir, cx);
+        });
     }
 
     pub fn total_tab_count(&self, cx: &App) -> usize {

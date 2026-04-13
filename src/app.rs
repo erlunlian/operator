@@ -9,6 +9,7 @@ use crate::recent_projects::RecentProjects;
 use crate::settings::AppSettings;
 use crate::settings::settings_panel::SettingsPanel;
 use crate::theme::colors;
+use crate::util;
 use crate::workspace::sidebar::WorkspaceCardData;
 use crate::workspace::{Workspace, WorkspaceSidebar};
 
@@ -594,7 +595,7 @@ impl OperatorApp {
         let app_clone = cx.entity().clone();
 
         let recent_paths = self.recent_projects.paths.clone();
-        let recent_count = recent_paths.len();
+
 
         let mut content = div()
             .flex()
@@ -649,9 +650,10 @@ impl OperatorApp {
                         .gap_2()
                         .child(
                             div()
+                                .font_family(util::ICON_FONT)
                                 .text_color(colors::text_muted())
                                 .text_base()
-                                .child("\u{1F4C2}"), // folder icon
+                                .child("\u{f07c}"), // nf-fa-folder_open
                         )
                         .child(
                             div()
@@ -685,9 +687,10 @@ impl OperatorApp {
                         .gap_2()
                         .child(
                             div()
+                                .font_family(util::ICON_FONT)
                                 .text_color(colors::text_muted())
                                 .text_base()
-                                .child("\u{2B07}\u{FE0F}"), // download icon
+                                .child("\u{f1d3}"), // nf-fa-git_square
                         )
                         .child(
                             div()
@@ -719,10 +722,6 @@ impl OperatorApp {
             // Header row
             section = section.child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
                     .mb_2()
                     .child(
                         div()
@@ -730,12 +729,6 @@ impl OperatorApp {
                             .text_color(colors::text_muted())
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Recent projects"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors::text_muted())
-                            .child(format!("View all ({recent_count})")),
                     ),
             );
 
@@ -824,6 +817,8 @@ impl Render for OperatorApp {
 
         let app_entity = cx.entity().clone();
         let app_entity2 = app_entity.clone();
+        let app_entity3 = app_entity.clone();
+        let app_entity4 = app_entity.clone();
 
         let sidebar_width = self.sidebar_width;
         let sidebar = if !self.sidebar_collapsed {
@@ -854,6 +849,44 @@ impl Render for OperatorApp {
                         cx.notify();
                     });
                 }),
+                Some(Rc::new(move |ix, _window, cx| {
+                    app_entity3.update(cx, |app, cx| {
+                        if app.workspaces.len() <= 1 {
+                            return; // Don't close the last workspace
+                        }
+                        app.workspaces.remove(ix);
+                        if app.active_workspace_ix >= app.workspaces.len() {
+                            app.active_workspace_ix = app.workspaces.len() - 1;
+                        } else if app.active_workspace_ix > ix {
+                            app.active_workspace_ix -= 1;
+                        } else if app.active_workspace_ix == ix {
+                            app.active_workspace_ix = app.active_workspace_ix.min(app.workspaces.len() - 1);
+                        }
+                        let dir = app.workspaces[app.active_workspace_ix].read(cx).directory.clone();
+                        if let Some(dir) = dir {
+                            app.update_diff_panel_dir(dir, cx);
+                        }
+                        cx.notify();
+                    });
+                })),
+                Some(Rc::new(move |from_ix, to_ix, _window, cx| {
+                    app_entity4.update(cx, |app, cx| {
+                        if from_ix == to_ix || from_ix >= app.workspaces.len() || to_ix >= app.workspaces.len() {
+                            return;
+                        }
+                        let ws = app.workspaces.remove(from_ix);
+                        app.workspaces.insert(to_ix, ws);
+                        // Update active index to follow the active workspace
+                        if app.active_workspace_ix == from_ix {
+                            app.active_workspace_ix = to_ix;
+                        } else if from_ix < app.active_workspace_ix && to_ix >= app.active_workspace_ix {
+                            app.active_workspace_ix -= 1;
+                        } else if from_ix > app.active_workspace_ix && to_ix <= app.active_workspace_ix {
+                            app.active_workspace_ix += 1;
+                        }
+                        cx.notify();
+                    });
+                })),
                 sidebar_width,
             ))
         } else {

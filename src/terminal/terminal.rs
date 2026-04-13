@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
@@ -81,7 +82,7 @@ pub struct TerminalModel {
 }
 
 impl TerminalModel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(work_dir: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let listener = JsonListener::new();
         let dimensions = TermDimensions {
             cols: TERM_COLS as usize,
@@ -121,7 +122,7 @@ impl TerminalModel {
 
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new("/bin/zsh".to_string(), vec![])),
-            working_directory: Some(std::env::current_dir().unwrap_or_default()),
+            working_directory: Some(work_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default())),
             env,
             ..Default::default()
         };

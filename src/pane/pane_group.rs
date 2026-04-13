@@ -67,8 +67,8 @@ pub struct TabGroup {
 }
 
 impl TabGroup {
-    pub fn new_terminal(cx: &mut App) -> Self {
-        let tab = cx.new(|cx| Tab::new("Terminal", cx));
+    pub fn new_terminal(work_dir: Option<std::path::PathBuf>, cx: &mut App) -> Self {
+        let tab = cx.new(|cx| Tab::new("Terminal", work_dir, cx));
         Self {
             id: next_group_id(),
             tabs: vec![tab],
@@ -143,10 +143,10 @@ impl SplitNode {
     }
 
     /// Split the active (first/only) leaf, creating a sibling with a new terminal.
-    pub fn split_active(&mut self, axis: SplitAxis, cx: &mut App) -> bool {
+    pub fn split_active(&mut self, axis: SplitAxis, work_dir: Option<std::path::PathBuf>, cx: &mut App) -> bool {
         match self {
             SplitNode::Leaf(_existing) => {
-                let existing = std::mem::replace(self, SplitNode::Leaf(TabGroup::new_terminal(cx)));
+                let existing = std::mem::replace(self, SplitNode::Leaf(TabGroup::new_terminal(work_dir, cx)));
                 let new_leaf = std::mem::replace(self, existing);
                 let old = std::mem::replace(self, SplitNode::Split {
                     id: next_split_id(),
@@ -176,11 +176,11 @@ impl SplitNode {
                         *r *= scale;
                     }
                     ratios.push(new_ratio);
-                    children.push(SplitNode::Leaf(TabGroup::new_terminal(cx)));
+                    children.push(SplitNode::Leaf(TabGroup::new_terminal(work_dir, cx)));
                     true
                 } else {
                     if let Some(last) = children.last_mut() {
-                        last.split_active(axis, cx)
+                        last.split_active(axis, work_dir, cx)
                     } else {
                         false
                     }
@@ -210,17 +210,17 @@ impl SplitNode {
         }
     }
 
-    pub fn add_tab(&mut self, cx: &mut App) {
+    pub fn add_tab(&mut self, work_dir: Option<std::path::PathBuf>, cx: &mut App) {
         match self {
             SplitNode::Leaf(group) => {
                 let idx = group.tabs.len() + 1;
-                let tab = cx.new(|cx| Tab::new(&format!("Terminal {}", idx), cx));
+                let tab = cx.new(|cx| Tab::new(&format!("Terminal {}", idx), work_dir, cx));
                 group.tabs.push(tab);
                 group.active_tab_ix = group.tabs.len() - 1;
             }
             SplitNode::Split { children, .. } => {
                 if let Some(first) = children.first_mut() {
-                    first.add_tab(cx);
+                    first.add_tab(work_dir, cx);
                 }
             }
         }
@@ -421,25 +421,29 @@ pub struct PaneGroup {
     pub root: SplitNode,
     pub drop_target: Option<DropTarget>,
     pub focused_group_id: Option<usize>,
+    pub work_dir: Option<std::path::PathBuf>,
 }
 
 impl PaneGroup {
-    pub fn new_terminal(cx: &mut App) -> Self {
-        let group = TabGroup::new_terminal(cx);
+    pub fn new_terminal(work_dir: Option<std::path::PathBuf>, cx: &mut App) -> Self {
+        let group = TabGroup::new_terminal(work_dir.clone(), cx);
         let id = group.id;
         Self {
             root: SplitNode::Leaf(group),
             drop_target: None,
             focused_group_id: Some(id),
+            work_dir,
         }
     }
 
     pub fn split(&mut self, axis: SplitAxis, cx: &mut App) {
-        self.root.split_active(axis, cx);
+        let dir = self.work_dir.clone();
+        self.root.split_active(axis, dir, cx);
     }
 
     pub fn split_right(&mut self, cx: &mut App) {
-        self.root.split_active(SplitAxis::Horizontal, cx);
+        let dir = self.work_dir.clone();
+        self.root.split_active(SplitAxis::Horizontal, dir, cx);
     }
 
     /// Smart close: closes the active sub-tab in the focused group's active tab (if editor),
@@ -559,7 +563,8 @@ impl PaneGroup {
             }),
             Rc::new(move |_window, cx| {
                 pg2.update(cx, |pg, cx| {
-                    add_tab_in_group(&mut pg.root, group_id, cx);
+                    let dir = pg.work_dir.clone();
+                    add_tab_in_group(&mut pg.root, group_id, dir, cx);
                     cx.notify();
                 });
             }),
@@ -979,7 +984,7 @@ fn handle_tab_drop(
                 prune_empty_leaves(root);
             } else if src_group_id == dst_group_id {
                 // Dragging within the same group to split: create a new terminal
-                let new_tab = cx.new(|cx| Tab::new("Terminal", cx));
+                let new_tab = cx.new(|cx| Tab::new("Terminal", None, cx));
                 let (axis, before) = match zone {
                     DropZone::Left => (SplitAxis::Horizontal, true),
                     DropZone::Right => (SplitAxis::Horizontal, false),
@@ -1058,10 +1063,10 @@ fn set_active_tab_in_group(node: &mut SplitNode, group_id: usize, ix: usize) {
     }
 }
 
-fn add_tab_in_group(node: &mut SplitNode, group_id: usize, cx: &mut App) {
+fn add_tab_in_group(node: &mut SplitNode, group_id: usize, work_dir: Option<std::path::PathBuf>, cx: &mut App) {
     if let Some(group) = find_group_mut(node, group_id) {
         let idx = group.tabs.len() + 1;
-        let tab = cx.new(|cx| Tab::new(&format!("Terminal {}", idx), cx));
+        let tab = cx.new(|cx| Tab::new(&format!("Terminal {}", idx), work_dir, cx));
         group.tabs.push(tab);
         group.active_tab_ix = group.tabs.len() - 1;
     }

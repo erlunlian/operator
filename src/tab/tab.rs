@@ -19,8 +19,8 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(title: &str, cx: &mut App) -> Self {
-        let terminal = cx.new(|cx| TerminalModel::new(cx));
+    pub fn new(title: &str, work_dir: Option<PathBuf>, cx: &mut App) -> Self {
+        let terminal = cx.new(|cx| TerminalModel::new(work_dir, cx));
         let terminal_view = cx.new(|cx| TerminalView::new(terminal, cx));
         Self {
             title: SharedString::from(title.to_string()),

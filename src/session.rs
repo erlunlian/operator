@@ -213,6 +213,7 @@ impl SessionState {
                     let dir = dir.clone();
                     let layout_state = ws_state.layout.clone();
                     cx.new(|cx: &mut gpui::Context<crate::workspace::Workspace>| {
+                        let dir_for_layout = dir.clone();
                         let mut ws = crate::workspace::Workspace::new(
                             &name,
                             dir,
@@ -220,12 +221,13 @@ impl SessionState {
                         );
                         // Replace the default layout with the restored one
                         if let Some(ref ls) = layout_state {
-                            let root = Self::restore_split_node(ls, &mut *cx);
+                            let root = Self::restore_split_node(ls, Some(&dir_for_layout), &mut *cx);
                             let layout = cx.new(|_cx| {
                                 PaneGroup {
                                     root,
                                     drop_target: None,
                                     focused_group_id: None,
+                                    work_dir: Some(dir_for_layout),
                                 }
                             });
                             cx.observe(&layout, |_this, _layout, cx| cx.notify())
@@ -280,10 +282,10 @@ impl SessionState {
         )
     }
 
-    fn restore_split_node(state: &SplitNodeState, cx: &mut gpui::App) -> SplitNode {
+    fn restore_split_node(state: &SplitNodeState, work_dir: Option<&std::path::PathBuf>, cx: &mut gpui::App) -> SplitNode {
         match state {
             SplitNodeState::Leaf(group_state) => {
-                SplitNode::Leaf(Self::restore_tab_group(group_state, cx))
+                SplitNode::Leaf(Self::restore_tab_group(group_state, work_dir, cx))
             }
             SplitNodeState::Split {
                 axis,
@@ -299,7 +301,7 @@ impl SessionState {
                     axis: split_axis,
                     children: children
                         .iter()
-                        .map(|c| Self::restore_split_node(c, cx))
+                        .map(|c| Self::restore_split_node(c, work_dir, cx))
                         .collect(),
                     ratios: ratios.clone(),
                 }
@@ -307,12 +309,12 @@ impl SessionState {
         }
     }
 
-    fn restore_tab_group(state: &TabGroupState, cx: &mut gpui::App) -> TabGroup {
+    fn restore_tab_group(state: &TabGroupState, work_dir: Option<&std::path::PathBuf>, cx: &mut gpui::App) -> TabGroup {
         let tabs: Vec<gpui::Entity<Tab>> = state
             .tabs
             .iter()
             .map(|tab_state| match tab_state {
-                TabState::Terminal { title } => cx.new(|cx| Tab::new(title, cx)),
+                TabState::Terminal { title } => cx.new(|cx| Tab::new(title, work_dir.cloned(), cx)),
                 TabState::Editor(editor_state) => {
                     cx.new(|cx| {
                         let tab =

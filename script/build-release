@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_NAME="Operator"
+BUNDLE="target/release/${APP_NAME}.app"
+
+echo "Building release binary..."
+cargo build --release
+
+echo "Assembling ${APP_NAME}.app bundle..."
+rm -rf "$BUNDLE"
+mkdir -p "$BUNDLE/Contents/MacOS"
+mkdir -p "$BUNDLE/Contents/Resources"
+
+cp target/release/operator "$BUNDLE/Contents/MacOS/operator"
+cp resources/Info.plist "$BUNDLE/Contents/Info.plist"
+
+# Copy icon if it exists
+if [ -f resources/AppIcon.icns ]; then
+    cp resources/AppIcon.icns "$BUNDLE/Contents/Resources/AppIcon.icns"
+fi
+
+echo ""
+echo "Done! App bundle at: $BUNDLE"
+echo ""
+echo "To run:  open $BUNDLE"
+echo "To install:  cp -r $BUNDLE /Applications/"

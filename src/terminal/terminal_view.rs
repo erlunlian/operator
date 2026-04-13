@@ -13,10 +13,29 @@ const CELL_WIDTH_PX: f32 = 8.0;
 const CELL_HEIGHT_PX: f32 = 16.0;
 const PADDING_PX: f32 = 8.0; // p_2 = 0.5rem = 8px
 
+/// A (line, col) position in the terminal grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridPos {
+    line: usize,
+    col: usize,
+}
+
+impl GridPos {
+    fn min(self, other: GridPos) -> GridPos {
+        if (self.line, self.col) <= (other.line, other.col) { self } else { other }
+    }
+    fn max(self, other: GridPos) -> GridPos {
+        if (self.line, self.col) >= (other.line, other.col) { self } else { other }
+    }
+}
+
 pub struct TerminalView {
     pub terminal: Entity<TerminalModel>,
     focus_handle: FocusHandle,
     last_size: Arc<std::sync::Mutex<Option<(u16, u16)>>>,
+    /// Mouse selection anchors.
+    selection_start: Option<GridPos>,
+    selection_end: Option<GridPos>,
 }
 
 impl TerminalView {
@@ -27,38 +46,117 @@ impl TerminalView {
             terminal,
             focus_handle: cx.focus_handle(),
             last_size: Arc::new(std::sync::Mutex::new(None)),
+            selection_start: None,
+            selection_end: None,
         }
     }
 
-    fn render_grid(&self, term: &Arc<FairMutex<Term<JsonListener>>>) -> Div {
+    /// Convert a window-relative mouse position to a grid (line, col).
+    fn mouse_to_grid(&self, pos: Point<Pixels>, bounds: Bounds<Pixels>) -> GridPos {
+        let x = (pos.x - bounds.origin.x) / px(1.0) - PADDING_PX;
+        let y = (pos.y - bounds.origin.y) / px(1.0) - PADDING_PX;
+        let col = (x / CELL_WIDTH_PX).max(0.0) as usize;
+        let line = (y / CELL_HEIGHT_PX).max(0.0) as usize;
+        GridPos { line, col }
+    }
+
+    /// Returns true if the cell at (line, col) is inside the raw selection range.
+    fn in_selection_range(&self, line: usize, col: usize) -> bool {
+        let (Some(start), Some(end)) = (self.selection_start, self.selection_end) else {
+            return false;
+        };
+        let lo = start.min(end);
+        let hi = start.max(end);
+        if lo == hi {
+            return false;
+        }
+        let pos = (line, col);
+        pos >= (lo.line, lo.col) && pos <= (hi.line, hi.col)
+    }
+
+    /// Extract the selected text from the terminal grid.
+    fn selected_text(&self, term: &Arc<FairMutex<Term<JsonListener>>>) -> String {
+        let (Some(start), Some(end)) = (self.selection_start, self.selection_end) else {
+            return String::new();
+        };
+        let lo = start.min(end);
+        let hi = start.max(end);
+        if lo == hi {
+            return String::new();
+        }
+
         let term = term.lock();
-        let content = term.renderable_content();
         let grid = term.grid();
+        let num_lines = grid.screen_lines();
+        let num_cols = grid.columns();
+        let mut result = String::new();
+
+        for line_idx in lo.line..=hi.line.min(num_lines.saturating_sub(1)) {
+            let row = &grid[Line(line_idx as i32)];
+            let col_start = if line_idx == lo.line { lo.col } else { 0 };
+            let col_end = if line_idx == hi.line { hi.col } else { num_cols.saturating_sub(1) };
+
+            let mut line_text = String::new();
+            for col_idx in col_start..=col_end.min(num_cols.saturating_sub(1)) {
+                let cell = &row[Column(col_idx)];
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line_text.push(ch);
+            }
+            let trimmed = line_text.trim_end();
+            result.push_str(trimmed);
+            if line_idx < hi.line {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    /// Find the last non-empty column index for a given row, or None if the row is empty.
+    fn last_content_col(row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>, num_cols: usize) -> Option<usize> {
+        for col in (0..num_cols).rev() {
+            let cell = &row[Column(col)];
+            let ch = cell.c;
+            if ch != ' ' && ch != '\0' {
+                return Some(col);
+            }
+        }
+        None
+    }
+
+    fn render_grid(&self, term: &Arc<FairMutex<Term<JsonListener>>>) -> Div {
+        let term_lock = term.lock();
+        let content = term_lock.renderable_content();
+        let grid = term_lock.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
         let cursor = content.cursor;
         let term_colors = content.colors;
 
+        let sel_bg = rgba(0x89b4fa44);
+
         let mut container = div()
             .flex()
             .flex_col()
-            .font_family("Menlo")
+            .font_family("MesloLGS NF")
             .text_size(px(13.0))
             .line_height(px(16.0));
 
         for line_idx in 0..num_lines {
             let line = Line(line_idx as i32);
             let row = &grid[line];
+            let last_content = Self::last_content_col(row, num_cols);
             let mut line_el = div().flex().flex_row().h(px(16.0));
 
-            // Group cells into runs of same style
-            let mut runs: Vec<(String, Rgba, Rgba, bool, bool)> = Vec::new();
+            // (text, fg, bg, bold, italic, underline, is_cursor)
+            let mut runs: Vec<(String, Rgba, Rgba, bool, bool, bool, bool)> = Vec::new();
 
             let mut col = 0;
             while col < num_cols {
                 let cell = &row[Column(col)];
 
-                // Skip wide char spacers
                 if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                     col += 1;
                     continue;
@@ -66,6 +164,10 @@ impl TerminalView {
 
                 let is_cursor =
                     line_idx == cursor.point.line.0 as usize && col == cursor.point.column.0;
+
+                // Only highlight selection on cells that have content (or are before last content)
+                let has_content = last_content.map_or(false, |lc| col <= lc);
+                let is_selected = has_content && self.in_selection_range(line_idx, col);
 
                 let fg = if is_cursor {
                     colors::surface()
@@ -75,18 +177,24 @@ impl TerminalView {
 
                 let bg = if is_cursor {
                     colors::accent()
+                } else if is_selected {
+                    sel_bg
                 } else {
-                    let bg_color = alac_color_to_gpui(&cell.bg, term_colors);
-                    bg_color
+                    alac_color_to_gpui(&cell.bg, term_colors)
                 };
 
                 let bold = cell.flags.contains(CellFlags::BOLD);
+                let italic = cell.flags.contains(CellFlags::ITALIC);
+                let underline = cell.flags.contains(CellFlags::UNDERLINE)
+                    || cell.flags.contains(CellFlags::DOUBLE_UNDERLINE)
+                    || cell.flags.contains(CellFlags::UNDERCURL);
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
-                // Try to merge with previous run
                 if !is_cursor {
                     if let Some(last) = runs.last_mut() {
-                        if last.1 == fg && last.2 == bg && last.3 == bold && !last.4 {
+                        if last.1 == fg && last.2 == bg && last.3 == bold
+                            && last.4 == italic && last.5 == underline && !last.6
+                        {
                             last.0.push(ch);
                             col += 1;
                             continue;
@@ -94,11 +202,11 @@ impl TerminalView {
                     }
                 }
 
-                runs.push((ch.to_string(), fg, bg, bold, is_cursor));
+                runs.push((ch.to_string(), fg, bg, bold, italic, underline, is_cursor));
                 col += 1;
             }
 
-            for (text, fg, bg, bold, _is_cursor) in &runs {
+            for (text, fg, bg, bold, italic, underline, _is_cursor) in &runs {
                 let has_custom_bg = *bg != colors::bg();
 
                 let mut span = div().text_color(*fg).flex_shrink_0();
@@ -109,6 +217,14 @@ impl TerminalView {
 
                 if *bold {
                     span = span.font_weight(FontWeight::BOLD);
+                }
+
+                if *italic {
+                    span = span.italic();
+                }
+
+                if *underline {
+                    span = span.underline();
                 }
 
                 span = span.child(text.clone());
@@ -131,7 +247,6 @@ impl Render for TerminalView {
         let terminal = self.terminal.read(cx);
         let term = terminal.term.clone();
 
-        // Resize detection: use a zero-size canvas overlay to measure bounds
         let terminal_entity = self.terminal.clone();
         let last_size = self.last_size.clone();
         let size_detector = canvas(
@@ -166,6 +281,24 @@ impl Render for TerminalView {
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .child(size_detector)
+            // ── Mouse selection ──
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, _cx| {
+                let bounds = window.bounds();
+                let pos = this.mouse_to_grid(event.position, bounds);
+                this.selection_start = Some(pos);
+                this.selection_end = Some(pos);
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.selection_start.is_some() && event.pressed_button == Some(MouseButton::Left) {
+                    let bounds = window.bounds();
+                    let pos = this.mouse_to_grid(event.position, bounds);
+                    this.selection_end = Some(pos);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_this, _event: &MouseUpEvent, _window, _cx| {
+            }))
+            // ── Scroll ──
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 let term = this.terminal.read(cx);
                 let lines = match event.delta {
@@ -185,17 +318,29 @@ impl Render for TerminalView {
                     }
                 }
             }))
+            // ── Keyboard ──
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
                 let keystroke = &event.keystroke;
 
                 // ── Cmd (platform) key combos ──
                 if keystroke.modifiers.platform {
-                    let term = this.terminal.read(cx);
                     match keystroke.key.as_str() {
-                        // Cmd+V: paste with bracket paste mode
-                        // Claude Code detects bracket paste and reads the system
-                        // clipboard itself (including images via pbpaste).
+                        "c" => {
+                            let term = this.terminal.read(cx);
+                            let text = this.selected_text(&term.term);
+                            if !text.is_empty() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                this.selection_start = None;
+                                this.selection_end = None;
+                                cx.notify();
+                                return;
+                            }
+                            let term = this.terminal.read(cx);
+                            term.write_to_pty(&[0x03]);
+                            return;
+                        }
                         "v" => {
+                            let term = this.terminal.read(cx);
                             if let Some(clipboard) = cx.read_from_clipboard() {
                                 let text = clipboard.text().unwrap_or_default();
                                 term.write_to_pty(b"\x1b[200~");
@@ -205,36 +350,32 @@ impl Render for TerminalView {
                                 term.write_to_pty(b"\x1b[201~");
                             }
                         }
-                        // Cmd+Backspace: delete to beginning of line (Ctrl+U)
-                        "backspace" => { term.write_to_pty(b"\x15"); }
-                        // Cmd+Delete: delete to end of line (Ctrl+K)
-                        "delete" => { term.write_to_pty(b"\x0b"); }
-                        // Cmd+Left: move to beginning of line (Home)
-                        "left" => { term.write_to_pty(b"\x01"); }
-                        // Cmd+Right: move to end of line (End)
-                        "right" => { term.write_to_pty(b"\x05"); }
-                        // Let other Cmd+key pass through to app actions
+                        "backspace" => { this.terminal.read(cx).write_to_pty(b"\x15"); }
+                        "delete" => { this.terminal.read(cx).write_to_pty(b"\x0b"); }
+                        "left" => { this.terminal.read(cx).write_to_pty(b"\x01"); }
+                        "right" => { this.terminal.read(cx).write_to_pty(b"\x05"); }
                         _ => { return; }
                     }
+                    this.selection_start = None;
+                    this.selection_end = None;
                     return;
                 }
+
+                // Clear selection on any non-Cmd keypress
+                this.selection_start = None;
+                this.selection_end = None;
 
                 let term = this.terminal.read(cx);
 
                 // ── Option (alt) key combos ──
                 if keystroke.modifiers.alt {
                     match keystroke.key.as_str() {
-                        // Option+Backspace: delete word backward (ESC + DEL)
                         "backspace" => { term.write_to_pty(b"\x1b\x7f"); return; }
-                        // Option+Delete: delete word forward (ESC + d)
                         "delete" => { term.write_to_pty(b"\x1bd"); return; }
-                        // Option+Left: move word backward (ESC + b)
                         "left" => { term.write_to_pty(b"\x1bb"); return; }
-                        // Option+Right: move word forward (ESC + f)
                         "right" => { term.write_to_pty(b"\x1bf"); return; }
                         _ => {}
                     }
-                    // Generic Alt+key: send ESC prefix
                     if let Some(key_char) = &keystroke.key_char {
                         let mut seq = vec![0x1b_u8];
                         seq.extend_from_slice(key_char.as_bytes());
@@ -310,7 +451,6 @@ impl Render for TerminalView {
                     _ => {}
                 }
 
-                // Regular character input
                 if let Some(key_char) = &keystroke.key_char {
                     term.write_str_to_pty(key_char);
                 }

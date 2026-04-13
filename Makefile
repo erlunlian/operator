@@ -8,13 +8,13 @@ help:
 	@echo "make install   Build release and copy to /Applications"
 	@echo "make clean     Remove all build artifacts"
 
-# Dev with auto-reload on save + full backtraces
+# Dev with auto-reload on save + full backtraces + info logging
 dev:
-	RUST_BACKTRACE=1 cargo watch -x run
+	RUST_LOG=info RUST_BACKTRACE=1 cargo watch -x run
 
 # Single build + run
 run:
-	RUST_BACKTRACE=1 cargo run
+	RUST_LOG=info RUST_BACKTRACE=1 cargo run
 
 # Release .app bundle
 release:

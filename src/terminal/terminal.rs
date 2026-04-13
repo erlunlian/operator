@@ -104,20 +104,7 @@ impl TerminalModel {
             cell_height: CELL_HEIGHT,
         };
 
-        // Set up PTY with minimal config to avoid Oh My Zsh issues
-        let zdotdir = std::env::temp_dir().join("operator-zsh");
-        std::fs::create_dir_all(&zdotdir).ok();
-        let zshrc_path = zdotdir.join(".zshrc");
-        if !zshrc_path.exists() {
-            std::fs::write(
-                &zshrc_path,
-                "PROMPT='%F{blue}%~%f %# '\nRPROMPT=''\n",
-            )
-            .ok();
-        }
-
         let mut env = std::collections::HashMap::new();
-        env.insert("ZDOTDIR".to_string(), zdotdir.to_string_lossy().to_string());
         env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let pty_config = tty::Options {

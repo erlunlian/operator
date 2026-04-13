@@ -26,7 +26,8 @@ pub struct WorkspaceCardData {
     pub name: SharedString,
     pub directory: String,
     pub git_branch: Option<String>,
-    pub claude_status: ClaudeStatus,
+    /// Per-pane Claude statuses (only non-idle entries).
+    pub pane_statuses: Vec<ClaudeStatus>,
 }
 
 #[derive(Clone)]
@@ -65,6 +66,14 @@ fn drop_indicator() -> Div {
 pub struct WorkspaceSidebar;
 
 impl WorkspaceSidebar {
+    fn status_color(status: &ClaudeStatus) -> Rgba {
+        match status {
+            ClaudeStatus::Idle => colors::text_muted(),
+            ClaudeStatus::WaitingForInput => rgb(0xf9e2af), // yellow
+            ClaudeStatus::Working => rgb(0xa6e3a1),          // green
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_width(
         workspaces: &[WorkspaceCardData],
@@ -170,7 +179,7 @@ impl WorkspaceSidebar {
                     div()
                         .text_sm()
                         .text_color(colors::text_muted())
-                        .child("New Workspace"),
+                        .child("New Workspace (Cmd+N)"),
                 )
                 .on_click(move |_, window, cx| {
                     on_new(window, cx);
@@ -204,13 +213,17 @@ impl WorkspaceSidebar {
             rgba(0x00000000) // transparent
         };
 
-        // Status indicator color
-        let status_color = match &ws.claude_status {
-            ClaudeStatus::Idle => colors::text_muted(),
-            ClaudeStatus::WaitingForInput => rgb(0xf9e2af), // yellow
-            ClaudeStatus::Working => rgb(0xa6e3a1),          // green
+        // Overall status color for the card dot (most active pane wins)
+        let overall_status = if ws.pane_statuses.iter().any(|s| *s == ClaudeStatus::Working) {
+            ClaudeStatus::Working
+        } else if ws.pane_statuses.iter().any(|s| *s == ClaudeStatus::WaitingForInput) {
+            ClaudeStatus::WaitingForInput
+        } else {
+            ClaudeStatus::Idle
         };
+        let status_color = Self::status_color(&overall_status);
 
+        let pane_statuses = ws.pane_statuses.clone();
         let git_branch = ws.git_branch.clone();
         let directory = ws.directory.clone();
 
@@ -295,17 +308,20 @@ impl WorkspaceSidebar {
                 .child(ws.name.clone()),
         );
 
-        // Claude status line
-        let status_label = ws.claude_status.label();
-        if !status_label.is_empty() {
-            text_col = text_col.child(
-                div()
-                    .text_xs()
-                    .text_color(status_color)
-                    .overflow_x_hidden()
-                    .text_ellipsis()
-                    .child(status_label.to_string()),
-            );
+        // Per-pane Claude status rows
+        for pane_status in &pane_statuses {
+            let label = pane_status.label();
+            if !label.is_empty() {
+                let color = Self::status_color(pane_status);
+                text_col = text_col.child(
+                    div()
+                        .text_xs()
+                        .text_color(color)
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .child(label.to_string()),
+                );
+            }
         }
 
         // Branch line

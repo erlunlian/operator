@@ -204,6 +204,7 @@ impl TabBar {
                 .text_sm()
                 .cursor_pointer()
                 .hover(|s| s.text_color(colors::text()))
+                .tooltip(|_window, cx| crate::util::render_tooltip("New Tab (Cmd+T)", cx))
                 .on_click(move |_, window, cx| {
                     on_new(window, cx);
                 })

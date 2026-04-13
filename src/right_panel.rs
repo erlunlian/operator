@@ -84,6 +84,7 @@ impl RightPanel {
         is_active: bool,
         entity: Entity<RightPanel>,
         tab: RightPanelTab,
+        tooltip_text: &'static str,
     ) -> Stateful<Div> {
         let bg = if is_active {
             colors::surface_hover()
@@ -113,6 +114,7 @@ impl RightPanel {
                     .text_color(text_col)
                     .child(icon.to_string()),
             )
+            .tooltip(move |_window, cx| util::render_tooltip(tooltip_text, cx))
             .on_click(move |_, _window, cx| {
                 entity.update(cx, |panel, cx| {
                     panel.active_tab = tab;
@@ -149,6 +151,7 @@ impl Render for RightPanel {
                 is_files,
                 entity,
                 RightPanelTab::Files,
+                "Files (Cmd+E)",
             ))
             .child(Self::render_tab_button(
                 "right-panel-tab-git",
@@ -156,6 +159,7 @@ impl Render for RightPanel {
                 is_git,
                 entity2,
                 RightPanelTab::Git,
+                "Git Diff (Cmd+Shift+G)",
             ))
             .child(Self::render_tab_button(
                 "right-panel-tab-pr",
@@ -163,6 +167,7 @@ impl Render for RightPanel {
                 is_pr,
                 entity3,
                 RightPanelTab::Pr,
+                "Pull Requests (Cmd+Shift+R)",
             ))
             .child(
                 div()

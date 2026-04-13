@@ -1452,14 +1452,21 @@ impl Render for OperatorApp {
         let cc = self.command_center.clone();
         root = root.child(cc);
 
-        // Sidebar toggle buttons (floating, always on top)
-        if sidebar_collapsed {
+        // Sidebar toggle button (floating, always on top)
+        {
+            let left_pos = if sidebar_collapsed {
+                // Clear macOS traffic lights (~70px)
+                px(70.0)
+            } else {
+                // Position at the right edge of the sidebar header
+                px(sidebar_width - 32.0)
+            };
             root = root.child(
                 div()
                     .id("toggle-sidebar-btn")
                     .absolute()
                     .top(px(8.0))
-                    .left(px(8.0))
+                    .left(left_pos)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1469,9 +1476,10 @@ impl Render for OperatorApp {
                     .cursor_pointer()
                     .text_color(colors::text_muted())
                     .hover(|s| s.bg(colors::surface_hover()).text_color(colors::text()))
+                    .tooltip(|_window, cx| util::render_tooltip("Toggle Sidebar (Cmd+B)", cx))
                     .on_click(move |_, _window, cx| {
                         app_toggle_sidebar.update(cx, |app, cx| {
-                            app.sidebar_collapsed = false;
+                            app.sidebar_collapsed = !app.sidebar_collapsed;
                             cx.notify();
                         });
                     })
@@ -1500,6 +1508,7 @@ impl Render for OperatorApp {
                 .cursor_pointer()
                 .text_color(colors::text_muted())
                 .hover(|s| s.bg(colors::surface_hover()).text_color(colors::text()))
+                .tooltip(|_window, cx| util::render_tooltip("Toggle Right Panel (Cmd+E)", cx))
                 .on_click(move |_, _window, cx| {
                     app_toggle_right.update(cx, |app, cx| {
                         app.right_panel_collapsed = !app.right_panel_collapsed;
@@ -1620,3 +1629,4 @@ impl Render for OperatorApp {
 fn short_path(path: &PathBuf) -> String {
     crate::util::short_path(path)
 }
+

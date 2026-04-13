@@ -1,4 +1,7 @@
+use gpui::*;
 use std::path::Path;
+
+use crate::theme::colors;
 
 /// Replace home directory prefix with `~` for display.
 pub fn short_path(path: &Path) -> String {
@@ -127,4 +130,31 @@ pub fn icon_for_file(name: &str) -> &'static str {
         // Default
         _ => "\u{f016}",               //  (file)
     }
+}
+
+// ── Tooltip helper ──
+
+pub struct TooltipView {
+    text: SharedString,
+}
+
+impl Render for TooltipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .bg(colors::surface())
+            .border_1()
+            .border_color(colors::border())
+            .rounded_md()
+            .shadow_md()
+            .text_xs()
+            .text_color(colors::text())
+            .child(self.text.clone())
+    }
+}
+
+pub fn render_tooltip(text: impl Into<SharedString>, cx: &mut App) -> AnyView {
+    let text = text.into();
+    cx.new(|_cx| TooltipView { text }).into()
 }

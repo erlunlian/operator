@@ -775,6 +775,20 @@ impl OperatorApp {
                     self.settings_panel_open = !self.settings_panel_open;
                     cx.notify();
                 }
+                CommandAction::SearchWorkspace => {
+                    let dir = self.active_workspace().read(cx).directory.clone();
+                    self.command_center.update(cx, |cc, cx| {
+                        cc.search_root = dir;
+                        cc.show_workspace_search_mode(cx);
+                    });
+                }
+                CommandAction::FindFile => {
+                    let dir = self.active_workspace().read(cx).directory.clone();
+                    self.command_center.update(cx, |cc, cx| {
+                        cc.search_root = dir;
+                        cc.show_file_search_mode(cx);
+                    });
+                }
             }
         }
 

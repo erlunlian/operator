@@ -38,6 +38,8 @@ pub enum CommandAction {
     ToggleDiffPanel,
     TogglePrPanel,
     ToggleSettings,
+    SearchWorkspace,
+    FindFile,
 }
 
 /// A single search result from workspace grep.
@@ -206,6 +208,18 @@ impl CommandCenter {
 
     fn default_commands() -> Vec<CommandEntry> {
         vec![
+            // Search & navigation
+            CommandEntry {
+                label: "Go to File".into(),
+                description: "Search files by name (Cmd+P)".into(),
+                action: CommandAction::FindFile,
+            },
+            CommandEntry {
+                label: "Search in Files".into(),
+                description: "Search across workspace files (Cmd+Shift+F)".into(),
+                action: CommandAction::SearchWorkspace,
+            },
+            // Project
             CommandEntry {
                 label: "Open Project".into(),
                 description: "Open a directory".into(),
@@ -218,32 +232,34 @@ impl CommandCenter {
             },
             CommandEntry {
                 label: "New Terminal Tab".into(),
-                description: "Open a new terminal".into(),
+                description: "Open a new terminal (Cmd+T)".into(),
                 action: CommandAction::NewTerminalTab,
             },
+            // Panels
             CommandEntry {
                 label: "Toggle Files Panel".into(),
-                description: "Open file browser".into(),
+                description: "Open file browser (Cmd+E)".into(),
                 action: CommandAction::ToggleFilesPanel,
             },
             CommandEntry {
-                label: "Toggle Sidebar".into(),
-                description: "Show/hide workspace sidebar".into(),
-                action: CommandAction::ToggleSidebar,
-            },
-            CommandEntry {
                 label: "Toggle Diff Panel".into(),
-                description: "Show/hide git diff panel".into(),
+                description: "Show/hide git diff (Cmd+Shift+G)".into(),
                 action: CommandAction::ToggleDiffPanel,
             },
             CommandEntry {
                 label: "Toggle PR Panel".into(),
-                description: "Show pull request diff".into(),
+                description: "Show pull request diff (Cmd+Shift+R)".into(),
                 action: CommandAction::TogglePrPanel,
             },
             CommandEntry {
+                label: "Toggle Sidebar".into(),
+                description: "Show/hide workspace sidebar (Cmd+B)".into(),
+                action: CommandAction::ToggleSidebar,
+            },
+            // Settings
+            CommandEntry {
                 label: "Settings".into(),
-                description: "Open settings".into(),
+                description: "Open settings (Cmd+,)".into(),
                 action: CommandAction::ToggleSettings,
             },
         ]

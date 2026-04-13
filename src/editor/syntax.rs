@@ -49,6 +49,7 @@ fn highlight_color(index: usize) -> Rgba {
     }
 }
 
+#[derive(Clone)]
 pub struct HighlightSpan {
     pub byte_range: Range<usize>,
     pub color: Rgba,

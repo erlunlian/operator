@@ -29,7 +29,7 @@ pub enum CommandAction {
     OpenProject,
     CloneRepo,
     NewTerminalTab,
-    NewEditorTab,
+    ToggleFilesPanel,
     ToggleSidebar,
     ToggleDiffPanel,
     ToggleSettings,
@@ -167,9 +167,9 @@ impl CommandCenter {
                 action: CommandAction::NewTerminalTab,
             },
             CommandEntry {
-                label: "New Editor Tab".into(),
-                description: "Open file editor".into(),
-                action: CommandAction::NewEditorTab,
+                label: "Toggle Files Panel".into(),
+                description: "Open file browser".into(),
+                action: CommandAction::ToggleFilesPanel,
             },
             CommandEntry {
                 label: "Toggle Sidebar".into(),

@@ -96,14 +96,6 @@ impl FileTree {
         }
     }
 
-    pub fn render(
-        &self,
-        on_file_click: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
-        on_dir_toggle: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,
-    ) -> Stateful<Div> {
-        self.render_with_width(on_file_click, on_dir_toggle, 220.0)
-    }
-
     pub fn render_with_width(
         &self,
         on_file_click: Rc<dyn Fn(PathBuf, &mut Window, &mut App)>,

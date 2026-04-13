@@ -1,4 +1,8 @@
-#![allow(dead_code)]
+#![allow(unexpected_cfgs)]
+
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
 
 mod actions;
 mod app;
@@ -7,6 +11,7 @@ mod editor;
 mod git;
 mod pane;
 mod recent_projects;
+mod right_panel;
 mod session;
 mod settings;
 mod tab;
@@ -38,6 +43,24 @@ fn set_dock_icon() {
     }
 }
 
+/// Disable the native titlebar window drag so that interactive elements (tabs)
+/// in the titlebar area can receive mouse events for drag-reorder/split.
+#[cfg(target_os = "macos")]
+fn disable_titlebar_drag(window: &mut gpui::Window) {
+    use raw_window_handle::HasWindowHandle;
+    if let Ok(handle) = window.window_handle() {
+        let raw = handle.as_raw();
+        if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw {
+            unsafe {
+                let ns_view: cocoa::base::id = appkit.ns_view.as_ptr() as _;
+                let ns_window: cocoa::base::id = objc::msg_send![ns_view, window];
+                let _: () = objc::msg_send![ns_window, setMovableByWindowBackground: false];
+                let _: () = objc::msg_send![ns_window, setMovable: false];
+            }
+        }
+    }
+}
+
 fn main() {
     env_logger::init();
 
@@ -63,9 +86,9 @@ fn main() {
             KeyBinding::new("cmd-shift-d", SplitPaneVertical, None),
             KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-shift-g", ToggleDiffPanel, None),
+            KeyBinding::new("cmd-e", ToggleFilesPanel, None),
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-            KeyBinding::new("cmd-e", NewEditorTab, None),
             KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
             KeyBinding::new("cmd-f", FindInFile, Some("FileEditor")),
             KeyBinding::new("cmd-shift-f", SearchWorkspace, None),
@@ -114,7 +137,10 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_window, cx| {
+            |window, cx| {
+                #[cfg(target_os = "macos")]
+                disable_titlebar_drag(window);
+
                 cx.new(|cx| {
                     if let Some(state) = saved {
                         state.restore(cx)

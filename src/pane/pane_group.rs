@@ -1,9 +1,17 @@
 use gpui::*;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::tab::{Tab, TabBar, TabDragPayload, tab_bar::TabIcon};
 use crate::theme::colors;
+
+/// Controls what kind of tabs a PaneGroup creates.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PaneGroupMode {
+    Terminal,
+    FileEditor,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SplitAxis {
@@ -67,11 +75,19 @@ pub struct TabGroup {
 }
 
 impl TabGroup {
-    pub fn new_terminal(work_dir: Option<std::path::PathBuf>, cx: &mut App) -> Self {
+    pub fn new_terminal(work_dir: Option<PathBuf>, cx: &mut App) -> Self {
         let tab = cx.new(|cx| Tab::new("Terminal", work_dir, cx));
         Self {
             id: next_group_id(),
             tabs: vec![tab],
+            active_tab_ix: 0,
+        }
+    }
+
+    pub fn new_empty() -> Self {
+        Self {
+            id: next_group_id(),
+            tabs: vec![],
             active_tab_ix: 0,
         }
     }
@@ -142,11 +158,18 @@ impl SplitNode {
         }
     }
 
-    /// Split the active (first/only) leaf, creating a sibling with a new terminal.
-    pub fn split_active(&mut self, axis: SplitAxis, work_dir: Option<std::path::PathBuf>, cx: &mut App) -> bool {
+    /// Split the active (first/only) leaf, creating a sibling with a new tab.
+    pub fn split_active(&mut self, axis: SplitAxis, work_dir: Option<PathBuf>, mode: PaneGroupMode, cx: &mut App) -> bool {
+        let make_leaf = |cx: &mut App| -> SplitNode {
+            match mode {
+                PaneGroupMode::Terminal => SplitNode::Leaf(TabGroup::new_terminal(work_dir.clone(), cx)),
+                PaneGroupMode::FileEditor => SplitNode::Leaf(TabGroup::new_empty()),
+            }
+        };
+
         match self {
             SplitNode::Leaf(_existing) => {
-                let existing = std::mem::replace(self, SplitNode::Leaf(TabGroup::new_terminal(work_dir, cx)));
+                let existing = std::mem::replace(self, make_leaf(cx));
                 let new_leaf = std::mem::replace(self, existing);
                 let old = std::mem::replace(self, SplitNode::Split {
                     id: next_split_id(),
@@ -176,11 +199,11 @@ impl SplitNode {
                         *r *= scale;
                     }
                     ratios.push(new_ratio);
-                    children.push(SplitNode::Leaf(TabGroup::new_terminal(work_dir, cx)));
+                    children.push(make_leaf(cx));
                     true
                 } else {
                     if let Some(last) = children.last_mut() {
-                        last.split_active(axis, work_dir, cx)
+                        last.split_active(axis, work_dir, mode, cx)
                     } else {
                         false
                     }
@@ -210,209 +233,6 @@ impl SplitNode {
         }
     }
 
-    pub fn add_tab(&mut self, work_dir: Option<std::path::PathBuf>, cx: &mut App) {
-        match self {
-            SplitNode::Leaf(group) => {
-                let idx = group.tabs.len() + 1;
-                let tab = cx.new(|cx| Tab::new(&format!("Terminal {}", idx), work_dir, cx));
-                group.tabs.push(tab);
-                group.active_tab_ix = group.tabs.len() - 1;
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.add_tab(work_dir, cx);
-                }
-            }
-        }
-    }
-
-    pub fn close_tab(&mut self) {
-        match self {
-            SplitNode::Leaf(group) => {
-                if !group.tabs.is_empty() {
-                    group.tabs.remove(group.active_tab_ix);
-                    if group.active_tab_ix >= group.tabs.len() && !group.tabs.is_empty() {
-                        group.active_tab_ix = group.tabs.len() - 1;
-                    }
-                }
-                // Empty leaves get pruned by the caller
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.close_tab();
-                }
-            }
-        }
-    }
-
-    pub fn next_tab(&mut self) {
-        match self {
-            SplitNode::Leaf(group) => {
-                if !group.tabs.is_empty() {
-                    group.active_tab_ix = (group.active_tab_ix + 1) % group.tabs.len();
-                }
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.next_tab();
-                }
-            }
-        }
-    }
-
-    pub fn prev_tab(&mut self) {
-        match self {
-            SplitNode::Leaf(group) => {
-                if !group.tabs.is_empty() {
-                    if group.active_tab_ix == 0 {
-                        group.active_tab_ix = group.tabs.len() - 1;
-                    } else {
-                        group.active_tab_ix -= 1;
-                    }
-                }
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.prev_tab();
-                }
-            }
-        }
-    }
-
-    pub fn add_editor_tab(&mut self, root_dir: std::path::PathBuf, cx: &mut App) {
-        match self {
-            SplitNode::Leaf(group) => {
-                let dir_name = root_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Editor".to_string());
-                let tab = cx.new(|cx| Tab::new_editor(&dir_name, root_dir, cx));
-                group.tabs.push(tab);
-                group.active_tab_ix = group.tabs.len() - 1;
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.add_editor_tab(root_dir, cx);
-                }
-            }
-        }
-    }
-
-    /// Check if there's an editor tab anywhere in the tree.
-    pub fn has_editor_tab(&self, cx: &App) -> bool {
-        match self {
-            SplitNode::Leaf(group) => group.tabs.iter().any(|t| t.read(cx).editor_entity().is_some()),
-            SplitNode::Split { children, .. } => children.iter().any(|c| c.has_editor_tab(cx)),
-        }
-    }
-
-    /// Open a file in the first editor tab found, then navigate to the given line.
-    pub fn open_file_in_editor(
-        &mut self,
-        path: std::path::PathBuf,
-        line_num: usize,
-        cx: &mut App,
-    ) {
-        match self {
-            SplitNode::Leaf(group) => {
-                for (ix, tab) in group.tabs.iter().enumerate() {
-                    if let Some(editor) = tab.read(cx).editor_entity().cloned() {
-                        editor.update(cx, |view, cx| {
-                            view.open_file(path.clone(), cx);
-                            // Navigate the active file viewer to the line
-                            if let Some(open_file) = view.open_files.get(view.active_file_ix) {
-                                open_file.viewer.update(cx, |fv, _cx| {
-                                    fv.navigate_to_line(line_num);
-                                });
-                            }
-                        });
-                        group.active_tab_ix = ix;
-                        return;
-                    }
-                }
-            }
-            SplitNode::Split { children, .. } => {
-                for child in children {
-                    if child.has_editor_tab(cx) {
-                        child.open_file_in_editor(path, line_num, cx);
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn reorder_tab(&mut self, from: usize, to: usize) {
-        match self {
-            SplitNode::Leaf(group) => {
-                if from < group.tabs.len() && to < group.tabs.len() && from != to {
-                    let tab = group.tabs.remove(from);
-                    group.tabs.insert(to, tab);
-                    group.active_tab_ix = to;
-                }
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.reorder_tab(from, to);
-                }
-            }
-        }
-    }
-
-    pub fn close_tab_at(&mut self, ix: usize) {
-        match self {
-            SplitNode::Leaf(group) => {
-                if ix < group.tabs.len() {
-                    group.tabs.remove(ix);
-                    if group.active_tab_ix >= group.tabs.len() && !group.tabs.is_empty() {
-                        group.active_tab_ix = group.tabs.len() - 1;
-                    } else if ix < group.active_tab_ix {
-                        group.active_tab_ix -= 1;
-                    }
-                }
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.close_tab_at(ix);
-                }
-            }
-        }
-    }
-
-    pub fn set_active_tab(&mut self, ix: usize) {
-        match self {
-            SplitNode::Leaf(group) => {
-                if ix < group.tabs.len() {
-                    group.active_tab_ix = ix;
-                }
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first_mut() {
-                    first.set_active_tab(ix);
-                }
-            }
-        }
-    }
-
-    pub fn first_leaf_tabs(&self, cx: &App) -> (Vec<SharedString>, usize) {
-        match self {
-            SplitNode::Leaf(group) => {
-                let titles = group
-                    .tabs
-                    .iter()
-                    .map(|t| t.read(cx).title.clone())
-                    .collect();
-                (titles, group.active_tab_ix)
-            }
-            SplitNode::Split { children, .. } => {
-                if let Some(first) = children.first() {
-                    first.first_leaf_tabs(cx)
-                } else {
-                    (vec![], 0)
-                }
-            }
-        }
-    }
 }
 
 // ── PaneGroup: GPUI entity that owns and renders the split tree ──
@@ -421,11 +241,12 @@ pub struct PaneGroup {
     pub root: SplitNode,
     pub drop_target: Option<DropTarget>,
     pub focused_group_id: Option<usize>,
-    pub work_dir: Option<std::path::PathBuf>,
+    pub work_dir: Option<PathBuf>,
+    pub mode: PaneGroupMode,
 }
 
 impl PaneGroup {
-    pub fn new_terminal(work_dir: Option<std::path::PathBuf>, cx: &mut App) -> Self {
+    pub fn new_terminal(work_dir: Option<PathBuf>, cx: &mut App) -> Self {
         let group = TabGroup::new_terminal(work_dir.clone(), cx);
         let id = group.id;
         Self {
@@ -433,52 +254,41 @@ impl PaneGroup {
             drop_target: None,
             focused_group_id: Some(id),
             work_dir,
+            mode: PaneGroupMode::Terminal,
+        }
+    }
+
+    pub fn new_file_editor(work_dir: Option<PathBuf>) -> Self {
+        let group = TabGroup::new_empty();
+        let id = group.id;
+        Self {
+            root: SplitNode::Leaf(group),
+            drop_target: None,
+            focused_group_id: Some(id),
+            work_dir,
+            mode: PaneGroupMode::FileEditor,
         }
     }
 
     pub fn split(&mut self, axis: SplitAxis, cx: &mut App) {
         let dir = self.work_dir.clone();
-        self.root.split_active(axis, dir, cx);
+        self.root.split_active(axis, dir, self.mode, cx);
     }
 
     pub fn split_right(&mut self, cx: &mut App) {
         let dir = self.work_dir.clone();
-        self.root.split_active(SplitAxis::Horizontal, dir, cx);
+        self.root.split_active(SplitAxis::Horizontal, dir, self.mode, cx);
     }
 
-    /// Smart close: closes the active sub-tab in the focused group's active tab (if editor),
-    /// otherwise closes the outer tab in the focused group.
+    /// Close the outer tab in the focused group.
     /// Returns true if something was closed, false if nothing to close.
     pub fn close_focused_tab(&mut self, cx: &mut App) -> bool {
+        let _ = cx;
         let group_id = match self.focused_group_id {
             Some(id) => id,
             None => return false,
         };
 
-        // First check if the focused group's active tab has sub-tabs to close
-        let maybe_editor = find_group_mut(&mut self.root, group_id)
-            .and_then(|group| group.tabs.get(group.active_tab_ix))
-            .and_then(|tab| tab.read(cx).editor_entity().cloned());
-
-        if let Some(editor) = maybe_editor {
-            if !editor.read(cx).open_files.is_empty() {
-                let ix = editor.read(cx).active_file_ix;
-                editor.update(cx, |editor, cx| {
-                    editor.close_file(ix, cx);
-                });
-                // If that was the last open file, close the editor tab too
-                if editor.read(cx).open_files.is_empty() {
-                    close_tab_in_focused_group(&mut self.root, group_id);
-                    prune_empty_leaves(&mut self.root);
-                    if find_group_mut(&mut self.root, group_id).is_none() {
-                        self.focused_group_id = first_group_id(&self.root);
-                    }
-                }
-                return true;
-            }
-        }
-
-        // No sub-tabs — close the outer tab in the focused group
         close_tab_in_focused_group(&mut self.root, group_id);
         prune_empty_leaves(&mut self.root);
 
@@ -490,23 +300,116 @@ impl PaneGroup {
         true
     }
 
+    /// Add a new tab to the focused group.
+    pub fn add_tab_to_focused(&mut self, cx: &mut App) {
+        let group_id = self.focused_group_id
+            .or_else(|| first_group_id(&self.root));
+        if let Some(gid) = group_id {
+            let dir = self.work_dir.clone();
+            let mode = self.mode;
+            add_tab_in_group(&mut self.root, gid, dir, mode, cx);
+        }
+    }
+
+    /// Switch to next tab in the focused group.
+    pub fn next_tab_in_focused(&mut self) {
+        let group_id = self.focused_group_id
+            .or_else(|| first_group_id(&self.root));
+        if let Some(gid) = group_id {
+            if let Some(group) = find_group_mut(&mut self.root, gid) {
+                if !group.tabs.is_empty() {
+                    group.active_tab_ix = (group.active_tab_ix + 1) % group.tabs.len();
+                }
+            }
+        }
+    }
+
+    /// Switch to previous tab in the focused group.
+    pub fn prev_tab_in_focused(&mut self) {
+        let group_id = self.focused_group_id
+            .or_else(|| first_group_id(&self.root));
+        if let Some(gid) = group_id {
+            if let Some(group) = find_group_mut(&mut self.root, gid) {
+                if !group.tabs.is_empty() {
+                    if group.active_tab_ix == 0 {
+                        group.active_tab_ix = group.tabs.len() - 1;
+                    } else {
+                        group.active_tab_ix -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn get_claude_status(&self, cx: &App) -> crate::workspace::workspace::ClaudeStatus {
         self.root.get_claude_status(cx)
     }
 
-    pub fn render_tree(&self, pane_group_entity: &Entity<PaneGroup>, cx: &App) -> AnyElement {
-        Self::render_node(&self.root, pane_group_entity, self.drop_target, cx)
+    /// Open a file in the focused group (or first group). If the file is already
+    /// open in any group, switch to it instead.
+    pub fn open_file(&mut self, path: PathBuf, cx: &mut App) {
+        // Check if already open in any group
+        if let Some((group_id, tab_ix)) = find_file_tab(&self.root, &path, cx) {
+            self.focused_group_id = Some(group_id);
+            set_active_tab_in_group(&mut self.root, group_id, tab_ix);
+            return;
+        }
+
+        // Open in the focused group, or first group
+        let group_id = self.focused_group_id
+            .or_else(|| first_group_id(&self.root));
+        if let Some(gid) = group_id {
+            if let Some(group) = find_group_mut(&mut self.root, gid) {
+                let tab = cx.new(|cx| Tab::new_file(path, cx));
+                group.tabs.push(tab);
+                group.active_tab_ix = group.tabs.len() - 1;
+            }
+        }
+    }
+
+    /// Navigate the active file viewer to a specific line.
+    pub fn navigate_to_line(&self, line: usize, cx: &mut App) {
+        let group_id = self.focused_group_id
+            .or_else(|| first_group_id(&self.root));
+        if let Some(gid) = group_id {
+            if let Some(group) = find_group(&self.root, gid) {
+                if let Some(tab) = group.tabs.get(group.active_tab_ix) {
+                    let viewer = tab.read(cx).file_viewer().cloned();
+                    if let Some(viewer) = viewer {
+                        viewer.update(cx, |fv, _cx| {
+                            fv.navigate_to_line(line);
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collect all open file paths across all groups.
+    pub fn all_open_files(&self, cx: &App) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        collect_file_paths(&self.root, &mut paths, cx);
+        paths
+    }
+
+    pub fn render_tree(&self, pane_group_entity: &Entity<PaneGroup>, center_focused: bool, cx: &App) -> AnyElement {
+        let focused_id = if center_focused { self.focused_group_id } else { None };
+        let has_splits = !matches!(&self.root, SplitNode::Leaf(_));
+        Self::render_node(&self.root, pane_group_entity, self.drop_target, focused_id, has_splits, self.mode, cx)
     }
 
     fn render_node(
         node: &SplitNode,
         pane_group_entity: &Entity<PaneGroup>,
         drop_target: Option<DropTarget>,
+        focused_group_id: Option<usize>,
+        has_splits: bool,
+        mode: PaneGroupMode,
         cx: &App,
     ) -> AnyElement {
         match node {
             SplitNode::Leaf(group) => {
-                Self::render_leaf(group, pane_group_entity, drop_target, cx)
+                Self::render_leaf(group, pane_group_entity, drop_target, focused_group_id, has_splits, mode, cx)
             }
             SplitNode::Split {
                 id,
@@ -514,7 +417,7 @@ impl PaneGroup {
                 children,
                 ratios,
             } => {
-                Self::render_split(*id, *axis, children, ratios, pane_group_entity, drop_target, cx)
+                Self::render_split(*id, *axis, children, ratios, pane_group_entity, drop_target, focused_group_id, has_splits, mode, cx)
             }
         }
     }
@@ -523,6 +426,9 @@ impl PaneGroup {
         group: &TabGroup,
         pane_group_entity: &Entity<PaneGroup>,
         drop_target: Option<DropTarget>,
+        focused_group_id: Option<usize>,
+        has_splits: bool,
+        mode: PaneGroupMode,
         cx: &App,
     ) -> AnyElement {
         let group_id = group.id;
@@ -538,7 +444,14 @@ impl PaneGroup {
         let tab_titles: Vec<SharedString> = group
             .tabs
             .iter()
-            .map(|t| t.read(cx).title.clone())
+            .map(|t| {
+                let tab = t.read(cx);
+                if tab.is_dirty(cx) {
+                    SharedString::from(format!("{} *", tab.title))
+                } else {
+                    tab.title.clone()
+                }
+            })
             .collect();
         let tab_icons: Vec<TabIcon> = group
             .tabs
@@ -564,7 +477,8 @@ impl PaneGroup {
             Rc::new(move |_window, cx| {
                 pg2.update(cx, |pg, cx| {
                     let dir = pg.work_dir.clone();
-                    add_tab_in_group(&mut pg.root, group_id, dir, cx);
+                    let mode = pg.mode;
+                    add_tab_in_group(&mut pg.root, group_id, dir, mode, cx);
                     cx.notify();
                 });
             }),
@@ -598,13 +512,17 @@ impl PaneGroup {
         let content = if active_ix < group.tabs.len() {
             group.tabs[active_ix].read(cx).render_content()
         } else {
+            let placeholder = match mode {
+                PaneGroupMode::Terminal => "No tab",
+                PaneGroupMode::FileEditor => "Select a file from the tree",
+            };
             div()
                 .flex()
                 .flex_1()
                 .items_center()
                 .justify_center()
                 .text_color(colors::text_muted())
-                .child("No tab")
+                .child(placeholder)
                 .into_any_element()
         };
 
@@ -651,6 +569,7 @@ impl PaneGroup {
                 pg_drop.update(cx, |pg, cx| {
                     let zone = pg.drop_target.map(|t| t.zone).unwrap_or(DropZone::Center);
                     pg.drop_target = None;
+                    let mode = pg.mode;
 
                     handle_tab_drop(
                         &mut pg.root,
@@ -658,6 +577,7 @@ impl PaneGroup {
                         payload.tab_ix,
                         group_id,
                         zone,
+                        mode,
                         cx,
                     );
                     cx.notify();
@@ -670,7 +590,7 @@ impl PaneGroup {
         let pg_clear = pane_group_entity.clone();
         let pg_focus = pane_group_entity.clone();
 
-        div()
+        let mut leaf = div()
             .id(ElementId::Name(format!("tab-group-{group_id}").into()))
             .flex()
             .flex_col()
@@ -705,8 +625,16 @@ impl PaneGroup {
                 }
             })
             .child(tab_bar)
-            .child(content_area)
-            .into_any_element()
+            .child(content_area);
+
+        // Dim unfocused panes: when center has focus and there are splits,
+        // or when center doesn't have focus at all (right panel focused).
+        let is_focused_pane = focused_group_id == Some(group_id);
+        if !is_focused_pane && (has_splits || focused_group_id.is_none()) {
+            leaf = leaf.opacity(0.7);
+        }
+
+        leaf.into_any_element()
     }
 
     fn render_split(
@@ -716,6 +644,9 @@ impl PaneGroup {
         ratios: &[f32],
         pane_group_entity: &Entity<PaneGroup>,
         drop_target: Option<DropTarget>,
+        focused_group_id: Option<usize>,
+        has_splits: bool,
+        mode: PaneGroupMode,
         cx: &App,
     ) -> AnyElement {
         let split_axis = axis;
@@ -787,23 +718,35 @@ impl PaneGroup {
                 let handle = match axis {
                     SplitAxis::Horizontal => div()
                         .id(ElementId::Name(handle_id.into()))
-                        .w(px(1.0))
+                        .w(px(12.0))
+                        .mx(px(-6.0))
                         .h_full()
                         .flex_shrink_0()
                         .cursor_col_resize()
-                        .bg(colors::border())
-                        .hover(|s| s.bg(colors::accent()))
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(1.0))
+                                .h_full()
+                                .bg(colors::border())
+                        )
                         .on_drag(drag_payload, |_, _, _, cx| {
                             cx.new(|_| ResizeGhost)
                         }),
                     SplitAxis::Vertical => div()
                         .id(ElementId::Name(handle_id.into()))
                         .w_full()
-                        .h(px(1.0))
+                        .h(px(12.0))
+                        .my(px(-6.0))
                         .flex_shrink_0()
                         .cursor_row_resize()
-                        .bg(colors::border())
-                        .hover(|s| s.bg(colors::accent()))
+                        .justify_center()
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(1.0))
+                                .bg(colors::border())
+                        )
                         .on_drag(drag_payload, |_, _, _, cx| {
                             cx.new(|_| ResizeGhost)
                         }),
@@ -819,7 +762,7 @@ impl PaneGroup {
                 .flex_basis(relative(*ratio))
                 .flex_grow()
                 .flex_shrink()
-                .child(Self::render_node(child, pane_group_entity, drop_target, cx));
+                .child(Self::render_node(child, pane_group_entity, drop_target, focused_group_id, has_splits, mode, cx));
 
             container = container.child(child_el);
         }
@@ -950,6 +893,7 @@ fn handle_tab_drop(
     src_tab_ix: usize,
     dst_group_id: usize,
     zone: DropZone,
+    mode: PaneGroupMode,
     cx: &mut App,
 ) {
     match zone {
@@ -983,8 +927,11 @@ fn handle_tab_drop(
 
                 prune_empty_leaves(root);
             } else if src_group_id == dst_group_id {
-                // Dragging within the same group to split: create a new terminal
-                let new_tab = cx.new(|cx| Tab::new("Terminal", None, cx));
+                // Dragging within the same group to split: create a new tab
+                let new_tab = match mode {
+                    PaneGroupMode::Terminal => cx.new(|cx| Tab::new("Terminal", None, cx)),
+                    PaneGroupMode::FileEditor => cx.new(|cx| Tab::new_empty_file(PathBuf::from("Untitled"), cx)),
+                };
                 let (axis, before) = match zone {
                     DropZone::Left => (SplitAxis::Horizontal, true),
                     DropZone::Right => (SplitAxis::Horizontal, false),
@@ -1063,10 +1010,26 @@ fn set_active_tab_in_group(node: &mut SplitNode, group_id: usize, ix: usize) {
     }
 }
 
-fn add_tab_in_group(node: &mut SplitNode, group_id: usize, work_dir: Option<std::path::PathBuf>, cx: &mut App) {
+fn add_tab_in_group(node: &mut SplitNode, group_id: usize, work_dir: Option<PathBuf>, mode: PaneGroupMode, cx: &mut App) {
     if let Some(group) = find_group_mut(node, group_id) {
-        let idx = group.tabs.len() + 1;
-        let tab = cx.new(|cx| Tab::new(&format!("Terminal {}", idx), work_dir, cx));
+        let tab = match mode {
+            PaneGroupMode::Terminal => {
+                let idx = group.tabs.len() + 1;
+                cx.new(|cx| Tab::new(&format!("Terminal {}", idx), work_dir, cx))
+            }
+            PaneGroupMode::FileEditor => {
+                let dir = work_dir.unwrap_or_else(|| PathBuf::from("."));
+                let mut n = 1u32;
+                let name = loop {
+                    let candidate = if n == 1 { "Untitled".to_string() } else { format!("Untitled-{n}") };
+                    if !group.tabs.iter().any(|t| t.read(cx).title.as_ref() == candidate) {
+                        break candidate;
+                    }
+                    n += 1;
+                };
+                cx.new(|cx| Tab::new_empty_file(dir.join(&name), cx))
+            }
+        };
         group.tabs.push(tab);
         group.active_tab_ix = group.tabs.len() - 1;
     }
@@ -1149,12 +1112,6 @@ fn move_tab_between_groups(
     }
 }
 
-/// Public wrapper for pruning empty leaves, called from workspace.
-/// Returns true if the root itself is now empty (shouldn't happen — caller should prevent).
-pub fn prune_empty_leaves_pub(node: &mut SplitNode) {
-    prune_empty_leaves(node);
-}
-
 /// Check if the tree has only a single tab left across all leaves.
 pub fn count_total_tabs(node: &SplitNode) -> usize {
     match node {
@@ -1235,6 +1192,63 @@ fn adjust_split_from_fraction(
                 for child in children.iter_mut() {
                     adjust_split_from_fraction(child, split_id, handle_idx, fraction);
                 }
+            }
+        }
+    }
+}
+
+/// Find a file tab by path across all groups. Returns (group_id, tab_ix).
+fn find_file_tab(node: &SplitNode, path: &PathBuf, cx: &App) -> Option<(usize, usize)> {
+    match node {
+        SplitNode::Leaf(group) => {
+            for (ix, tab) in group.tabs.iter().enumerate() {
+                if tab.read(cx).file_path() == Some(path) {
+                    return Some((group.id, ix));
+                }
+            }
+            None
+        }
+        SplitNode::Split { children, .. } => {
+            for child in children {
+                if let Some(result) = find_file_tab(child, path, cx) {
+                    return Some(result);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Immutable group lookup by id.
+fn find_group(node: &SplitNode, group_id: usize) -> Option<&TabGroup> {
+    match node {
+        SplitNode::Leaf(group) => {
+            if group.id == group_id { Some(group) } else { None }
+        }
+        SplitNode::Split { children, .. } => {
+            for child in children {
+                if let Some(g) = find_group(child, group_id) {
+                    return Some(g);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Collect all open file paths from file tabs across all groups.
+fn collect_file_paths(node: &SplitNode, paths: &mut Vec<PathBuf>, cx: &App) {
+    match node {
+        SplitNode::Leaf(group) => {
+            for tab in &group.tabs {
+                if let Some(p) = tab.read(cx).file_path() {
+                    paths.push(p.clone());
+                }
+            }
+        }
+        SplitNode::Split { children, .. } => {
+            for child in children {
+                collect_file_paths(child, paths, cx);
             }
         }
     }

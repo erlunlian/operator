@@ -38,10 +38,13 @@ pub struct TerminalView {
     pub terminal: Entity<TerminalModel>,
     focus_handle: FocusHandle,
     last_size: Arc<std::sync::Mutex<Option<(u16, u16)>>>,
+    last_bounds: Arc<std::sync::Mutex<Bounds<Pixels>>>,
     selection_start: Option<GridPos>,
     selection_end: Option<GridPos>,
     cell_width: f32,
     has_been_focused: bool,
+    /// Accumulated scroll pixels for smooth trackpad scrolling.
+    scroll_px: f32,
 }
 
 impl TerminalView {
@@ -69,18 +72,17 @@ impl TerminalView {
             terminal,
             focus_handle: cx.focus_handle(),
             last_size: Arc::new(std::sync::Mutex::new(None)),
+            last_bounds: Arc::new(std::sync::Mutex::new(Bounds::default())),
             selection_start: None,
             selection_end: None,
             cell_width,
             has_been_focused: false,
+            scroll_px: 0.0,
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        self.focus_handle.focus(window);
-    }
-
-    fn mouse_to_grid(&self, pos: Point<Pixels>, bounds: Bounds<Pixels>) -> GridPos {
+    fn mouse_to_grid(&self, pos: Point<Pixels>) -> GridPos {
+        let bounds = *self.last_bounds.lock().unwrap();
         let x = (pos.x - bounds.origin.x) / px(1.0) - PADDING_PX;
         let y = (pos.y - bounds.origin.y) / px(1.0) - PADDING_PX;
         let col = (x / self.cell_width).max(0.0) as usize;
@@ -88,16 +90,27 @@ impl TerminalView {
         GridPos { line, col }
     }
 
-    fn in_selection_range(&self, line: usize, col: usize) -> bool {
-        let (Some(start), Some(end)) = (self.selection_start, self.selection_end) else {
-            return false;
+    /// Send a mouse event to the terminal PTY using SGR or legacy encoding.
+    /// `button` is the xterm button number: 0=left, 1=middle, 2=right, 32=motion.
+    /// `pressed` is true for press/motion, false for release.
+    fn send_mouse_event(&self, term_model: &TerminalModel, button: u8, pos: GridPos, pressed: bool) {
+        // Terminal coords are 1-based.
+        let x = (pos.col + 1) as u32;
+        let y = (pos.line + 1) as u32;
+        let has_sgr = {
+            let t = term_model.term.lock();
+            t.mode().contains(TermMode::SGR_MOUSE)
         };
-        let lo = start.min(end);
-        let hi = start.max(end);
-        if lo == hi {
-            return false;
+        if has_sgr {
+            let c = if pressed { 'M' } else { 'm' };
+            term_model.write_str_to_pty(&format!("\x1b[<{button};{x};{y}{c}"));
+        } else {
+            // Legacy X10/normal encoding: button+32, x+32, y+32 (capped at 223).
+            let cb = if pressed { button + 32 } else { 3 + 32 };
+            let cx = (x.min(223) as u8) + 32;
+            let cy = (y.min(223) as u8) + 32;
+            term_model.write_to_pty(&[b'\x1b', b'[', b'M', cb, cx, cy]);
         }
-        (line, col) >= (lo.line, lo.col) && (line, col) <= (hi.line, hi.col)
     }
 
     fn selected_text(&self, term: &Arc<FairMutex<Term<JsonListener>>>) -> String {
@@ -153,17 +166,19 @@ impl Render for TerminalView {
         let terminal_entity = self.terminal.clone();
         let last_size = self.last_size.clone();
 
-        // Build selection state for the paint closure (which can't access &self)
-        let sel_start = self.selection_start;
-        let sel_end = self.selection_end;
         let cell_width = self.cell_width;
+
+        let last_bounds = self.last_bounds.clone();
 
         let grid_canvas = canvas(
             // Prepaint: resize detection
             {
                 let terminal_entity = terminal_entity.clone();
                 let last_size = last_size.clone();
+                let last_bounds = last_bounds.clone();
                 move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
+                    *last_bounds.lock().unwrap() = bounds;
+
                     let w = bounds.size.width / px(1.0);
                     let h = bounds.size.height / px(1.0);
                     let cols = ((w - PADDING_PX * 2.0) / cell_width).max(1.0) as u16;
@@ -178,21 +193,16 @@ impl Render for TerminalView {
                     bounds
                 }
             },
-            // Paint: render the terminal grid
+            // Paint: render the terminal grid using Alacritty's display_iter
             {
                 let term = term.clone();
                 move |bounds: Bounds<Pixels>, _prepaint: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
-                    // We need to reconstruct selection state for painting
-                    // Paint the terminal grid using GPUI's text shaping
                     let term_lock = term.lock();
                     let content = term_lock.renderable_content();
-                    let grid = term_lock.grid();
-                    let num_lines = grid.screen_lines();
-                    let num_cols = grid.columns();
+                    let display_offset = content.display_offset;
                     let cursor = content.cursor;
                     let term_colors = content.colors;
 
-                    let sel_color: Rgba = rgba(0x89b4fa44);
                     let bg_color = colors::bg();
                     let line_height = px(CELL_HEIGHT_PX);
                     let font_size = px(FONT_SIZE);
@@ -208,79 +218,90 @@ impl Render for TerminalView {
                     let font_italic = Font { style: FontStyle::Italic, ..font_normal.clone() };
                     let font_bold_italic = Font { weight: FontWeight::BOLD, style: FontStyle::Italic, ..font_normal.clone() };
 
-                    // Selection helper
-                    let in_sel = |line: usize, col: usize| -> bool {
-                        let (Some(start), Some(end)) = (sel_start, sel_end) else { return false; };
-                        let lo = start.min(end);
-                        let hi = start.max(end);
-                        if lo == hi { return false; }
-                        (line, col) >= (lo.line, lo.col) && (line, col) <= (hi.line, hi.col)
-                    };
+                    // Collect cells from display_iter, grouped by screen row
+                    struct RowCell {
+                        col: usize,
+                        ch: char,
+                        fg: Rgba,
+                        bg: Rgba,
+                        bold: bool,
+                        italic: bool,
+                        underline: bool,
+                        undercurl: bool,
+                        is_wide_spacer: bool,
+                    }
 
-                    for line_idx in 0..num_lines {
-                        let row = &grid[Line(line_idx as i32)];
-                        let y = bounds.origin.y + px(PADDING_PX) + line_height * line_idx;
+                    let mut rows: std::collections::BTreeMap<usize, Vec<RowCell>> = std::collections::BTreeMap::new();
 
-                        let last_content_col = {
-                            let mut last = None;
-                            for c in (0..num_cols).rev() {
-                                let ch = row[Column(c)].c;
-                                if ch != ' ' && ch != '\0' { last = Some(c); break; }
-                            }
-                            last
-                        };
+                    for indexed in content.display_iter {
+                        let screen_row = (indexed.point.line.0 + display_offset as i32) as usize;
+                        let col = indexed.point.column.0;
+                        let cell = &indexed.cell;
+
+                        rows.entry(screen_row).or_default().push(RowCell {
+                            col,
+                            ch: cell.c,
+                            fg: alac_color_to_gpui(&cell.fg, term_colors),
+                            bg: alac_color_to_gpui(&cell.bg, term_colors),
+                            bold: cell.flags.contains(CellFlags::BOLD),
+                            italic: cell.flags.contains(CellFlags::ITALIC),
+                            underline: cell.flags.contains(CellFlags::UNDERLINE)
+                                || cell.flags.contains(CellFlags::DOUBLE_UNDERLINE)
+                                || cell.flags.contains(CellFlags::UNDERCURL),
+                            undercurl: cell.flags.contains(CellFlags::UNDERCURL),
+                            is_wide_spacer: cell.flags.contains(CellFlags::WIDE_CHAR_SPACER),
+                        });
+                    }
+
+                    // Cursor screen row (only visible when not scrolled back)
+                    let cursor_row = (cursor.point.line.0 as usize).wrapping_add(display_offset);
+
+                    for (screen_row, cells) in &rows {
+                        let y = bounds.origin.y + px(PADDING_PX) + line_height * *screen_row;
 
                         let mut line_text = String::new();
                         let mut runs: Vec<TextRun> = Vec::new();
                         let mut bg_runs: Vec<(usize, usize, Rgba)> = Vec::new();
                         let mut current_bg: Option<(usize, Rgba)> = None;
 
-                        let mut col = 0;
-                        while col < num_cols {
-                            let cell = &row[Column(col)];
-                            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) { col += 1; continue; }
+                        for rc in cells {
+                            if rc.is_wide_spacer { continue; }
 
-                            let is_cursor = line_idx == cursor.point.line.0 as usize && col == cursor.point.column.0;
-                            let has_content = last_content_col.map_or(false, |lc| col <= lc);
-                            let is_selected = has_content && in_sel(line_idx, col);
+                            let is_cursor = display_offset == 0
+                                && *screen_row == cursor_row
+                                && rc.col == cursor.point.column.0;
 
-                            let fg = if is_cursor { colors::surface() } else { alac_color_to_gpui(&cell.fg, term_colors) };
-                            let cell_bg = if is_cursor { colors::accent() } else if is_selected { sel_color } else { alac_color_to_gpui(&cell.bg, term_colors) };
+                            let fg = if is_cursor { colors::surface() } else { rc.fg };
+                            let cell_bg = if is_cursor { colors::accent() } else { rc.bg };
 
                             if cell_bg != bg_color {
                                 match &mut current_bg {
                                     Some((_, ref c)) if *c == cell_bg => {}
-                                    Some((start, c)) => { bg_runs.push((*start, col, *c)); current_bg = Some((col, cell_bg)); }
-                                    None => { current_bg = Some((col, cell_bg)); }
+                                    Some((start, c)) => { bg_runs.push((*start, rc.col, *c)); current_bg = Some((rc.col, cell_bg)); }
+                                    None => { current_bg = Some((rc.col, cell_bg)); }
                                 }
                             } else if let Some((start, c)) = current_bg.take() {
-                                bg_runs.push((start, col, c));
+                                bg_runs.push((start, rc.col, c));
                             }
 
-                            let bold = cell.flags.contains(CellFlags::BOLD);
-                            let italic = cell.flags.contains(CellFlags::ITALIC);
-                            let underline = cell.flags.contains(CellFlags::UNDERLINE)
-                                || cell.flags.contains(CellFlags::DOUBLE_UNDERLINE)
-                                || cell.flags.contains(CellFlags::UNDERCURL);
-                            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                            let ch = if rc.ch == '\0' { ' ' } else { rc.ch };
                             let char_len = ch.len_utf8();
                             line_text.push(ch);
 
-                            let font = match (bold, italic) {
+                            let font = match (rc.bold, rc.italic) {
                                 (true, true) => font_bold_italic.clone(),
                                 (true, false) => font_bold.clone(),
                                 (false, true) => font_italic.clone(),
                                 (false, false) => font_normal.clone(),
                             };
 
-                            let underline_style = if underline {
-                                Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba_to_hsla(fg)), wavy: cell.flags.contains(CellFlags::UNDERCURL) })
+                            let underline_style = if rc.underline {
+                                Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba_to_hsla(fg)), wavy: rc.undercurl })
                             } else { None };
 
                             if let Some(last) = runs.last_mut() {
                                 if last.font == font && last.color == rgba_to_hsla(fg) && last.underline == underline_style {
                                     last.len += char_len;
-                                    col += 1;
                                     continue;
                                 }
                             }
@@ -293,10 +314,12 @@ impl Render for TerminalView {
                                 underline: underline_style,
                                 strikethrough: None,
                             });
-                            col += 1;
                         }
 
-                        if let Some((start, c)) = current_bg { bg_runs.push((start, num_cols, c)); }
+                        if let Some((start, c)) = current_bg {
+                            let end_col = cells.last().map_or(start, |c| c.col + 1);
+                            bg_runs.push((start, end_col, c));
+                        }
 
                         for (start_col, end_col, color) in &bg_runs {
                             let x = bounds.origin.x + px(PADDING_PX) + px(cell_width * *start_col as f32);
@@ -330,47 +353,99 @@ impl Render for TerminalView {
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .child(grid_canvas)
-            // ── Mouse selection ──
+            // ── Mouse ──
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.focus(window);
-                let bounds = window.bounds();
-                let pos = this.mouse_to_grid(event.position, bounds);
-                this.selection_start = Some(pos);
-                this.selection_end = Some(pos);
+                let term_model = this.terminal.read(cx);
+                let has_mouse_mode = {
+                    let t = term_model.term.lock();
+                    t.mode().intersects(TermMode::MOUSE_MODE)
+                };
+                if has_mouse_mode {
+                    let pos = this.mouse_to_grid(event.position);
+                    this.send_mouse_event(&term_model, 0, pos, true);
+                    this.selection_start = None;
+                    this.selection_end = None;
+                } else {
+                    let pos = this.mouse_to_grid(event.position);
+                    this.selection_start = Some(pos);
+                    this.selection_end = Some(pos);
+                }
                 cx.notify();
             }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if this.selection_start.is_some() && event.pressed_button == Some(MouseButton::Left) {
-                    let bounds = window.bounds();
-                    let pos = this.mouse_to_grid(event.position, bounds);
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                let term_model = this.terminal.read(cx);
+                let has_mouse_mode = {
+                    let t = term_model.term.lock();
+                    t.mode().intersects(TermMode::MOUSE_MODE)
+                };
+                if has_mouse_mode {
+                    let pos = this.mouse_to_grid(event.position);
+                    this.send_mouse_event(&term_model, 32, pos, true);
+                    cx.notify();
+                } else if this.selection_start.is_some() {
+                    let pos = this.mouse_to_grid(event.position);
                     this.selection_end = Some(pos);
                     cx.notify();
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|_this, _event: &MouseUpEvent, _window, _cx| {
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                let term_model = this.terminal.read(cx);
+                let has_mouse_mode = {
+                    let t = term_model.term.lock();
+                    t.mode().intersects(TermMode::MOUSE_MODE)
+                };
+                if has_mouse_mode {
+                    let pos = this.mouse_to_grid(event.position);
+                    this.send_mouse_event(&term_model, 0, pos, false);
+                    cx.notify();
+                }
             }))
             // ── Scroll ──
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                let term_model = this.terminal.read(cx);
-                let lines = match event.delta {
-                    ScrollDelta::Lines(delta) => -delta.y as i32,
+                let line_height = CELL_HEIGHT_PX;
+                let scroll_lines: Option<i32> = match event.delta {
+                    ScrollDelta::Lines(delta) => {
+                        Some(delta.y as i32)
+                    }
                     ScrollDelta::Pixels(delta) => {
-                        let dy = delta.y / px(1.0);
-                        (-dy / CELL_HEIGHT_PX) as i32
+                        match event.touch_phase {
+                            TouchPhase::Started => {
+                                this.scroll_px = 0.0;
+                                None
+                            }
+                            TouchPhase::Moved => {
+                                let old_offset = (this.scroll_px / line_height) as i32;
+                                this.scroll_px += delta.y / px(1.0);
+                                let new_offset = (this.scroll_px / line_height) as i32;
+                                Some(new_offset - old_offset)
+                            }
+                            TouchPhase::Ended => None,
+                        }
                     }
                 };
+
+                let Some(lines) = scroll_lines else { return };
                 if lines == 0 { return; }
 
-                let mouse_mode = {
+                let term_model = this.terminal.read(cx);
+                let (mouse_mode, is_alt_screen, has_sgr, has_alt_scroll) = {
                     let t = term_model.term.lock();
-                    t.mode().contains(TermMode::MOUSE_MODE) || t.mode().contains(TermMode::ALT_SCREEN)
+                    (
+                        t.mode().intersects(TermMode::MOUSE_MODE),
+                        t.mode().contains(TermMode::ALT_SCREEN),
+                        t.mode().contains(TermMode::SGR_MOUSE),
+                        t.mode().contains(TermMode::ALT_SCREEN)
+                            && t.mode().contains(TermMode::ALTERNATE_SCROLL),
+                    )
                 };
 
                 if mouse_mode {
-                    let sgr = { let t = term_model.term.lock(); t.mode().contains(TermMode::SGR_MOUSE) };
-                    let count = lines.unsigned_abs().min(10);
-                    for _ in 0..count {
-                        if sgr {
+                    for _ in 0..lines.unsigned_abs() {
+                        if has_sgr {
                             let button = if lines > 0 { 64 } else { 65 };
                             term_model.write_str_to_pty(&format!("\x1b[<{};1;1M", button));
                         } else {
@@ -378,7 +453,12 @@ impl Render for TerminalView {
                             term_model.write_to_pty(&[b'\x1b', b'[', b'M', button + 32, 33, 33]);
                         }
                     }
-                } else {
+                } else if has_alt_scroll {
+                    let cmd: u8 = if lines > 0 { b'A' } else { b'B' };
+                    for _ in 0..lines.unsigned_abs() {
+                        term_model.write_to_pty(&[0x1b, b'O', cmd]);
+                    }
+                } else if !is_alt_screen {
                     let mut t = term_model.term.lock();
                     t.scroll_display(Scroll::Delta(lines));
                     drop(t);
@@ -426,6 +506,14 @@ impl Render for TerminalView {
 
                 this.selection_start = None;
                 this.selection_end = None;
+
+                // Scroll to bottom on any input so the user can see what they're typing
+                {
+                    let term_model = this.terminal.read(cx);
+                    let mut t = term_model.term.lock();
+                    t.scroll_display(Scroll::Bottom);
+                }
+
                 let term = this.terminal.read(cx);
 
                 if keystroke.modifiers.alt {

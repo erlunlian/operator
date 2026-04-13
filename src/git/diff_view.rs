@@ -505,7 +505,7 @@ impl GitDiffPanel {
                 TreeNode::File {
                     name,
                     file_idx,
-                    status: _,
+                    _status: _,
                 } => {
                     let idx = *file_idx;
                     let entity = cx.entity().clone();
@@ -892,7 +892,7 @@ impl GitDiffPanel {
             if change_indices.is_empty() {
                 segments.push(LineSegment::CollapsedContext {
                     count: lines.len(),
-                    file_idx,
+                    _file_idx: file_idx,
                     hunk_idx,
                     direction: ExpandDirection::Top,
                 });
@@ -908,7 +908,7 @@ impl GitDiffPanel {
             if visible_start > 0 {
                 segments.push(LineSegment::CollapsedContext {
                     count: visible_start,
-                    file_idx,
+                    _file_idx: file_idx,
                     hunk_idx,
                     direction: ExpandDirection::Top,
                 });
@@ -922,7 +922,7 @@ impl GitDiffPanel {
             if hidden_below > 0 {
                 segments.push(LineSegment::CollapsedContext {
                     count: hidden_below,
-                    file_idx,
+                    _file_idx: file_idx,
                     hunk_idx,
                     direction: ExpandDirection::Bottom,
                 });
@@ -1050,6 +1050,52 @@ impl GitDiffPanel {
         };
         let line_num_str = line_num.map(|n| format!("{n}")).unwrap_or_default();
 
+        let content = line.content.trim_end();
+        let content_el: AnyElement = if let Some(highlights) = line.highlights.as_ref() {
+            if highlights.is_empty() {
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(content.to_string())
+                    .into_any_element()
+            } else {
+                let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
+                    .iter()
+                    .filter(|s| s.byte_range.end <= content.len()
+                        && content.is_char_boundary(s.byte_range.start)
+                        && content.is_char_boundary(s.byte_range.end))
+                    .map(|s| {
+                        (
+                            s.byte_range.clone(),
+                            HighlightStyle {
+                                color: Some(Hsla::from(s.color)),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
+                let text = SharedString::from(content.to_string());
+                let styled = StyledText::new(text).with_highlights(hl);
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(styled)
+                    .into_any_element()
+            }
+        } else {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_color(text_col)
+                .pl(px(4.0))
+                .child(content.to_string())
+                .into_any_element()
+        };
+
         div()
             .flex()
             .flex_row()
@@ -1077,14 +1123,7 @@ impl GitDiffPanel {
                     .pl(px(4.0))
                     .child(prefix.to_string()),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_color(text_col)
-                    .pl(px(4.0))
-                    .child(line.content.trim_end().to_string()),
-            )
+            .child(content_el)
     }
 }
 
@@ -1120,7 +1159,7 @@ enum LineSegment {
     Line(DiffLine),
     CollapsedContext {
         count: usize,
-        file_idx: usize,
+        _file_idx: usize,
         hunk_idx: usize,
         direction: ExpandDirection,
     },
@@ -1137,7 +1176,7 @@ enum TreeNode {
     File {
         name: String,
         file_idx: usize,
-        status: FileStatus,
+        _status: FileStatus,
     },
 }
 
@@ -1164,7 +1203,7 @@ fn insert_into_tree(
         nodes.push(TreeNode::File {
             name: parts[0].to_string(),
             file_idx,
-            status,
+            _status: status,
         });
         return;
     }
@@ -1213,13 +1252,10 @@ impl Render for GitDiffPanel {
             .id("diff-panel")
             .flex()
             .flex_col()
-            .w(px(self.width))
-            .min_w(px(200.0))
+            .w_full()
+            .flex_1()
             .h_full()
-            .flex_shrink_0()
             .bg(colors::surface())
-            .border_l_1()
-            .border_color(colors::border())
             // Handle tree resize drag across the whole panel
             .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_move.update(cx, |panel, cx| {

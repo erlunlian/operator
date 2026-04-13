@@ -1,16 +1,20 @@
 use gpui::*;
 use std::path::PathBuf;
 
-use crate::editor::EditorView;
+use crate::editor::FileViewer;
 use crate::tab::tab_bar::TabIcon;
 use crate::terminal::TerminalModel;
 use crate::terminal::terminal_view::TerminalView;
 use crate::theme::colors;
+use crate::util;
 use crate::workspace::workspace::ClaudeStatus;
 
 pub enum TabContent {
     Terminal(Entity<TerminalView>),
-    Editor(Entity<EditorView>),
+    File {
+        path: PathBuf,
+        viewer: Entity<FileViewer>,
+    },
 }
 
 pub struct Tab {
@@ -28,11 +32,27 @@ impl Tab {
         }
     }
 
-    pub fn new_editor(title: &str, root_dir: PathBuf, cx: &mut App) -> Self {
-        let editor = cx.new(|cx| EditorView::new(root_dir, cx));
+    pub fn new_file(path: PathBuf, cx: &mut App) -> Self {
+        let title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let viewer = cx.new(|cx| FileViewer::open(path.clone(), cx));
         Self {
-            title: SharedString::from(title.to_string()),
-            content: TabContent::Editor(editor),
+            title: SharedString::from(title),
+            content: TabContent::File { path, viewer },
+        }
+    }
+
+    pub fn new_empty_file(path: PathBuf, cx: &mut App) -> Self {
+        let title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let viewer = cx.new(|cx| FileViewer::new_empty(path.clone(), cx));
+        Self {
+            title: SharedString::from(title),
+            content: TabContent::File { path, viewer },
         }
     }
 
@@ -42,50 +62,68 @@ impl Tab {
                 glyph: "\u{e795}", //  terminal
                 color: colors::text_muted(),
             },
-            TabContent::Editor(_) => TabIcon {
-                glyph: "\u{f07c}", //  folder open
-                color: colors::text_muted(),
-            },
+            TabContent::File { .. } => {
+                TabIcon {
+                    glyph: util::icon_for_file(&self.title),
+                    color: util::file_icon_color(&self.title),
+                }
+            }
         }
     }
 
     pub fn get_claude_status(&self, cx: &App) -> ClaudeStatus {
         match &self.content {
-            TabContent::Terminal(view) => {
-                let view = view.read(cx);
+            TabContent::Terminal(terminal_view) => {
+                let view = terminal_view.read(cx);
                 let terminal = view.terminal.read(cx);
                 ClaudeStatus::from_detected(&terminal.get_claude_status())
             }
-            TabContent::Editor(_) => ClaudeStatus::Idle,
-        }
-    }
-
-    /// Returns true if this tab has inner sub-tabs that should be closed first.
-    pub fn has_open_sub_tabs(&self, cx: &App) -> bool {
-        match &self.content {
-            TabContent::Editor(view) => !view.read(cx).open_files.is_empty(),
-            TabContent::Terminal(_) => false,
-        }
-    }
-
-    /// Get the editor entity if this is an editor tab.
-    pub fn editor_entity(&self) -> Option<&Entity<EditorView>> {
-        match &self.content {
-            TabContent::Editor(view) => Some(view),
-            TabContent::Terminal(_) => None,
+            TabContent::File { .. } => ClaudeStatus::Idle,
         }
     }
 
     pub fn render_content(&self) -> AnyElement {
-        let child: AnyElement = match &self.content {
-            TabContent::Terminal(view) => view.clone().into_any_element(),
-            TabContent::Editor(view) => view.clone().into_any_element(),
-        };
-        div()
-            .flex()
-            .flex_1()
-            .size_full()
-            .child(child)
-            .into_any_element()
+        match &self.content {
+            TabContent::Terminal(terminal_view) => {
+                div()
+                    .flex()
+                    .flex_1()
+                    .size_full()
+                    .child(terminal_view.clone())
+                    .into_any_element()
+            }
+            TabContent::File { viewer, .. } => {
+                div()
+                    .flex()
+                    .flex_1()
+                    .size_full()
+                    .child(viewer.clone())
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// Returns the file path if this is a file tab.
+    pub fn file_path(&self) -> Option<&PathBuf> {
+        match &self.content {
+            TabContent::File { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Returns the file viewer if this is a file tab.
+    pub fn file_viewer(&self) -> Option<&Entity<FileViewer>> {
+        match &self.content {
+            TabContent::File { viewer, .. } => Some(viewer),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a file tab with dirty state.
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        match &self.content {
+            TabContent::File { viewer, .. } => viewer.read(cx).dirty,
+            _ => false,
+        }
     }
 }

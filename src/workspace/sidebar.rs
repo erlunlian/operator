@@ -5,6 +5,22 @@ use crate::theme::colors;
 use crate::util;
 use crate::workspace::workspace::ClaudeStatus;
 
+/// Start a native window drag from within an on_mouse_down handler (macOS).
+#[cfg(target_os = "macos")]
+fn start_window_drag_native() {
+    unsafe {
+        let app: cocoa::base::id = objc::msg_send![objc::class!(NSApplication), sharedApplication];
+        let event: cocoa::base::id = objc::msg_send![app, currentEvent];
+        let window: cocoa::base::id = objc::msg_send![event, window];
+        if !window.is_null() {
+            let _: () = objc::msg_send![window, performWindowDragWithEvent: event];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_window_drag_native() {}
+
 /// Data for rendering a single workspace card in the sidebar
 pub struct WorkspaceCardData {
     pub name: SharedString,
@@ -49,23 +65,6 @@ fn drop_indicator() -> Div {
 pub struct WorkspaceSidebar;
 
 impl WorkspaceSidebar {
-    pub fn render(
-        workspaces: &[WorkspaceCardData],
-        active_ix: usize,
-        on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
-        on_new: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_close: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
-        on_reorder: Option<Rc<dyn Fn(usize, usize, &mut Window, &mut App)>>,
-    ) -> Stateful<Div> {
-        Self::render_with_width(
-            workspaces, active_ix, on_select, on_new, on_close, on_reorder,
-            None,
-            Rc::new(|_, _, _| {}),
-            Rc::new(|_, _| {}),
-            260.0,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_width(
         workspaces: &[WorkspaceCardData],
@@ -93,11 +92,28 @@ impl WorkspaceSidebar {
             .border_r_1()
             .border_color(colors::border())
             .overflow_hidden()
-            .pt(px(36.0))
             .pb_1()
             .on_mouse_up(MouseButton::Left, move |_, window, cx| {
                 on_drag_end2(window, cx);
             });
+
+        // Titlebar drag region — replaces the old pt(36px) padding.
+        // Allows dragging the window from the empty sidebar top area.
+        sidebar = sidebar.child(
+            div()
+                .id("sidebar-titlebar-drag")
+                .h(px(36.0))
+                .w_full()
+                .flex_shrink_0()
+                .on_mouse_down(MouseButton::Left, |_event, _window, _cx| {
+                    start_window_drag_native();
+                })
+                .on_click(move |event, window, _cx| {
+                    if event.click_count() == 2 {
+                        window.titlebar_double_click();
+                    }
+                }),
+        );
 
         for (ix, ws) in workspaces.iter().enumerate() {
             let is_active = ix == active_ix;

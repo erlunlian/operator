@@ -5,12 +5,12 @@ actions!(
     [
         NewWorkspace,
         NewTab,
-        NewEditorTab,
         CloseTab,
         SplitPane,
         SplitPaneVertical,
         ToggleSidebar,
         ToggleDiffPanel,
+        ToggleFilesPanel,
         NextTab,
         PrevTab,
         SaveFile,

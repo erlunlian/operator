@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use crate::pane::pane_group::{SplitAxis, SplitNode, TabGroup};
 use crate::pane::PaneGroup;
-use crate::tab::tab::{Tab, TabContent};
+use crate::right_panel::{RightPanel, RightPanelTab};
+use crate::tab::tab::Tab;
 
 /// Serializable snapshot of the entire app state.
 #[derive(Serialize, Deserialize)]
@@ -21,6 +22,14 @@ pub struct SettingsState {
     pub theme: String,
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
+    #[serde(default)]
+    pub right_panel_collapsed: bool,
+    #[serde(default = "default_right_panel_width")]
+    pub right_panel_width: f32,
+    #[serde(default = "default_right_panel_tab")]
+    pub right_panel_tab: String,
+    // Legacy fields for backwards compat
+    #[serde(default)]
     pub diff_panel_collapsed: bool,
     #[serde(default = "default_diff_panel_width")]
     pub diff_panel_width: f32,
@@ -28,14 +37,27 @@ pub struct SettingsState {
     pub window_y: Option<f32>,
     pub window_width: Option<f32>,
     pub window_height: Option<f32>,
+    /// Editor state for the right panel
+    #[serde(default)]
+    pub editor_open_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub editor_active_file_ix: usize,
 }
 
 fn default_theme() -> String {
     crate::theme::colors::DEFAULT_THEME.name.to_string()
 }
 
+fn default_right_panel_width() -> f32 {
+    400.0
+}
+
 fn default_diff_panel_width() -> f32 {
     360.0
+}
+
+fn default_right_panel_tab() -> String {
+    "git".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -70,6 +92,8 @@ pub struct TabGroupState {
 #[derive(Serialize, Deserialize, Clone)]
 pub enum TabState {
     Terminal { title: String },
+    // Legacy: editor tabs are now in the right panel. Kept for migration.
+    #[serde(alias = "Editor")]
     Editor(EditorState),
 }
 
@@ -103,6 +127,23 @@ impl SessionState {
             })
             .collect();
 
+        let rp = app.right_panel.read(cx);
+        let right_panel_tab = match rp.active_tab {
+            RightPanelTab::Files => "files",
+            RightPanelTab::Git => "git",
+        };
+
+        // Capture editor state from right panel
+        let (editor_open_files, editor_active_file_ix) = if let Some(editor) = &rp.editor {
+            let editor = editor.read(cx);
+            (
+                editor.all_open_files(cx),
+                0, // active file index not meaningful with split panes
+            )
+        } else {
+            (Vec::new(), 0)
+        };
+
         SessionState {
             workspaces,
             active_workspace_ix: app.active_workspace_ix,
@@ -111,12 +152,17 @@ impl SessionState {
                 theme: settings.theme.clone(),
                 sidebar_collapsed: app.sidebar_collapsed,
                 sidebar_width: app.sidebar_width,
-                diff_panel_collapsed: app.diff_panel_collapsed,
-                diff_panel_width: app.diff_panel.read(cx).width,
+                right_panel_collapsed: app.right_panel_collapsed,
+                right_panel_width: rp.width,
+                right_panel_tab: right_panel_tab.to_string(),
+                diff_panel_collapsed: app.right_panel_collapsed,
+                diff_panel_width: rp.width,
                 window_x: app.window_bounds.map(|b| b.0),
                 window_y: app.window_bounds.map(|b| b.1),
                 window_width: app.window_bounds.map(|b| b.2),
                 window_height: app.window_bounds.map(|b| b.3),
+                editor_open_files,
+                editor_active_file_ix,
             },
         }
     }
@@ -149,23 +195,8 @@ impl SessionState {
             .iter()
             .map(|tab_entity| {
                 let tab = tab_entity.read(cx);
-                match &tab.content {
-                    TabContent::Terminal(_) => TabState::Terminal {
-                        title: tab.title.to_string(),
-                    },
-                    TabContent::Editor(editor_entity) => {
-                        let editor = editor_entity.read(cx);
-                        TabState::Editor(EditorState {
-                            title: tab.title.to_string(),
-                            root_dir: editor.root_dir.clone(),
-                            open_files: editor
-                                .open_files
-                                .iter()
-                                .map(|f| f.path.clone())
-                                .collect(),
-                            active_file_ix: editor.active_file_ix,
-                        })
-                    }
+                TabState::Terminal {
+                    title: tab.title.to_string(),
                 }
             })
             .collect();
@@ -193,7 +224,21 @@ impl SessionState {
 
         let sidebar_collapsed = self.settings.sidebar_collapsed;
         let sidebar_width = self.settings.sidebar_width;
-        let diff_panel_collapsed = self.settings.diff_panel_collapsed;
+        // Support both new and legacy field names
+        let right_panel_collapsed = if self.settings.right_panel_collapsed {
+            true
+        } else {
+            self.settings.diff_panel_collapsed
+        };
+        let right_panel_width = if self.settings.right_panel_width > 0.0 {
+            self.settings.right_panel_width
+        } else {
+            self.settings.diff_panel_width.max(400.0)
+        };
+        let right_panel_tab = match self.settings.right_panel_tab.as_str() {
+            "files" => RightPanelTab::Files,
+            _ => RightPanelTab::Git,
+        };
         let window_bounds = match (
             self.settings.window_x,
             self.settings.window_y,
@@ -228,6 +273,7 @@ impl SessionState {
                                     drop_target: None,
                                     focused_group_id: None,
                                     work_dir: Some(dir_for_layout),
+                                    mode: crate::pane::pane_group::PaneGroupMode::Terminal,
                                 }
                             });
                             cx.observe(&layout, |_this, _layout, cx| cx.notify())
@@ -253,20 +299,44 @@ impl SessionState {
             .active_workspace_ix
             .min(workspaces.len().saturating_sub(1));
 
-        let diff_panel_width = self.settings.diff_panel_width;
         // Derive diff panel work_dir from the active workspace's directory
         let active_ws_dir = workspaces
             .get(active_workspace_ix)
             .and_then(|ws| ws.read(cx).directory.clone());
-        let diff_panel = cx.new(|_cx| {
-            let mut panel = if let Some(dir) = active_ws_dir {
-                crate::git::GitDiffPanel::new(dir)
-            } else {
-                crate::git::GitDiffPanel::empty()
-            };
-            panel.width = diff_panel_width;
-            panel
+
+        let editor_open_files = self.settings.editor_open_files.clone();
+        let _editor_active_file_ix = self.settings.editor_active_file_ix;
+        let active_ws_dir_clone = active_ws_dir.clone();
+
+        let right_panel = cx.new(|cx| {
+            let diff_panel = cx.new(|_cx| {
+                if let Some(dir) = &active_ws_dir {
+                    crate::git::GitDiffPanel::new(dir.clone())
+                } else {
+                    crate::git::GitDiffPanel::empty()
+                }
+            });
+            let mut rp = RightPanel::new(diff_panel);
+            rp.width = right_panel_width;
+            rp.active_tab = right_panel_tab;
+
+            // Restore editor with open files
+            if let Some(dir) = active_ws_dir_clone {
+                rp.ensure_editor(dir, cx);
+                if let Some(editor) = &rp.editor {
+                    editor.update(cx, |editor, cx| {
+                        for file_path in &editor_open_files {
+                            if file_path.exists() {
+                                editor.open_file(file_path.clone(), cx);
+                            }
+                        }
+                    });
+                }
+            }
+
+            rp
         });
+
         let settings_panel = cx.new(|cx| crate::settings::settings_panel::SettingsPanel::new(cx));
 
         crate::app::OperatorApp::from_restored(
@@ -274,9 +344,9 @@ impl SessionState {
             active_workspace_ix,
             sidebar_collapsed,
             sidebar_width,
-            diff_panel_collapsed,
+            right_panel_collapsed,
             window_bounds,
-            diff_panel,
+            right_panel,
             settings_panel,
             cx,
         )
@@ -313,31 +383,21 @@ impl SessionState {
         let tabs: Vec<gpui::Entity<Tab>> = state
             .tabs
             .iter()
-            .map(|tab_state| match tab_state {
-                TabState::Terminal { title } => cx.new(|cx| Tab::new(title, work_dir.cloned(), cx)),
-                TabState::Editor(editor_state) => {
-                    cx.new(|cx| {
-                        let tab =
-                            Tab::new_editor(&editor_state.title, editor_state.root_dir.clone(), cx);
-                        // Open the previously open files
-                        if let TabContent::Editor(editor_entity) = &tab.content {
-                            let editor_entity = editor_entity.clone();
-                            editor_entity.update(cx, |editor: &mut crate::editor::EditorView, cx| {
-                                for file_path in &editor_state.open_files {
-                                    if file_path.exists() {
-                                        editor.open_file(file_path.clone(), cx);
-                                    }
-                                }
-                                if editor_state.active_file_ix < editor.open_files.len() {
-                                    editor.active_file_ix = editor_state.active_file_ix;
-                                }
-                            });
-                        }
-                        tab
-                    })
+            .filter_map(|tab_state| match tab_state {
+                TabState::Terminal { title } => {
+                    Some(cx.new(|cx| Tab::new(title, work_dir.cloned(), cx)))
                 }
+                // Legacy editor tabs are skipped — editor is now in the right panel
+                TabState::Editor(_) => None,
             })
             .collect();
+
+        // If all tabs were editor tabs (now removed), add a terminal
+        let tabs = if tabs.is_empty() {
+            vec![cx.new(|cx| Tab::new("Terminal", work_dir.cloned(), cx))]
+        } else {
+            tabs
+        };
 
         let active = state.active_tab_ix.min(tabs.len().saturating_sub(1));
         TabGroup {

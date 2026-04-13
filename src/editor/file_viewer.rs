@@ -1315,18 +1315,6 @@ impl FileViewer {
         self.jump_to_search_match();
     }
 
-    fn search_prev(&mut self) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        if self.search_match_ix == 0 {
-            self.search_match_ix = self.search_matches.len() - 1;
-        } else {
-            self.search_match_ix -= 1;
-        }
-        self.jump_to_search_match();
-    }
-
     fn jump_to_search_match(&mut self) {
         if let Some(&(row, col, _)) = self.search_matches.get(self.search_match_ix) {
             self.cursor_row = row;
@@ -1883,13 +1871,6 @@ impl FileViewer {
     }
 
     // ── Rendering ──
-
-    pub fn filename(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "untitled".to_string())
-    }
 
     /// Convert a byte offset within a line to a character (grapheme) count.
     /// This is used to position the cursor overlay: left = char_count * char_width.

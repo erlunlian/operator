@@ -124,8 +124,7 @@ impl Workspace {
 
     pub fn add_tab(&mut self, cx: &mut Context<Self>) {
         self.with_layout(cx, |pg, cx| {
-            let dir = pg.work_dir.clone();
-            pg.root.add_tab(dir, cx);
+            pg.add_tab_to_focused(cx);
         });
     }
 
@@ -142,20 +141,12 @@ impl Workspace {
         self.with_layout(cx, |pg, cx| { pg.close_focused_tab(cx); });
     }
 
-    pub fn close_tab_at(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.with_layout(cx, |pg, _cx| pg.root.close_tab_at(ix));
-    }
-
-    pub fn set_active_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.with_layout(cx, |pg, _cx| pg.root.set_active_tab(ix));
-    }
-
     pub fn next_tab(&mut self, cx: &mut Context<Self>) {
-        self.with_layout(cx, |pg, _cx| pg.root.next_tab());
+        self.with_layout(cx, |pg, _cx| pg.next_tab_in_focused());
     }
 
     pub fn prev_tab(&mut self, cx: &mut Context<Self>) {
-        self.with_layout(cx, |pg, _cx| pg.root.prev_tab());
+        self.with_layout(cx, |pg, _cx| pg.prev_tab_in_focused());
     }
 
     pub fn split_active_pane(&mut self, cx: &mut Context<Self>) {
@@ -168,14 +159,5 @@ impl Workspace {
         });
     }
 
-    pub fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        self.with_layout(cx, |pg, _cx| pg.root.reorder_tab(from, to));
-    }
-
-    pub fn add_editor_tab(&mut self, cx: &mut Context<Self>) {
-        if let Some(dir) = self.directory.clone() {
-            self.with_layout(cx, |pg, cx| pg.root.add_editor_tab(dir, cx));
-        }
-    }
 }
 

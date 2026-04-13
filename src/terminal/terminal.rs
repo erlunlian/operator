@@ -77,7 +77,7 @@ pub enum DetectedClaudeStatus {
 pub struct TerminalModel {
     pub term: Arc<FairMutex<Term<JsonListener>>>,
     event_loop_sender: EventLoopSender,
-    listener: JsonListener,
+    _listener: JsonListener,
     pub claude_status: Arc<std::sync::Mutex<DetectedClaudeStatus>>,
 }
 
@@ -211,7 +211,7 @@ impl TerminalModel {
         Self {
             term,
             event_loop_sender,
-            listener,
+            _listener: listener,
             claude_status,
         }
     }

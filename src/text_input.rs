@@ -56,16 +56,6 @@ impl TextInput {
         self.on_cancel = Some(f);
     }
 
-    pub fn set_on_change(&mut self, f: Rc<dyn Fn(&str, &mut Window, &mut App)>) {
-        self.on_change = Some(f);
-    }
-
-    pub fn set_text(&mut self, text: &str) {
-        self.text = text.to_string();
-        self.cursor = self.text.len();
-        self.selection = None;
-    }
-
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -74,10 +64,6 @@ impl TextInput {
 
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
-    }
-
-    pub fn is_focused(&self, window: &Window) -> bool {
-        self.focus_handle.is_focused(window)
     }
 
     // ── Char boundary helpers ──

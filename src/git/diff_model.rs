@@ -1,3 +1,5 @@
+use crate::editor::syntax::HighlightSpan;
+
 #[derive(Clone)]
 pub enum DiffLineKind {
     Context,
@@ -11,11 +13,13 @@ pub struct DiffLine {
     pub content: String,
     pub old_lineno: Option<u32>,
     pub new_lineno: Option<u32>,
+    /// Precomputed syntax highlight spans for this line's content.
+    pub highlights: Option<Vec<HighlightSpan>>,
 }
 
 #[derive(Clone)]
 pub struct DiffHunk {
-    pub header: String,
+    pub _header: String,
     pub lines: Vec<DiffLine>,
 }
 

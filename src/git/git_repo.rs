@@ -2,6 +2,7 @@ use git2::{Delta, Diff, DiffOptions, Repository};
 use std::path::{Path, PathBuf};
 
 use super::diff_model::*;
+use crate::editor::syntax;
 
 pub struct GitRepo {
     repo: Repository,
@@ -62,14 +63,6 @@ impl GitRepo {
             Some(d) => Self::extract_files(&d),
             None => Vec::new(),
         }
-    }
-
-    /// Combined working diff (kept for backward compat / session capture).
-    pub fn working_diff(&self) -> Vec<DiffFile> {
-        let mut staged = self.staged_diff();
-        let unstaged = self.unstaged_diff();
-        staged.extend(unstaged);
-        staged
     }
 
     /// Stage a file (git add).
@@ -173,11 +166,12 @@ impl GitRepo {
                                         content,
                                         old_lineno: line.old_lineno(),
                                         new_lineno: line.new_lineno(),
+                                        highlights: None,
                                     });
                                 }
                             }
 
-                            hunks.push(DiffHunk { header, lines });
+                            hunks.push(DiffHunk { _header: header, lines });
                         }
                     }
                 }
@@ -188,6 +182,67 @@ impl GitRepo {
                 status,
                 hunks,
             });
+        }
+
+        // Precompute syntax highlights for each file's diff lines.
+        for file in &mut diff_files {
+            let Some(lang) = syntax::detect_language(&file.path) else {
+                continue;
+            };
+            // Collect trimmed content strings (owned) so we don't borrow file.hunks.
+            let all_lines: Vec<String> = file
+                .hunks
+                .iter()
+                .flat_map(|h| h.lines.iter())
+                .map(|l| l.content.trim_end().to_string())
+                .collect();
+            let full_text = all_lines.join("\n");
+            let spans = syntax::highlight_source(&full_text, lang);
+            if spans.is_empty() {
+                continue;
+            }
+
+            // Split global spans back to per-line highlights.
+            let mut per_line: Vec<Option<Vec<syntax::HighlightSpan>>> =
+                Vec::with_capacity(all_lines.len());
+            let mut offset = 0usize;
+            for line_text in &all_lines {
+                let line_start = offset;
+                let line_end = offset + line_text.len();
+                let line_spans: Vec<_> = spans
+                    .iter()
+                    .filter(|s| s.byte_range.start < line_end && s.byte_range.end > line_start)
+                    .filter_map(|s| {
+                        let start = s.byte_range.start.max(line_start) - line_start;
+                        let end = s.byte_range.end.min(line_end) - line_start;
+                        if start < end
+                            && end <= line_text.len()
+                            && line_text.is_char_boundary(start)
+                            && line_text.is_char_boundary(end)
+                        {
+                            Some(syntax::HighlightSpan {
+                                byte_range: start..end,
+                                color: s.color,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                per_line.push(if line_spans.is_empty() { None } else { Some(line_spans) });
+                offset = line_end + 1;
+            }
+
+            // Apply highlights back to diff lines.
+            let mut idx = 0;
+            for hunk in &mut file.hunks {
+                for diff_line in &mut hunk.lines {
+                    if idx < per_line.len() {
+                        diff_line.highlights = per_line[idx].take();
+                    }
+                    idx += 1;
+                }
+            }
         }
 
         diff_files

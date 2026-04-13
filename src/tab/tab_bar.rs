@@ -4,6 +4,25 @@ use std::rc::Rc;
 use crate::theme::colors;
 use crate::util;
 
+/// Start a native window drag from within an on_mouse_down handler.
+/// Uses NSApp currentEvent + performWindowDragWithEvent: on macOS.
+#[cfg(target_os = "macos")]
+fn start_window_drag_native() {
+    unsafe {
+        let app: cocoa::base::id = objc::msg_send![objc::class!(NSApplication), sharedApplication];
+        let event: cocoa::base::id = objc::msg_send![app, currentEvent];
+        let window: cocoa::base::id = objc::msg_send![event, window];
+        if !window.is_null() {
+            let _: () = objc::msg_send![window, performWindowDragWithEvent: event];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_window_drag_native() {
+    // No-op on non-macOS platforms; GPUI's start_window_move() handles Linux.
+}
+
 /// Icon info for a tab.
 #[derive(Clone)]
 pub struct TabIcon {
@@ -188,6 +207,25 @@ impl TabBar {
                     on_new(window, cx);
                 })
                 .child("+"),
+        );
+
+        // Spacer that fills remaining tab bar width — acts as a window drag region.
+        // Double-click to zoom is handled via titlebar_double_click.
+        bar = bar.child(
+            div()
+                .id(ElementId::Name(
+                    format!("tab-bar-drag-{group_id}").into(),
+                ))
+                .flex_1()
+                .h_full()
+                .on_mouse_down(MouseButton::Left, |_event, _window, _cx| {
+                    start_window_drag_native();
+                })
+                .on_click(move |event, window, _cx| {
+                    if event.click_count() == 2 {
+                        window.titlebar_double_click();
+                    }
+                }),
         );
 
         bar

@@ -327,14 +327,6 @@ fn active() -> &'static RwLock<Theme> {
     ACTIVE_THEME.get_or_init(|| RwLock::new(DEFAULT_THEME))
 }
 
-pub fn current_theme() -> Theme {
-    *active().read().unwrap()
-}
-
-pub fn current_theme_name() -> &'static str {
-    active().read().unwrap().name
-}
-
 pub fn set_theme(theme: Theme) {
     *active().write().unwrap() = theme;
 }

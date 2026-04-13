@@ -630,13 +630,25 @@ impl OperatorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let prev = window.focused(cx);
-        self.command_center.update(cx, |cc, cx| {
-            if !cc.visible {
-                cc.previous_focus = prev;
+        let was_visible = self.command_center.read(cx).visible;
+        if was_visible {
+            // Closing — restore previous focus
+            let prev = self.command_center.read(cx).previous_focus.clone();
+            self.command_center.update(cx, |cc, cx| {
+                cc.previous_focus = None;
+                cc.toggle(cx);
+            });
+            if let Some(handle) = prev {
+                handle.focus(window);
             }
-            cc.toggle(cx);
-        });
+        } else {
+            // Opening — save current focus
+            let prev = window.focused(cx);
+            self.command_center.update(cx, |cc, cx| {
+                cc.previous_focus = prev;
+                cc.toggle(cx);
+            });
+        }
     }
 
     fn request_quit(
@@ -1134,23 +1146,6 @@ impl OperatorApp {
 
 impl Render for OperatorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // When the command center closes, its TextInput's focus handle is
-        // orphaned (no longer in the rendered tree). Restore focus to the
-        // pane that was focused before the command center opened.
-        if !self.command_center.read(cx).visible
-            && !self.focus_handle.contains_focused(window, cx)
-        {
-            let prev = self.command_center.read(cx).previous_focus.clone();
-            if let Some(handle) = prev {
-                handle.focus(window);
-            } else {
-                self.focus_handle.focus(window);
-            }
-            self.command_center.update(cx, |cc, _cx| {
-                cc.previous_focus = None;
-            });
-        }
-
         // Cache window bounds for session persistence
         let bounds = window.bounds();
         self.window_bounds = Some((

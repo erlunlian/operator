@@ -123,10 +123,15 @@ impl CommandCenter {
                     cc.handle_submit(cx);
                 });
             }));
-            inp.set_on_cancel(Rc::new(move |_window, cx| {
+            inp.set_on_cancel(Rc::new(move |window, cx| {
+                let prev = entity_change.read(cx).previous_focus.clone();
                 entity_change.update(cx, |cc, cx| {
+                    cc.previous_focus = None;
                     cc.dismiss(cx);
                 });
+                if let Some(handle) = prev {
+                    handle.focus(window);
+                }
             }));
         });
 
@@ -942,11 +947,11 @@ impl Render for CommandCenter {
             inp.focus(window);
         });
 
-        let entity = cx.entity().clone();
         let entity_up = cx.entity().clone();
         let entity_down = cx.entity().clone();
 
         // Backdrop
+        let backdrop_entity = cx.entity().clone();
         let backdrop = div()
             .id("command-center-backdrop")
             .absolute()
@@ -954,8 +959,15 @@ impl Render for CommandCenter {
             .left_0()
             .size_full()
             .bg(rgba(0x00000088))
-            .on_click(move |_, _window, cx| {
-                entity.update(cx, |cc, cx| cc.dismiss(cx));
+            .on_click(move |_, window, cx| {
+                let prev = backdrop_entity.read(cx).previous_focus.clone();
+                backdrop_entity.update(cx, |cc, cx| {
+                    cc.previous_focus = None;
+                    cc.dismiss(cx);
+                });
+                if let Some(handle) = prev {
+                    handle.focus(window);
+                }
             });
 
         // Build modal content
@@ -973,7 +985,7 @@ impl Render for CommandCenter {
             .top(px(120.0))
             .left_auto()
             .right_auto()
-            .w(px(560.0))
+            .w(px(680.0))
             .max_h(px(600.0))
             .when(has_virtual_list, |m: Stateful<Div>| m.h(px(600.0)))
             .bg(colors::surface())
@@ -1173,6 +1185,7 @@ impl Render for CommandCenter {
                                                 .id(ElementId::Name(
                                                     format!("search-result-{row_ix}").into(),
                                                 ))
+                                                .w_full()
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
@@ -1282,6 +1295,7 @@ impl Render for CommandCenter {
                                         .id(ElementId::Name(
                                             format!("file-result-{ix}").into(),
                                         ))
+                                        .w_full()
                                         .flex()
                                         .flex_row()
                                         .items_center()
@@ -1309,6 +1323,7 @@ impl Render for CommandCenter {
                                     if let Some(dir) = dir_part {
                                         row = row.child(
                                             div()
+                                                .ml_2()
                                                 .text_xs()
                                                 .text_color(colors::text_muted())
                                                 .child(dir),

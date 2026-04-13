@@ -23,7 +23,8 @@ impl SettingsPanel {
 }
 
 impl Render for SettingsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.focus_handle.focus(window);
         let vim_enabled = AppSettings::vim_mode(cx);
         let entity = cx.entity().clone();
         let current_theme_name = AppSettings::get(cx).theme.clone();

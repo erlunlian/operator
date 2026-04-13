@@ -7,6 +7,7 @@ use crate::actions::NewTab;
 use crate::editor::file_tree::FileTree;
 use crate::editor::FileViewer;
 use crate::theme::colors;
+use crate::util;
 
 pub struct OpenFile {
     pub path: PathBuf,
@@ -136,10 +137,11 @@ impl EditorView {
             let entity_select = entity.clone();
             let entity_close = entity.clone();
 
+            let file_icon = util::icon_for_file(&file.title);
             let tab_title = if is_dirty {
-                format!("{} *", file.title)
+                format!("{file_icon} {} *", file.title)
             } else {
-                file.title.to_string()
+                format!("{file_icon} {}", file.title)
             };
 
             let mut tab_el = div()

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::theme::colors;
+use crate::util;
 
 pub struct FileTreeEntry {
     pub path: PathBuf,
@@ -176,6 +177,7 @@ impl FileTree {
             if entry.is_dir {
                 let is_expanded = self.expanded_dirs.contains(&entry.path);
                 let chevron = if is_expanded { "▼" } else { "▶" };
+                let dir_icon = if is_expanded { util::dir_icon_open() } else { util::dir_icon() };
 
                 row = row
                     .child(
@@ -183,6 +185,12 @@ impl FileTree {
                             .text_color(colors::text_muted())
                             .w(px(12.0))
                             .child(chevron),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .mr(px(4.0))
+                            .child(dir_icon),
                     )
                     .child(entry.name.clone());
 
@@ -193,8 +201,15 @@ impl FileTree {
                 });
             } else {
                 // File: no chevron, just indented name
+                let icon = util::icon_for_file(&entry.name);
                 row = row
                     .child(div().w(px(12.0)))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .mr(px(4.0))
+                            .child(icon),
+                    )
                     .child(entry.name.clone());
 
                 let path = entry.path.clone();

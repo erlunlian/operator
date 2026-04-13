@@ -240,10 +240,17 @@ impl SessionState {
             .active_workspace_ix
             .min(workspaces.len().saturating_sub(1));
 
-        let work_dir = std::env::current_dir().unwrap_or_default();
         let diff_panel_width = self.settings.diff_panel_width;
+        // Derive diff panel work_dir from the active workspace's directory
+        let active_ws_dir = workspaces
+            .get(active_workspace_ix)
+            .and_then(|ws| ws.read(cx).directory.clone());
         let diff_panel = cx.new(|_cx| {
-            let mut panel = crate::git::GitDiffPanel::new(work_dir);
+            let mut panel = if let Some(dir) = active_ws_dir {
+                crate::git::GitDiffPanel::new(dir)
+            } else {
+                crate::git::GitDiffPanel::empty()
+            };
             panel.width = diff_panel_width;
             panel
         });

@@ -20,6 +20,9 @@ if [ -f resources/AppIcon.icns ]; then
     cp resources/AppIcon.icns "$BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
+# Remove quarantine attributes so macOS doesn't block the unsigned app
+xattr -cr "$BUNDLE"
+
 echo ""
 echo "Done! App bundle at: $BUNDLE"
 echo ""

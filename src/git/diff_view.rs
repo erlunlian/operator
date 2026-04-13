@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::diff_model::*;
 use super::git_repo::GitRepo;
 use crate::theme::colors;
+use crate::util;
 
 /// How many context lines around each change to show by default.
 const DEFAULT_CONTEXT: usize = 3;
@@ -89,6 +90,30 @@ impl std::hash::Hash for DiffSection {
 }
 
 impl GitDiffPanel {
+    pub fn empty() -> Self {
+        Self {
+            repo: None,
+            branch: String::new(),
+            staged_files: Vec::new(),
+            unstaged_files: Vec::new(),
+            active_section: DiffSection::Unstaged,
+            collapsed_files: HashSet::new(),
+            collapsed_dirs: HashSet::new(),
+            staged_tree_collapsed: false,
+            unstaged_tree_collapsed: false,
+            expanded_context: HashMap::new(),
+            width: 360.0,
+            tree_width: 200.0,
+            resizing_tree: false,
+            tree_drag_start_x: 0.0,
+            tree_drag_start_width: 0.0,
+            scroll_handle: ScrollHandle::new(),
+            copied_file_key: None,
+            _copied_timer: None,
+            scroll_to_file: None,
+        }
+    }
+
     pub fn new(work_dir: PathBuf) -> Self {
         let repo = GitRepo::open(&work_dir);
         let branch = repo
@@ -316,6 +341,7 @@ impl GitDiffPanel {
                     let entity = cx.entity().clone();
                     let dk = dir_key.clone();
                     let chevron = if is_collapsed { "\u{25B6}" } else { "\u{25BC}" };
+                    let dir_icon = if is_collapsed { util::dir_icon() } else { util::dir_icon_open() };
 
                     container = container.child(
                         div()
@@ -348,6 +374,12 @@ impl GitDiffPanel {
                             )
                             .child(
                                 div()
+                                    .text_size(px(12.0))
+                                    .ml_1()
+                                    .child(dir_icon),
+                            )
+                            .child(
+                                div()
                                     .ml_1()
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -364,14 +396,8 @@ impl GitDiffPanel {
                 TreeNode::File {
                     name,
                     file_idx,
-                    status,
+                    status: _,
                 } => {
-                    let status_color = match status {
-                        FileStatus::Added => colors::diff_added(),
-                        FileStatus::Modified => colors::accent(),
-                        FileStatus::Deleted => colors::diff_removed(),
-                        FileStatus::Renamed => colors::accent(),
-                    };
                     let idx = *file_idx;
                     let entity = cx.entity().clone();
                     let is_active_section = self.active_section == section;
@@ -458,7 +484,8 @@ impl GitDiffPanel {
                                     cx.notify();
                                 });
                             })
-                            .child(
+                            .child({
+                                let file_icon = util::icon_for_file(name);
                                 div()
                                     .flex()
                                     .flex_row()
@@ -466,19 +493,16 @@ impl GitDiffPanel {
                                     .gap_1()
                                     .child(
                                         div()
-                                            .w(px(8.0))
-                                            .h(px(8.0))
-                                            .rounded_full()
-                                            .bg(status_color)
-                                            .flex_shrink_0(),
+                                            .text_size(px(12.0))
+                                            .child(file_icon),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(colors::accent())
                                             .child(name.clone()),
-                                    ),
-                            )
+                                    )
+                            })
                             .child(
                                 actions
                                     .id(ElementId::Name(format!("tree-actions-{sec_prefix}-{idx}").into()))

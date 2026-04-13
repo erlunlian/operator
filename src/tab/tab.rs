@@ -21,7 +21,7 @@ impl Tab {
         let terminal = cx.new(|cx| TerminalModel::new(cx));
         let terminal_view = cx.new(|cx| TerminalView::new(terminal, cx));
         Self {
-            title: SharedString::from(title.to_string()),
+            title: SharedString::from(format!("\u{1F4BB} {title}")), // 💻
             content: TabContent::Terminal(terminal_view),
         }
     }
@@ -29,7 +29,7 @@ impl Tab {
     pub fn new_editor(title: &str, root_dir: PathBuf, cx: &mut App) -> Self {
         let editor = cx.new(|cx| EditorView::new(root_dir, cx));
         Self {
-            title: SharedString::from(title.to_string()),
+            title: SharedString::from(format!("\u{1F4C2} {title}")), // 📂
             content: TabContent::Editor(editor),
         }
     }

@@ -36,8 +36,7 @@ impl OperatorApp {
         let ws = cx.new(|cx| Workspace::new_empty(cx));
         cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
 
-        let work_dir = std::env::current_dir().unwrap_or_default();
-        let diff_panel = cx.new(|_cx| GitDiffPanel::new(work_dir));
+        let diff_panel = cx.new(|_cx| GitDiffPanel::empty());
 
         let settings_panel = cx.new(|cx| SettingsPanel::new(cx));
         let command_center = cx.new(|cx| CommandCenter::new(cx));
@@ -234,7 +233,16 @@ impl OperatorApp {
     fn remove_active_workspace(&mut self, cx: &mut Context<Self>) {
         self.workspaces.remove(self.active_workspace_ix);
         if self.workspaces.is_empty() {
-            cx.quit();
+            // Instead of quitting, create a fresh uninitialized workspace
+            let ws = cx.new(|cx| Workspace::new_empty(cx));
+            cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
+            self.workspaces.push(ws);
+            self.active_workspace_ix = 0;
+            self.diff_panel.update(cx, |panel, cx| {
+                *panel = GitDiffPanel::empty();
+                cx.notify();
+            });
+            cx.notify();
             return;
         }
         if self.active_workspace_ix >= self.workspaces.len() {
@@ -259,9 +267,12 @@ impl OperatorApp {
     fn close_tab(&mut self, _: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
         let ws = self.active_workspace().clone();
 
-        // If workspace has no directory yet (welcome screen), close the workspace
+        // If workspace has no directory yet (welcome screen), close it —
+        // unless it's the last one, then do nothing.
         if !ws.read(cx).has_directory() {
-            self.remove_active_workspace(cx);
+            if self.workspaces.len() > 1 {
+                self.remove_active_workspace(cx);
+            }
             return;
         }
 
@@ -479,19 +490,31 @@ impl OperatorApp {
 
         let ws = self.active_workspace().clone();
         if !ws.read(cx).has_directory() {
-            ws.update(cx, |ws, cx| ws.set_directory(dir, cx));
+            ws.update(cx, |ws, cx| ws.set_directory(dir.clone(), cx));
         } else {
             // Create a new workspace for this directory
             let dir_name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Workspace".to_string());
-            let new_ws = cx.new(|cx| Workspace::new(&dir_name, dir, cx));
+            let new_ws = cx.new(|cx| Workspace::new(&dir_name, dir.clone(), cx));
             cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
             self.workspaces.push(new_ws);
             self.active_workspace_ix = self.workspaces.len() - 1;
         }
+        self.update_diff_panel_dir(dir, cx);
         cx.notify();
+    }
+
+    /// Point the diff panel at a new working directory and restart the file watcher.
+    fn update_diff_panel_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.diff_panel.update(cx, |panel, cx| {
+            let w = panel.width;
+            *panel = GitDiffPanel::new(dir);
+            panel.width = w;
+            cx.notify();
+        });
+        Self::start_diff_watcher(self.diff_panel.clone(), cx);
     }
 
     /// Open the OS directory picker and set directory on the active workspace.
@@ -785,6 +808,15 @@ impl Render for OperatorApp {
                 Rc::new(move |ix, _window, cx| {
                     app_entity.update(cx, |app, cx| {
                         app.active_workspace_ix = ix;
+                        let dir = app.workspaces[ix].read(cx).directory.clone();
+                        if let Some(dir) = dir {
+                            app.update_diff_panel_dir(dir, cx);
+                        } else {
+                            app.diff_panel.update(cx, |panel, cx| {
+                                *panel = GitDiffPanel::empty();
+                                cx.notify();
+                            });
+                        }
                         cx.notify();
                     });
                 }),

@@ -85,6 +85,11 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(window_bounds),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Operator".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(9.0), px(9.0))),
+                }),
                 ..Default::default()
             },
             |_window, cx| {

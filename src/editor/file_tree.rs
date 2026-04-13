@@ -62,8 +62,8 @@ impl FileTree {
             for entry in read_dir.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
 
-                // Skip hidden files and ignored directories
-                if name.starts_with('.') || IGNORED_NAMES.contains(&name.as_str()) {
+                // Skip ignored directories/files
+                if IGNORED_NAMES.contains(&name.as_str()) {
                     continue;
                 }
 

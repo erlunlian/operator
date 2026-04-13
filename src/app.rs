@@ -6,6 +6,7 @@ use crate::actions::*;
 use crate::command_center::{CommandAction, CommandCenter};
 use crate::git::GitDiffPanel;
 use crate::recent_projects::RecentProjects;
+use crate::settings::AppSettings;
 use crate::settings::settings_panel::SettingsPanel;
 use crate::theme::colors;
 use crate::workspace::sidebar::WorkspaceCardData;
@@ -47,6 +48,7 @@ impl OperatorApp {
 
         Self::register_quit_handler(cx);
         Self::start_diff_watcher(diff_panel.clone(), cx);
+        cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
         Self {
             workspaces: vec![ws],
@@ -99,6 +101,7 @@ impl OperatorApp {
 
         Self::register_quit_handler(cx);
         Self::start_diff_watcher(diff_panel.clone(), cx);
+        cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
         Self {
             workspaces,
@@ -349,10 +352,15 @@ impl OperatorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let bounds = Bounds::centered(None, size(px(400.0), px(300.0)), cx);
+        let bounds = Bounds::centered(None, size(px(400.0), px(400.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Settings".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(9.0), px(9.0))),
+                }),
                 ..Default::default()
             },
             |_window, cx| cx.new(|cx| SettingsPanel::new(cx)),
@@ -922,10 +930,12 @@ impl Render for OperatorApp {
         root = root.child(
             div()
                 .flex()
+                .flex_col()
                 .flex_1()
                 .min_w(px(100.0))
                 .h_full()
                 .overflow_hidden()
+                .pt(px(36.0))
                 .child(center),
         );
         if let Some(dp) = diff_panel {

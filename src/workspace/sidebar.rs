@@ -43,7 +43,8 @@ impl WorkspaceSidebar {
             .border_r_1()
             .border_color(colors::border())
             .overflow_hidden()
-            .py_1();
+            .pt(px(36.0))
+            .pb_1();
 
         for (ix, ws) in workspaces.iter().enumerate() {
             let is_active = ix == active_ix;

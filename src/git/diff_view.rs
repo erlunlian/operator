@@ -1093,6 +1093,7 @@ impl Render for GitDiffPanel {
             .min_w(px(200.0))
             .h_full()
             .flex_shrink_0()
+            .pt(px(36.0))
             .bg(colors::surface())
             .border_l_1()
             .border_color(colors::border())

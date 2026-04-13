@@ -33,6 +33,7 @@ impl Render for SettingsPanel {
             .flex()
             .flex_col()
             .size_full()
+            .pt(px(36.0))
             .bg(colors::surface())
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_window))
@@ -57,8 +58,11 @@ impl Render for SettingsPanel {
             // Settings list
             .child(
                 div()
+                    .id("settings-scroll")
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .overflow_y_scroll()
                     .p_4()
                     .gap_6()
                     // Theme selector

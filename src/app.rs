@@ -958,7 +958,8 @@ impl OperatorApp {
 
         // When the sidebar is collapsed, the tab bar is the leftmost element
         // and needs to clear the macOS traffic light buttons (~70px).
-        let tab_bar_left_inset = if self.sidebar_collapsed { px(70.0) } else { px(0.0) };
+        // 70px for traffic lights + 28px for the sidebar toggle button
+        let tab_bar_left_inset = if self.sidebar_collapsed { px(98.0) } else { px(0.0) };
 
         if let Some(layout_entity) = &ws.layout {
             let layout = layout_entity.read(cx);

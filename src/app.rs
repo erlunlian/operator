@@ -956,9 +956,13 @@ impl OperatorApp {
         let ws_entity = self.active_workspace().clone();
         let ws = ws_entity.read(cx);
 
+        // When the sidebar is collapsed, the tab bar is the leftmost element
+        // and needs to clear the macOS traffic light buttons (~70px).
+        let tab_bar_left_inset = if self.sidebar_collapsed { px(70.0) } else { px(0.0) };
+
         if let Some(layout_entity) = &ws.layout {
             let layout = layout_entity.read(cx);
-            layout.render_tree(layout_entity, center_focused, cx)
+            layout.render_tree(layout_entity, center_focused, tab_bar_left_inset, cx)
         } else {
             // Welcome screen — no directory selected yet
             self.render_welcome_screen(cx)
@@ -1170,9 +1174,11 @@ impl Render for OperatorApp {
         ));
 
         // Refresh claude status from terminal output for each workspace
-        for ws_entity in &self.workspaces {
+        let active_ws_ix = self.active_workspace_ix;
+        for (i, ws_entity) in self.workspaces.iter().enumerate() {
+            let is_active = i == active_ws_ix;
             ws_entity.update(cx, |ws, cx| {
-                ws.refresh_claude_status(cx);
+                ws.refresh_claude_status(is_active, cx);
             });
         }
 
@@ -1186,7 +1192,7 @@ impl Render for OperatorApp {
                     name: ws.name.clone(),
                     directory: ws.short_dir(),
                     git_branch: ws.git_branch.clone(),
-                    claude_status: ws.claude_status.clone(),
+                    pane_statuses: ws.pane_statuses.clone(),
                 }
             })
             .collect();

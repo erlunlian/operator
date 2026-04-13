@@ -141,7 +141,7 @@ impl Render for EditorView {
         }
 
         // Right panel: PaneGroup with file editor tabs
-        let pane_tree = pane_group_entity.read(cx).render_tree(&pane_group_entity, true, cx);
+        let pane_tree = pane_group_entity.read(cx).render_tree(&pane_group_entity, true, px(0.0), cx);
         let right_panel = div()
             .flex()
             .flex_col()

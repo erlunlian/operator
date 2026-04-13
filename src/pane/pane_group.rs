@@ -212,25 +212,45 @@ impl SplitNode {
         }
     }
 
-    pub fn get_claude_status(&self, cx: &App) -> crate::workspace::workspace::ClaudeStatus {
+    /// Collect one status per pane (leaf), checking ALL tabs.
+    /// Only non-idle statuses are returned. Priority within a pane: Working > WaitingForInput.
+    /// If `mark_read_group_id` matches a leaf's group ID, the active tab in that group
+    /// is marked as read before its status is checked (the user is looking at it).
+    pub fn collect_pane_statuses(
+        &self,
+        mark_read_group_id: Option<usize>,
+        cx: &App,
+    ) -> Vec<crate::workspace::workspace::ClaudeStatus> {
+        use crate::workspace::workspace::ClaudeStatus;
+        let mut result = Vec::new();
         match self {
             SplitNode::Leaf(group) => {
-                if let Some(tab) = group.tabs.get(group.active_tab_ix) {
-                    tab.read(cx).get_claude_status(cx)
-                } else {
-                    crate::workspace::workspace::ClaudeStatus::Idle
+                let is_focused = mark_read_group_id == Some(group.id);
+
+                let mut best = ClaudeStatus::Idle;
+                for (i, tab) in group.tabs.iter().enumerate() {
+                    // Mark the active tab in the focused pane as read before checking status
+                    if is_focused && i == group.active_tab_ix {
+                        tab.read(cx).mark_claude_as_read(cx);
+                    }
+                    let status = tab.read(cx).get_claude_status(cx);
+                    if status == ClaudeStatus::Working {
+                        best = ClaudeStatus::Working;
+                    } else if status == ClaudeStatus::WaitingForInput && best != ClaudeStatus::Working {
+                        best = ClaudeStatus::WaitingForInput;
+                    }
+                }
+                if best != ClaudeStatus::Idle {
+                    result.push(best);
                 }
             }
             SplitNode::Split { children, .. } => {
                 for child in children {
-                    let status = child.get_claude_status(cx);
-                    if status != crate::workspace::workspace::ClaudeStatus::Idle {
-                        return status;
-                    }
+                    result.extend(child.collect_pane_statuses(mark_read_group_id, cx));
                 }
-                crate::workspace::workspace::ClaudeStatus::Idle
             }
         }
+        result
     }
 
 }
@@ -341,8 +361,9 @@ impl PaneGroup {
         }
     }
 
-    pub fn get_claude_status(&self, cx: &App) -> crate::workspace::workspace::ClaudeStatus {
-        self.root.get_claude_status(cx)
+    pub fn collect_pane_statuses(&self, is_active_workspace: bool, cx: &App) -> Vec<crate::workspace::workspace::ClaudeStatus> {
+        let mark_read = if is_active_workspace { self.focused_group_id } else { None };
+        self.root.collect_pane_statuses(mark_read, cx)
     }
 
     /// Open a file in the focused group (or first group). If the file is already
@@ -392,10 +413,10 @@ impl PaneGroup {
         paths
     }
 
-    pub fn render_tree(&self, pane_group_entity: &Entity<PaneGroup>, center_focused: bool, cx: &App) -> AnyElement {
+    pub fn render_tree(&self, pane_group_entity: &Entity<PaneGroup>, center_focused: bool, tab_bar_left_inset: Pixels, cx: &App) -> AnyElement {
         let focused_id = if center_focused { self.focused_group_id } else { None };
         let has_splits = !matches!(&self.root, SplitNode::Leaf(_));
-        Self::render_node(&self.root, pane_group_entity, self.drop_target, focused_id, has_splits, self.mode, cx)
+        Self::render_node(&self.root, pane_group_entity, self.drop_target, focused_id, has_splits, self.mode, tab_bar_left_inset, cx)
     }
 
     fn render_node(
@@ -405,11 +426,12 @@ impl PaneGroup {
         focused_group_id: Option<usize>,
         has_splits: bool,
         mode: PaneGroupMode,
+        tab_bar_left_inset: Pixels,
         cx: &App,
     ) -> AnyElement {
         match node {
             SplitNode::Leaf(group) => {
-                Self::render_leaf(group, pane_group_entity, drop_target, focused_group_id, has_splits, mode, cx)
+                Self::render_leaf(group, pane_group_entity, drop_target, focused_group_id, has_splits, mode, tab_bar_left_inset, cx)
             }
             SplitNode::Split {
                 id,
@@ -417,7 +439,7 @@ impl PaneGroup {
                 children,
                 ratios,
             } => {
-                Self::render_split(*id, *axis, children, ratios, pane_group_entity, drop_target, focused_group_id, has_splits, mode, cx)
+                Self::render_split(*id, *axis, children, ratios, pane_group_entity, drop_target, focused_group_id, has_splits, mode, tab_bar_left_inset, cx)
             }
         }
     }
@@ -429,6 +451,7 @@ impl PaneGroup {
         focused_group_id: Option<usize>,
         has_splits: bool,
         mode: PaneGroupMode,
+        tab_bar_left_inset: Pixels,
         cx: &App,
     ) -> AnyElement {
         let group_id = group.id;
@@ -628,7 +651,7 @@ impl PaneGroup {
                     });
                 }
             })
-            .child(tab_bar)
+            .child(tab_bar.pl(tab_bar_left_inset))
             .child(content_area);
 
         // Dim unfocused panes: when center has focus and there are splits,
@@ -651,6 +674,7 @@ impl PaneGroup {
         focused_group_id: Option<usize>,
         has_splits: bool,
         mode: PaneGroupMode,
+        tab_bar_left_inset: Pixels,
         cx: &App,
     ) -> AnyElement {
         let split_axis = axis;
@@ -749,6 +773,9 @@ impl PaneGroup {
                 container = container.child(handle);
             }
 
+            // Only the first child in a horizontal split (leftmost pane) or
+            // vertical split (topmost pane) inherits the traffic-light inset.
+            let child_inset = if i == 0 { tab_bar_left_inset } else { px(0.0) };
             let child_el = div()
                 .flex()
                 .size_full()
@@ -756,7 +783,7 @@ impl PaneGroup {
                 .flex_basis(relative(*ratio))
                 .flex_grow()
                 .flex_shrink()
-                .child(Self::render_node(child, pane_group_entity, drop_target, focused_group_id, has_splits, mode, cx));
+                .child(Self::render_node(child, pane_group_entity, drop_target, focused_group_id, has_splits, mode, child_inset, cx));
 
             container = container.child(child_el);
         }

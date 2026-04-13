@@ -571,6 +571,7 @@ impl Render for TerminalView {
 
                 if keystroke.modifiers.shift {
                     if keystroke.key.as_str() == "tab" { term.write_to_pty(b"\x1b[Z"); return; }
+                    if keystroke.key.as_str() == "enter" { term.write_to_pty(b"\x0a"); return; }
                 }
 
                 match keystroke.key.as_str() {

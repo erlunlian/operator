@@ -598,6 +598,9 @@ impl PaneGroup {
             .flex_1()
             .size_full()
             .overflow_hidden()
+            .border_color(colors::border())
+            .border_r_1()
+            .border_b_1()
             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                 pg_focus.update(cx, |pg, cx| {
                     if pg.focused_group_id != Some(group_id) {
@@ -718,6 +721,8 @@ impl PaneGroup {
                     axis: split_axis,
                 };
 
+                // Invisible hit area for dragging — visual border comes from
+                // the leaf's border_r/border_b (same pattern as sidebar resize).
                 let handle = match axis {
                     SplitAxis::Horizontal => div()
                         .id(ElementId::Name(handle_id.into()))
@@ -726,30 +731,16 @@ impl PaneGroup {
                         .h_full()
                         .flex_shrink_0()
                         .cursor_col_resize()
-                        .items_center()
-                        .child(
-                            div()
-                                .w(px(1.0))
-                                .h_full()
-                                .bg(colors::border())
-                        )
                         .on_drag(drag_payload, |_, _, _, cx| {
                             cx.new(|_| ResizeGhost)
                         }),
                     SplitAxis::Vertical => div()
                         .id(ElementId::Name(handle_id.into()))
                         .w_full()
-                        .h(px(6.0))
-                        .my(px(-3.0))
+                        .h(px(12.0))
+                        .my(px(-6.0))
                         .flex_shrink_0()
                         .cursor_row_resize()
-                        .items_center()
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(1.0))
-                                .bg(colors::border())
-                        )
                         .on_drag(drag_payload, |_, _, _, cx| {
                             cx.new(|_| ResizeGhost)
                         }),

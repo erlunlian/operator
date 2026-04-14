@@ -63,6 +63,15 @@ pub struct PrInfo {
     pub base_ref_name: String,
     pub head_ref_name: String,
     pub url: String,
+    /// Lines added as reported by GitHub (authoritative).
+    #[serde(default)]
+    pub additions: u64,
+    /// Lines deleted as reported by GitHub (authoritative).
+    #[serde(default)]
+    pub deletions: u64,
+    /// Number of files changed as reported by GitHub.
+    #[serde(default)]
+    pub changed_files: u64,
 }
 
 /// Detect whether a PR is open for the current branch.
@@ -72,7 +81,7 @@ pub fn detect_pr(repo_dir: &Path) -> Option<PrInfo> {
             "pr",
             "view",
             "--json",
-            "number,title,state,baseRefName,headRefName,url",
+            "number,title,state,baseRefName,headRefName,url,additions,deletions,changedFiles",
         ])
         .current_dir(repo_dir)
         .output()

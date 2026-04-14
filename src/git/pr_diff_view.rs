@@ -280,21 +280,15 @@ impl PrDiffPanel {
 
     /// Refresh the branch diff and reload PR data asynchronously.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        // Synchronous: recompute branch diff
+        // Synchronous: update branch name immediately
         if let Some(repo) = &self.repo {
             self.branch = repo.current_branch();
-            self.diff_files = repo.branch_diff(&self.base_ref);
-            self.expanded_context.clear();
-            self.rendered_file_limit = FILE_RENDER_BATCH;
-            self.flat_cache_dirty = true;
         }
 
-        // Async: check gh and fetch PR data
         let Some(work_dir) = self.work_dir.clone() else {
             return;
         };
 
-        // If base_ref changed via PR info, recompute diff on the new base
         let current_base = self.base_ref.clone();
 
         self.loading = true;
@@ -311,6 +305,16 @@ impl PrDiffPanel {
                             .as_ref()
                             .map(|p| github::fetch_pr_comments(&work_dir, p.number))
                             .unwrap_or_default();
+                        // Fetch the base ref so our local merge-base is up to date.
+                        // This ensures the diff matches what GitHub shows.
+                        let fetch_ref = pr
+                            .as_ref()
+                            .map(|p| p.base_ref_name.as_str())
+                            .unwrap_or(&current_base);
+                        let _ = std::process::Command::new("git")
+                            .args(["fetch", "origin", fetch_ref])
+                            .current_dir(&work_dir)
+                            .output();
                         (pr, comments)
                     } else {
                         (None, Vec::new())
@@ -324,22 +328,25 @@ impl PrDiffPanel {
                     let (gh_status, pr_info, comments) = result;
                     panel.gh_status = gh_status;
 
-                    // If PR detected and base differs, recompute diff
+                    // Update base ref from PR info if needed
                     if let Some(ref pr) = pr_info {
-                        if pr.base_ref_name != current_base {
+                        if pr.base_ref_name != panel.base_ref {
                             panel.base_ref = pr.base_ref_name.clone();
-                            if let Some(repo) = &panel.repo {
-                                panel.diff_files = repo.branch_diff(&panel.base_ref);
-                                panel.flat_cache_dirty = true;
-                            }
                         }
                     }
+
+                    // Recompute diff with (now up-to-date) base ref
+                    if let Some(repo) = &panel.repo {
+                        panel.diff_files = repo.branch_diff(&panel.base_ref);
+                    }
+                    panel.expanded_context.clear();
+                    panel.rendered_file_limit = FILE_RENDER_BATCH;
+                    panel.flat_cache_dirty = true;
 
                     panel.pr_info = pr_info;
                     panel.pr_comments = comments;
                     panel.rebuild_comment_index();
                     panel.loading = false;
-                    panel.flat_cache_dirty = true;
                     cx.notify();
                 });
             });
@@ -1825,9 +1832,20 @@ impl Render for PrDiffPanel {
             self.rebuild_flat_cache();
         }
 
-        let total_files = self.diff_files.len();
-        let total_adds = self.total_additions();
-        let total_dels = self.total_deletions();
+        // Use GitHub's authoritative stats when available, fall back to local computation
+        let (total_files, total_adds, total_dels) = if let Some(ref pr) = self.pr_info {
+            (
+                pr.changed_files as usize,
+                pr.additions as usize,
+                pr.deletions as usize,
+            )
+        } else {
+            (
+                self.diff_files.len(),
+                self.total_additions(),
+                self.total_deletions(),
+            )
+        };
 
         let entity_move = cx.entity().clone();
         let entity_up = cx.entity().clone();
@@ -1907,10 +1925,7 @@ impl Render for PrDiffPanel {
             } else if total_files == 0 && !self.loading {
                 format!("{} \u{2192} {} \u{00B7} No changes", self.branch, self.base_ref)
             } else {
-                format!(
-                    "{} \u{2192} {} \u{00B7} {} files",
-                    self.branch, self.base_ref, total_files
-                )
+                format!("{} \u{2192} {}", self.branch, self.base_ref)
             };
             div()
                 .text_sm()
@@ -1936,7 +1951,7 @@ impl Render for PrDiffPanel {
             .border_color(colors::border())
             .child(header_el);
 
-        if total_adds > 0 || total_dels > 0 {
+        if total_adds > 0 || total_dels > 0 || total_files > 0 {
             header = header.child(
                 div()
                     .ml_2()
@@ -1944,6 +1959,15 @@ impl Render for PrDiffPanel {
                     .flex_row()
                     .gap_1()
                     .flex_shrink_0()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .child(format!(
+                                "{total_files} file{}",
+                                if total_files == 1 { "" } else { "s" }
+                            )),
+                    )
                     .when(total_adds > 0, |d: Div| {
                         d.child(
                             div()

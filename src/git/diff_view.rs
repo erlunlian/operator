@@ -1699,7 +1699,7 @@ impl Render for GitDiffPanel {
                         .child(if total_file_count == 0 {
                             "No Changes".to_string()
                         } else {
-                            format!("{section_label} \u{00B7} {active_count} files")
+                            section_label.to_string()
                         }),
                 )
                 .when(total_adds > 0 || total_dels > 0, |d: Div| {
@@ -1709,6 +1709,15 @@ impl Render for GitDiffPanel {
                             .flex()
                             .flex_row()
                             .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors::text_muted())
+                                    .child(format!(
+                                        "{active_count} file{}",
+                                        if active_count == 1 { "" } else { "s" }
+                                    )),
+                            )
                             .when(total_adds > 0, |d: Div| {
                                 d.child(
                                     div()

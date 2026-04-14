@@ -99,8 +99,18 @@ fn main() {
             KeyBinding::new("cmd-k", ToggleCommandCenter, None),
             KeyBinding::new("cmd-w", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
             KeyBinding::new("escape", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
+            KeyBinding::new("cmd-o", OpenDirectory, None),
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("ctrl-shift-d", ToggleDebugPanel, None),
+            KeyBinding::new("cmd-1", ActivateWorkspace1, None),
+            KeyBinding::new("cmd-2", ActivateWorkspace2, None),
+            KeyBinding::new("cmd-3", ActivateWorkspace3, None),
+            KeyBinding::new("cmd-4", ActivateWorkspace4, None),
+            KeyBinding::new("cmd-5", ActivateWorkspace5, None),
+            KeyBinding::new("cmd-6", ActivateWorkspace6, None),
+            KeyBinding::new("cmd-7", ActivateWorkspace7, None),
+            KeyBinding::new("cmd-8", ActivateWorkspace8, None),
+            KeyBinding::new("cmd-9", ActivateWorkspace9, None),
         ]);
 
 

@@ -1033,6 +1033,14 @@ impl OperatorApp {
         cx.notify();
     }
 
+    /// Switch to workspace N (0-indexed) via Cmd+1..9 shortcut.
+    fn activate_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.workspaces.len() {
+            self.switch_to_workspace(ix, cx);
+            self.focus_handle.focus(window);
+        }
+    }
+
     /// Point the right panel at a new working directory and restart the file watcher.
     fn update_right_panel_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         // Drop the old watcher task so it stops watching the previous .git dir
@@ -1076,6 +1084,54 @@ impl OperatorApp {
                     let _ = cx.update(|cx| {
                         let _ = this.update(cx, |app, cx| {
                             app.open_directory(dir, cx);
+                        });
+                    });
+                }
+            }
+            let _ = cx.update(|cx| {
+                let _ = this.update(cx, |app, cx| {
+                    app.picker_open = false;
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Cmd+O: open directory picker, always create a new workspace with the chosen directory.
+    fn open_directory_in_new_workspace(&mut self, _: &OpenDirectory, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker_open {
+            return;
+        }
+        self.picker_open = true;
+
+        let paths_rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths_rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let _ = cx.update(|cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.cache_editor_files(cx);
+                            app.recent_projects.add(dir.clone());
+
+                            let dir_name = dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Workspace".to_string());
+                            let new_ws = cx.new(|cx| Workspace::new(&dir_name, dir.clone(), cx));
+                            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
+                            app.workspaces.push(new_ws);
+                            app.active_workspace_ix = app.workspaces.len() - 1;
+                            app.update_right_panel_dir(dir, cx);
+                            app.command_center.update(cx, |cc, _cx| {
+                                cc.invalidate_file_index();
+                            });
+                            cx.notify();
                         });
                     });
                 }
@@ -1481,6 +1537,16 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::search_workspace))
             .on_action(cx.listener(Self::toggle_debug_panel))
             .on_action(cx.listener(Self::request_quit))
+            .on_action(cx.listener(Self::open_directory_in_new_workspace))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace1, window, cx| this.activate_workspace(0, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace2, window, cx| this.activate_workspace(1, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace3, window, cx| this.activate_workspace(2, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace4, window, cx| this.activate_workspace(3, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace5, window, cx| this.activate_workspace(4, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace6, window, cx| this.activate_workspace(5, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace7, window, cx| this.activate_workspace(6, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace8, window, cx| this.activate_workspace(7, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace9, window, cx| this.activate_workspace(8, window, cx)))
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 app_resize_move.update(cx, |app, cx| {
                     let x = f32::from(event.position.x);

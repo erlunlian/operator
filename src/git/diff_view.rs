@@ -903,7 +903,7 @@ impl GitDiffPanel {
             .items_center()
             .w_full()
             .min_h(px(32.0))
-            .when(file_idx > 0, |d: Stateful<Div>| d.mt(px(8.0)))
+            .when(file_idx > 0, |d: Stateful<Div>| d.mt(px(12.0)))
             .px_3()
             .py(px(4.0))
             .bg(file_header_bg())
@@ -1793,7 +1793,7 @@ impl Render for GitDiffPanel {
         )
         .flex_1()
         .min_w(px(100.0))
-        .p_3();
+        .p(px(16.0));
 
         // Auto-load more files if there are un-rendered files
         let render_limit = self.rendered_file_limit.min(self.active_files().len());

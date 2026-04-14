@@ -811,6 +811,7 @@ impl PrDiffPanel {
             .items_center()
             .w_full()
             .min_h(px(32.0))
+            .when(file_idx > 0, |d: Stateful<Div>| d.mt(px(8.0)))
             .px_3()
             .py(px(4.0))
             .bg(file_header_bg())

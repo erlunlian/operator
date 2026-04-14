@@ -175,6 +175,9 @@ impl Render for TerminalView {
         let last_bounds = self.last_bounds.clone();
         let size_changed = self.size_changed.clone();
 
+        let sel_start = self.selection_start;
+        let sel_end = self.selection_end;
+
         let grid_canvas = canvas(
             // Prepaint: resize detection
             {
@@ -204,6 +207,13 @@ impl Render for TerminalView {
             {
                 let term = term.clone();
                 move |bounds: Bounds<Pixels>, _prepaint: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+                    // Selection range (normalized so lo <= hi)
+                    let selection = match (sel_start, sel_end) {
+                        (Some(s), Some(e)) if s != e => Some((s.min(e), s.max(e))),
+                        _ => None,
+                    };
+                    let sel_bg = colors::accent();
+                    let sel_fg = colors::bg();
                     let term_lock = term.lock();
                     let content = term_lock.renderable_content();
                     let display_offset = content.display_offset;
@@ -278,8 +288,18 @@ impl Render for TerminalView {
                                 && *screen_row == cursor_row
                                 && rc.col == cursor.point.column.0;
 
-                            let fg = if is_cursor { colors::surface() } else { rc.fg };
-                            let cell_bg = if is_cursor { colors::accent() } else { rc.bg };
+                            let is_selected = selection.map_or(false, |(lo, hi)| {
+                                let row = *screen_row;
+                                let col = rc.col;
+                                if row < lo.line || row > hi.line { return false; }
+                                if row == lo.line && row == hi.line { return col >= lo.col && col < hi.col; }
+                                if row == lo.line { return col >= lo.col; }
+                                if row == hi.line { return col < hi.col; }
+                                true
+                            });
+
+                            let fg = if is_cursor { colors::surface() } else if is_selected { sel_fg } else { rc.fg };
+                            let cell_bg = if is_cursor { colors::accent() } else if is_selected { sel_bg } else { rc.bg };
 
                             if cell_bg != bg_color {
                                 match &mut current_bg {

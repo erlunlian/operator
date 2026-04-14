@@ -104,7 +104,7 @@ pub struct PrDiffPanel {
     resizing_tree: bool,
     tree_drag_start_x: f32,
     tree_drag_start_width: f32,
-    scroll_handle: ScrollHandle,
+    list_state: ListState,
     scroll_to_file: Option<usize>,
     copied_file_key: Option<usize>,
     _copied_timer: Option<Task<()>>,
@@ -120,8 +120,18 @@ pub struct PrDiffPanel {
     copy_anchor_line: Option<usize>,
     /// Global line index where selection currently ends.
     copy_end_line: Option<usize>,
-    /// Rebuilt each render: global line index → text content for copy.
+    /// Global line index → text content for copy (rebuilt with flat cache).
     copy_line_contents: Vec<String>,
+
+    // Virtual scroll cache
+    /// Pre-flattened line segments per file (indexed by file_idx).
+    cached_file_segments: Vec<Vec<LineSegment>>,
+    /// Flat row descriptors for the uniform_list.
+    flat_rows: Vec<FlatRow>,
+    /// file_idx → index of its FileHeader row in flat_rows.
+    flat_file_starts: Vec<usize>,
+    /// Whether the flat cache needs rebuilding before next render.
+    flat_cache_dirty: bool,
 }
 
 impl PrDiffPanel {
@@ -150,7 +160,7 @@ impl PrDiffPanel {
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             scroll_to_file: None,
             copied_file_key: None,
             _copied_timer: None,
@@ -160,6 +170,10 @@ impl PrDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            cached_file_segments: Vec::new(),
+            flat_rows: Vec::new(),
+            flat_file_starts: Vec::new(),
+            flat_cache_dirty: true,
         }
     }
 
@@ -203,7 +217,7 @@ impl PrDiffPanel {
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             scroll_to_file: None,
             copied_file_key: None,
             _copied_timer: None,
@@ -213,6 +227,10 @@ impl PrDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            cached_file_segments: Vec::new(),
+            flat_rows: Vec::new(),
+            flat_file_starts: Vec::new(),
+            flat_cache_dirty: true,
         }
     }
 
@@ -268,6 +286,7 @@ impl PrDiffPanel {
             self.diff_files = repo.branch_diff(&self.base_ref);
             self.expanded_context.clear();
             self.rendered_file_limit = FILE_RENDER_BATCH;
+            self.flat_cache_dirty = true;
         }
 
         // Async: check gh and fetch PR data
@@ -311,6 +330,7 @@ impl PrDiffPanel {
                             panel.base_ref = pr.base_ref_name.clone();
                             if let Some(repo) = &panel.repo {
                                 panel.diff_files = repo.branch_diff(&panel.base_ref);
+                                panel.flat_cache_dirty = true;
                             }
                         }
                     }
@@ -319,6 +339,7 @@ impl PrDiffPanel {
                     panel.pr_comments = comments;
                     panel.rebuild_comment_index();
                     panel.loading = false;
+                    panel.flat_cache_dirty = true;
                     cx.notify();
                 });
             });
@@ -556,6 +577,7 @@ impl PrDiffPanel {
                                         panel.rendered_file_limit = idx + 1;
                                     }
                                     panel.scroll_to_file = Some(idx);
+                                    panel.flat_cache_dirty = true;
                                     cx.notify();
                                 });
                             })
@@ -613,28 +635,157 @@ impl PrDiffPanel {
         container
     }
 
-    // ── File diff section ──
+    // ── Virtual scroll cache ──
 
-    fn render_file_diff(
-        &self,
-        file: &DiffFile,
-        file_idx: usize,
-        line_counter: &std::cell::Cell<usize>,
-        line_texts: &std::cell::RefCell<Vec<String>>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    /// Rebuild the flat row cache from current state.
+    /// Called at the start of render when `flat_cache_dirty` is true.
+    fn rebuild_flat_cache(&mut self) {
+        // Phase 1: flatten segments for each file
+        let render_limit = self.rendered_file_limit.min(self.diff_files.len());
+        let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(render_limit);
+        for file_idx in 0..render_limit {
+            if self.collapsed_files.contains(&file_idx) || self.diff_files[file_idx].hunks.is_empty()
+            {
+                all_segments.push(Vec::new());
+            } else {
+                let segs = self.flatten_file_lines(&self.diff_files[file_idx], file_idx);
+                all_segments.push(segs);
+            }
+        }
+
+        // Phase 2: build flat rows
+        self.flat_rows.clear();
+        self.flat_file_starts.clear();
+        let mut copy_texts: Vec<String> = Vec::new();
+        let mut global_line_idx = 0usize;
+
+        for file_idx in 0..render_limit {
+            self.flat_file_starts.push(self.flat_rows.len());
+            self.flat_rows.push(FlatRow::FileHeader { file_idx });
+
+            if self.collapsed_files.contains(&file_idx) {
+                continue;
+            }
+
+            if self.diff_files[file_idx].hunks.is_empty() {
+                self.flat_rows.push(FlatRow::EmptyFile { file_idx });
+                continue;
+            }
+
+            let segments = &all_segments[file_idx];
+            let num_segs = segments.len();
+
+            for (seg_idx, seg) in segments.iter().enumerate() {
+                let is_last = seg_idx == num_segs - 1;
+                match seg {
+                    LineSegment::Line(line) => {
+                        copy_texts.push(line.content.trim_end().to_string());
+                        self.flat_rows.push(FlatRow::Line {
+                            file_idx,
+                            seg_idx,
+                            global_line_idx,
+                            is_last_in_file: is_last,
+                        });
+                        global_line_idx += 1;
+                    }
+                    LineSegment::CollapsedContext {
+                        count,
+                        hunk_idx,
+                        direction,
+                    } => {
+                        self.flat_rows.push(FlatRow::CollapsedContext {
+                            file_idx,
+                            seg_idx,
+                            count: *count,
+                            hunk_idx: *hunk_idx,
+                            direction: *direction,
+                            is_last_in_file: is_last,
+                        });
+                    }
+                }
+            }
+        }
+
+        let remaining = self.diff_files.len().saturating_sub(render_limit);
+        if remaining > 0 {
+            self.flat_rows.push(FlatRow::LoadMore { remaining });
+        }
+
+        self.cached_file_segments = all_segments;
+        self.copy_line_contents = copy_texts;
+        self.list_state.reset(self.flat_rows.len());
+        self.flat_cache_dirty = false;
+    }
+
+    /// Render a single flat row. Called from the list callback.
+    fn render_flat_row(&self, row_idx: usize, entity: &Entity<Self>) -> AnyElement {
+        match &self.flat_rows[row_idx] {
+            FlatRow::FileHeader { file_idx } => {
+                self.render_file_header(*file_idx, entity)
+            }
+            FlatRow::EmptyFile { file_idx } => {
+                self.render_empty_file(*file_idx)
+            }
+            FlatRow::Line {
+                file_idx,
+                seg_idx,
+                global_line_idx,
+                is_last_in_file,
+            } => {
+                let seg = &self.cached_file_segments[*file_idx][*seg_idx];
+                if let LineSegment::Line(line) = seg {
+                    self.render_line_row(
+                        line,
+                        *file_idx,
+                        *global_line_idx,
+                        *is_last_in_file,
+                        entity,
+                    )
+                } else {
+                    div().into_any_element()
+                }
+            }
+            FlatRow::CollapsedContext {
+                file_idx,
+                seg_idx: _,
+                count,
+                hunk_idx,
+                direction,
+                is_last_in_file,
+            } => {
+                self.render_collapsed_row(
+                    *file_idx,
+                    *count,
+                    *hunk_idx,
+                    *direction,
+                    *is_last_in_file,
+                    row_idx,
+                    entity,
+                )
+            }
+            FlatRow::LoadMore { remaining } => {
+                div()
+                    .w_full()
+                    .py_2()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .child(format!("{remaining} more files...")),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_file_header(&self, file_idx: usize, entity: &Entity<Self>) -> AnyElement {
+        let file = &self.diff_files[file_idx];
         let adds = file.additions();
         let dels = file.deletions();
         let is_collapsed = self.collapsed_files.contains(&file_idx);
-        let entity_hdr = cx.entity().clone();
         let file_path = file.path.clone();
-
-        let mut container = div()
-            .id(ElementId::Name(format!("pr-fdiff-{file_idx}").into()))
-            .flex()
-            .flex_col()
-            .w_full()
-            .mb_2();
 
         let status_color = match file.status {
             FileStatus::Added => colors::diff_added(),
@@ -643,161 +794,500 @@ impl PrDiffPanel {
             FileStatus::Renamed => colors::accent(),
         };
 
-        // File header
-        container = container.child(
+        let entity_hdr = entity.clone();
+        let just_copied = self.copied_file_key == Some(file_idx);
+        let (icon, icon_color) = if just_copied {
+            ("\u{2713}", colors::diff_added())
+        } else {
+            ("\u{2750}", colors::text_muted())
+        };
+        let path_for_copy = file.path.clone();
+        let entity_copy = entity.clone();
+
+        div()
+            .id(ElementId::Name(format!("pr-fhdr-{file_idx}").into()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .min_h(px(32.0))
+            .px_3()
+            .py(px(4.0))
+            .bg(file_header_bg())
+            .border_1()
+            .border_color(colors::border())
+            .when(is_collapsed, |d: Stateful<Div>| d.rounded_md())
+            .when(!is_collapsed, |d: Stateful<Div>| d.rounded_t_md())
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()))
+            .on_click(move |_, _window, cx| {
+                entity_hdr.update(cx, |panel, cx| {
+                    if panel.collapsed_files.contains(&file_idx) {
+                        panel.collapsed_files.remove(&file_idx);
+                    } else {
+                        panel.collapsed_files.insert(file_idx);
+                    }
+                    panel.flat_cache_dirty = true;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(status_color)
+                    .flex_shrink_0()
+                    .mr_2(),
+            )
+            .child({
+                div()
+                    .id(ElementId::Name(format!("pr-fcopy-{file_idx}").into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap(px(5.0))
+                    .cursor_pointer()
+                    .text_xs()
+                    .border_b_1()
+                    .border_color(gpui::rgba(0x00000000))
+                    .hover(|s| s.border_color(colors::accent()))
+                    .on_click(move |_, _window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            path_for_copy.clone(),
+                        ));
+                        let entity = entity_copy.clone();
+                        entity_copy.update(cx, |panel, cx| {
+                            panel.copied_file_key = Some(file_idx);
+                            cx.notify();
+                        });
+                        cx.defer(move |cx| {
+                            entity.update(cx, |panel, cx| {
+                                panel._copied_timer = Some(cx.spawn(async move |this, cx| {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(1500))
+                                        .await;
+                                    let _ = cx.update(|cx| {
+                                        let _ = this.update(cx, |panel, cx| {
+                                            if panel.copied_file_key == Some(file_idx) {
+                                                panel.copied_file_key = None;
+                                            }
+                                            cx.notify();
+                                        });
+                                    });
+                                }));
+                            });
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors::text())
+                            .child(file_path),
+                    )
+                    .child(div().text_color(icon_color).child(icon))
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .ml_2()
+                    .when(adds > 0, |d: Div| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors::diff_added())
+                                .child(format!("+{adds}")),
+                        )
+                    })
+                    .when(dels > 0, |d: Div| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors::diff_removed())
+                                .child(format!("-{dels}")),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_empty_file(&self, file_idx: usize) -> AnyElement {
+        div()
+            .id(ElementId::Name(format!("pr-fempty-{file_idx}").into()))
+            .w_full()
+            .px_3()
+            .py_3()
+            .bg(colors::surface())
+            .border_1()
+            .border_t_0()
+            .border_color(colors::border())
+            .rounded_b_md()
+            .text_xs()
+            .text_color(colors::text_muted())
+            .child("This file has no content")
+            .into_any_element()
+    }
+
+    fn render_line_row(
+        &self,
+        line: &DiffLine,
+        file_idx: usize,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+        entity: &Entity<Self>,
+    ) -> AnyElement {
+        let file_path = &self.diff_files[file_idx].path;
+        let line_num = match line.kind {
+            DiffLineKind::Removed => line.old_lineno,
+            _ => line.new_lineno.or(line.old_lineno),
+        };
+        let side = match line.kind {
+            DiffLineKind::Removed => CommentSide::Left,
+            _ => CommentSide::Right,
+        };
+
+        let (row_bg, gutter_bg_color, text_col, prefix) = match line.kind {
+            DiffLineKind::Added => (
+                added_line_bg(),
+                added_gutter_bg(),
+                colors::diff_added(),
+                "+",
+            ),
+            DiffLineKind::Removed => (
+                removed_line_bg(),
+                removed_gutter_bg(),
+                colors::diff_removed(),
+                "-",
+            ),
+            DiffLineKind::Context => (
+                gpui::rgba(0x00000000),
+                gutter_bg(),
+                colors::text_muted(),
+                " ",
+            ),
+        };
+
+        let line_num_str = line_num.map(|n| format!("{n}")).unwrap_or_default();
+        let content = line.content.trim_end();
+
+        // Syntax highlighted content
+        let content_el: AnyElement = if let Some(highlights) = line.highlights.as_ref() {
+            if highlights.is_empty() {
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(content.to_string())
+                    .into_any_element()
+            } else {
+                let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
+                    .iter()
+                    .filter(|s| {
+                        s.byte_range.end <= content.len()
+                            && content.is_char_boundary(s.byte_range.start)
+                            && content.is_char_boundary(s.byte_range.end)
+                    })
+                    .map(|s| {
+                        (
+                            s.byte_range.clone(),
+                            HighlightStyle {
+                                color: Some(Hsla::from(s.color)),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
+                let text = SharedString::from(content.to_string());
+                let styled = StyledText::new(text).with_highlights(hl);
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(styled)
+                    .into_any_element()
+            }
+        } else {
             div()
-                .id(ElementId::Name(format!("pr-fhdr-{file_idx}").into()))
+                .flex_1()
+                .min_w(px(0.0))
+                .text_color(text_col)
+                .pl(px(4.0))
+                .child(content.to_string())
+                .into_any_element()
+        };
+
+        // Comment "+" button
+        let can_comment = self.can_comment();
+        let has_line_num = line_num.is_some();
+        let comment_btn: AnyElement = if can_comment && has_line_num {
+            let ln = line_num.unwrap();
+            let entity_down = entity.clone();
+            let entity_up = entity.clone();
+            let entity_move = entity.clone();
+            let path_down = file_path.to_string();
+            let path_up = file_path.to_string();
+
+            let in_drag = self
+                .comment_drag_start
+                .as_ref()
+                .map_or(false, |(p, start, _)| {
+                    if p != file_path {
+                        return false;
+                    }
+                    let end = self.comment_drag_end.unwrap_or(*start);
+                    let lo = (*start).min(end);
+                    let hi = (*start).max(end);
+                    ln >= lo && ln <= hi
+                });
+
+            div()
+                .id(ElementId::Name(
+                    format!("pr-comment-btn-{}-{ln}-{}", file_path, side.api_str()).into(),
+                ))
+                .w(px(18.0))
+                .h_full()
+                .flex_shrink_0()
                 .flex()
-                .flex_row()
                 .items_center()
-                .w_full()
-                .min_h(px(32.0))
-                .px_3()
-                .py(px(4.0))
-                .bg(file_header_bg())
-                .border_1()
-                .border_color(colors::border())
-                .when(is_collapsed, |d: Stateful<Div>| d.rounded_md())
-                .when(!is_collapsed, |d: Stateful<Div>| d.rounded_t_md())
+                .justify_center()
+                .text_size(px(11.0))
+                .text_color(colors::accent())
                 .cursor_pointer()
-                .hover(|s| s.bg(colors::surface_hover()))
-                .on_click(move |_, _window, cx| {
-                    entity_hdr.update(cx, |panel, cx| {
-                        if panel.collapsed_files.contains(&file_idx) {
-                            panel.collapsed_files.remove(&file_idx);
-                        } else {
-                            panel.collapsed_files.insert(file_idx);
-                        }
+                .bg(if in_drag {
+                    rgba(0x89b4fa30)
+                } else {
+                    gutter_bg_color
+                })
+                .opacity(0.0)
+                .when(in_drag, |d: Stateful<Div>| d.opacity(1.0))
+                .group_hover("pr-diff-line", |s| s.opacity(1.0))
+                .hover(|s| s.bg(rgba(0x89b4fa20)))
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    let path = path_down.clone();
+                    entity_down.update(cx, |panel, cx| {
+                        panel.comment_drag_start = Some((path, ln, side));
+                        panel.comment_drag_end = None;
                         cx.notify();
                     });
+                    cx.stop_propagation();
                 })
-                // Status dot
-                .child(
-                    div()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .rounded_full()
-                        .bg(status_color)
-                        .flex_shrink_0()
-                        .mr_2(),
-                )
-                // File path + copy icon
-                .child({
-                    let path_for_copy = file.path.clone();
-                    let just_copied = self.copied_file_key == Some(file_idx);
-                    let entity_copy = cx.entity().clone();
-                    let (icon, icon_color) = if just_copied {
-                        ("\u{2713}", colors::diff_added())
-                    } else {
-                        ("\u{2750}", colors::text_muted())
-                    };
-                    div()
-                        .id(ElementId::Name(format!("pr-fcopy-{file_idx}").into()))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .flex_shrink_0()
-                        .gap(px(5.0))
-                        .cursor_pointer()
-                        .text_xs()
-                        .border_b_1()
-                        .border_color(gpui::rgba(0x00000000))
-                        .hover(|s| s.border_color(colors::accent()))
-                        .on_click(move |_, _window, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                path_for_copy.clone(),
-                            ));
-                            let entity = entity_copy.clone();
-                            entity_copy.update(cx, |panel, cx| {
-                                panel.copied_file_key = Some(file_idx);
-                                cx.notify();
-                            });
-                            cx.defer(move |cx| {
-                                entity.update(cx, |panel, cx| {
-                                    panel._copied_timer = Some(cx.spawn(async move |this, cx| {
-                                        cx.background_executor()
-                                            .timer(std::time::Duration::from_millis(1500))
-                                            .await;
-                                        let _ = cx.update(|cx| {
-                                            let _ = this.update(cx, |panel, cx| {
-                                                if panel.copied_file_key == Some(file_idx) {
-                                                    panel.copied_file_key = None;
-                                                }
-                                                cx.notify();
-                                            });
-                                        });
-                                    }));
-                                });
-                            });
-                            cx.stop_propagation();
-                        })
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors::text())
-                                .child(file_path),
-                        )
-                        .child(div().text_color(icon_color).child(icon))
+                .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
+                    let path = path_up.clone();
+                    entity_up.update(cx, |panel, cx| {
+                        if let Some((ref drag_path, start_ln, drag_side)) =
+                            panel.comment_drag_start.take()
+                        {
+                            if drag_path == &path {
+                                let start = start_ln.min(ln);
+                                let end = start_ln.max(ln);
+                                panel.comment_drag_end = None;
+                                panel.start_comment(path, start, end, drag_side, cx);
+                            }
+                        }
+                    });
+                    cx.stop_propagation();
                 })
-                .child(div().flex_1())
-                // Stats
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_1()
-                        .flex_shrink_0()
-                        .ml_2()
-                        .when(adds > 0, |d: Div| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors::diff_added())
-                                    .child(format!("+{adds}")),
-                            )
-                        })
-                        .when(dels > 0, |d: Div| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors::diff_removed())
-                                    .child(format!("-{dels}")),
-                            )
-                        }),
-                ),
-        );
+                .on_mouse_move(move |_, _window, cx| {
+                    entity_move.update(cx, |panel, cx| {
+                        if panel.comment_drag_start.is_some()
+                            && panel.comment_drag_end != Some(ln)
+                        {
+                            panel.comment_drag_end = Some(ln);
+                            cx.notify();
+                        }
+                    });
+                })
+                .child("+")
+                .into_any_element()
+        } else {
+            div()
+                .w(px(18.0))
+                .flex_shrink_0()
+                .bg(gutter_bg_color)
+                .into_any_element()
+        };
 
-        // Diff body
-        if !is_collapsed {
-            if file.hunks.is_empty() {
-                container = container.child(
-                    div()
-                        .w_full()
-                        .px_3()
-                        .py_3()
-                        .bg(colors::surface())
-                        .border_1()
-                        .border_t_0()
-                        .border_color(colors::border())
-                        .rounded_b_md()
-                        .text_xs()
-                        .text_color(colors::text_muted())
-                        .child("This file has no content"),
-                );
-            } else {
-                let all_lines = self.flatten_file_lines(file, file_idx);
-                container = container.child(self.render_line_blocks(
-                    &all_lines,
-                    file_idx,
-                    &file.path,
-                    line_counter,
-                    line_texts,
-                    cx,
-                ));
+        // Drag highlight
+        let in_drag = self
+            .comment_drag_start
+            .as_ref()
+            .map_or(false, |(p, start, _)| {
+                if p != file_path {
+                    return false;
+                }
+                if let Some(ln) = line_num {
+                    let end = self.comment_drag_end.unwrap_or(*start);
+                    let lo = (*start).min(end);
+                    let hi = (*start).max(end);
+                    ln >= lo && ln <= hi
+                } else {
+                    false
+                }
+            });
+        let drag_highlight = if in_drag { rgba(0x89b4fa15) } else { row_bg };
+
+        // Selection highlight
+        let line_selected = self.is_line_selected(global_line_idx);
+        let final_bg = if line_selected {
+            rgba(0x89b4fa30)
+        } else {
+            drag_highlight
+        };
+
+        let entity_sel_down = entity.clone();
+        let entity_sel_move = entity.clone();
+        let gli = global_line_idx;
+
+        let line_row = div()
+            .group("pr-diff-line")
+            .flex()
+            .flex_row()
+            .w_full()
+            .min_h(px(20.0))
+            .bg(final_bg)
+            .font_family("Menlo")
+            .text_xs()
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                entity_sel_down.update(cx, |panel, cx| {
+                    panel.copy_anchor_line = Some(gli);
+                    panel.copy_end_line = Some(gli);
+                    panel.copy_selecting = true;
+                    cx.notify();
+                });
+            })
+            .on_mouse_move(move |_, _window, cx| {
+                entity_sel_move.update(cx, |panel, cx| {
+                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
+                        panel.copy_end_line = Some(gli);
+                        cx.notify();
+                    }
+                });
+            })
+            .child(
+                div()
+                    .w(px(44.0))
+                    .flex_shrink_0()
+                    .text_right()
+                    .pr(px(4.0))
+                    .pl(px(4.0))
+                    .bg(gutter_bg_color)
+                    .text_color(colors::text_muted())
+                    .child(line_num_str),
+            )
+            .child(comment_btn)
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_shrink_0()
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(prefix.to_string()),
+            )
+            .child(content_el);
+
+        // Check if this line has comments or a comment form
+        let has_comment_form = self.active_comment_line.as_ref().map_or(false, |(active_path, _start, end, active_side)| {
+            active_path == file_path && line_num == Some(*end) && side == *active_side
+        });
+        let has_comments = line_num.and_then(|ln| self.comment_index.get(&(file_path.to_string(), ln))).map_or(false, |v| !v.is_empty());
+
+        if !has_comment_form && !has_comments {
+            // Simple case: just the line, apply borders directly
+            return line_row
+                .border_l_1()
+                .border_r_1()
+                .border_color(colors::border())
+                .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
+                .into_any_element();
+        }
+
+        // Wrap line + comments in a vertical container so they stack properly
+        let mut wrapper = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .border_l_1()
+            .border_r_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
+            .child(line_row);
+
+        // Inline comment form after this line
+        if has_comment_form {
+            wrapper = wrapper.child(self.render_comment_form(entity));
+        }
+
+        // Existing PR comments for this line
+        if let Some(ln) = line_num {
+            if let Some(indices) = self.comment_index.get(&(file_path.to_string(), ln)) {
+                for &idx in indices {
+                    wrapper = wrapper.child(self.render_comment_bubble(idx, entity));
+                }
             }
         }
 
-        container
+        wrapper.into_any_element()
+    }
+
+    fn render_collapsed_row(
+        &self,
+        file_idx: usize,
+        count: usize,
+        hunk_idx: usize,
+        direction: ExpandDirection,
+        is_last_in_file: bool,
+        row_idx: usize,
+        entity: &Entity<Self>,
+    ) -> AnyElement {
+        let entity = entity.clone();
+        let label = format!("{count} unmodified lines");
+        let dir = direction;
+
+        div()
+            .id(ElementId::Name(
+                format!("pr-collapse-{file_idx}-{row_idx}").into(),
+            ))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(22.0))
+            .bg(collapse_bar_bg())
+            .border_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Stateful<Div>| d.rounded_b_md())
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()))
+            .on_click(move |_, _window, cx| {
+                entity.update(cx, |panel, cx| {
+                    let entry = panel
+                        .expanded_context
+                        .entry((file_idx, hunk_idx))
+                        .or_insert((0, 0));
+                    match dir {
+                        ExpandDirection::Top => entry.0 += EXPAND_STEP,
+                        ExpandDirection::Bottom => entry.1 += EXPAND_STEP,
+                    }
+                    panel.flat_cache_dirty = true;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .child(label),
+            )
+            .into_any_element()
     }
 
     /// Flatten a file's hunks into renderable segments.
@@ -978,360 +1468,10 @@ impl PrDiffPanel {
         segments
     }
 
-    fn render_line_blocks(
-        &self,
-        segments: &[LineSegment],
-        file_idx: usize,
-        file_path: &str,
-        line_counter: &std::cell::Cell<usize>,
-        line_texts: &std::cell::RefCell<Vec<String>>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let mut block = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .border_l_1()
-            .border_r_1()
-            .border_b_1()
-            .border_color(colors::border())
-            .rounded_b_md()
-            .overflow_hidden();
 
-        for (seg_idx, seg) in segments.iter().enumerate() {
-            match seg {
-                LineSegment::Line(line) => {
-                    let line_num = match line.kind {
-                        DiffLineKind::Removed => line.old_lineno,
-                        _ => line.new_lineno.or(line.old_lineno),
-                    };
-                    let side = match line.kind {
-                        DiffLineKind::Removed => CommentSide::Left,
-                        _ => CommentSide::Right,
-                    };
-
-                    let gli = line_counter.get();
-                    line_counter.set(gli + 1);
-                    line_texts
-                        .borrow_mut()
-                        .push(line.content.trim_end().to_string());
-
-                    block = block
-                        .child(self.render_diff_line(line, file_path, line_num, side, gli, cx));
-
-                    // Render inline comment form after the last line of the range
-                    if let Some((ref active_path, _start, end, active_side)) =
-                        self.active_comment_line
-                    {
-                        if active_path == file_path && line_num == Some(end) && side == active_side
-                        {
-                            block = block.child(self.render_comment_form(cx));
-                        }
-                    }
-
-                    // Render existing comments for this line
-                    if let Some(line_num) = line_num {
-                        if let Some(indices) =
-                            self.comment_index.get(&(file_path.to_string(), line_num))
-                        {
-                            for &idx in indices {
-                                block = block.child(self.render_comment_bubble(idx, cx));
-                            }
-                        }
-                    }
-                }
-                LineSegment::CollapsedContext {
-                    count,
-                    hunk_idx,
-                    direction,
-                } => {
-                    let entity = cx.entity().clone();
-                    let hunk_idx = *hunk_idx;
-                    let dir = *direction;
-                    let label = format!("{count} unmodified lines");
-
-                    block = block.child(
-                        div()
-                            .id(ElementId::Name(
-                                format!("pr-collapse-{file_idx}-{seg_idx}").into(),
-                            ))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_center()
-                            .w_full()
-                            .h(px(22.0))
-                            .bg(collapse_bar_bg())
-                            .border_t_1()
-                            .border_b_1()
-                            .border_color(colors::border())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(colors::surface_hover()))
-                            .on_click(move |_, _window, cx| {
-                                entity.update(cx, |panel, cx| {
-                                    let entry = panel
-                                        .expanded_context
-                                        .entry((file_idx, hunk_idx))
-                                        .or_insert((0, 0));
-                                    match dir {
-                                        ExpandDirection::Top => entry.0 += EXPAND_STEP,
-                                        ExpandDirection::Bottom => entry.1 += EXPAND_STEP,
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors::text_muted())
-                                    .child(label),
-                            ),
-                    );
-                }
-            }
-        }
-
-        block
-    }
-
-    fn render_diff_line(
-        &self,
-        line: &DiffLine,
-        file_path: &str,
-        line_num: Option<u32>,
-        side: CommentSide,
-        global_line_idx: usize,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let (row_bg, gutter_bg_color, text_col, prefix) = match line.kind {
-            DiffLineKind::Added => (
-                added_line_bg(),
-                added_gutter_bg(),
-                colors::diff_added(),
-                "+",
-            ),
-            DiffLineKind::Removed => (
-                removed_line_bg(),
-                removed_gutter_bg(),
-                colors::diff_removed(),
-                "-",
-            ),
-            DiffLineKind::Context => (
-                gpui::rgba(0x00000000),
-                gutter_bg(),
-                colors::text_muted(),
-                " ",
-            ),
-        };
-
-        let line_num_str = line_num.map(|n| format!("{n}")).unwrap_or_default();
-        let content = line.content.trim_end();
-
-        let content_el: AnyElement = if let Some(highlights) = line.highlights.as_ref() {
-            if highlights.is_empty() {
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_color(text_col)
-                    .pl(px(4.0))
-                    .child(content.to_string())
-                    .into_any_element()
-            } else {
-                let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
-                    .iter()
-                    .filter(|s| {
-                        s.byte_range.end <= content.len()
-                            && content.is_char_boundary(s.byte_range.start)
-                            && content.is_char_boundary(s.byte_range.end)
-                    })
-                    .map(|s| {
-                        (
-                            s.byte_range.clone(),
-                            HighlightStyle {
-                                color: Some(Hsla::from(s.color)),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect();
-                let text = SharedString::from(content.to_string());
-                let styled = StyledText::new(text).with_highlights(hl);
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_color(text_col)
-                    .pl(px(4.0))
-                    .child(styled)
-                    .into_any_element()
-            }
-        } else {
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .text_color(text_col)
-                .pl(px(4.0))
-                .child(content.to_string())
-                .into_any_element()
-        };
-
-        // The "+" comment button on the left gutter — supports drag for multi-line
-        let can_comment = self.can_comment();
-        let has_line_num = line_num.is_some();
-        let comment_btn: AnyElement = if can_comment && has_line_num {
-            let ln = line_num.unwrap();
-            let entity_down = cx.entity().clone();
-            let entity_up = cx.entity().clone();
-            let entity_move = cx.entity().clone();
-            let path_down = file_path.to_string();
-            let path_up = file_path.to_string();
-
-            // Check if this line is within a drag selection
-            let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, _)| {
-                if p != file_path { return false; }
-                let end = self.comment_drag_end.unwrap_or(*start);
-                let lo = (*start).min(end);
-                let hi = (*start).max(end);
-                ln >= lo && ln <= hi
-            });
-
-            div()
-                .id(ElementId::Name(
-                    format!("pr-comment-btn-{}-{ln}-{}", file_path, side.api_str()).into(),
-                ))
-                .w(px(18.0))
-                .h_full()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(11.0))
-                .text_color(colors::accent())
-                .cursor_pointer()
-                .bg(if in_drag { rgba(0x89b4fa30) } else { gutter_bg_color })
-                .opacity(0.0)
-                .when(in_drag, |d: Stateful<Div>| d.opacity(1.0))
-                .group_hover("pr-diff-line", |s| s.opacity(1.0))
-                .hover(|s| s.bg(rgba(0x89b4fa20)))
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                    let path = path_down.clone();
-                    entity_down.update(cx, |panel, cx| {
-                        panel.comment_drag_start = Some((path, ln, side));
-                        panel.comment_drag_end = None;
-                        cx.notify();
-                    });
-                    cx.stop_propagation();
-                })
-                .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
-                    let path = path_up.clone();
-                    entity_up.update(cx, |panel, cx| {
-                        if let Some((ref drag_path, start_ln, drag_side)) = panel.comment_drag_start.take() {
-                            if drag_path == &path {
-                                let start = start_ln.min(ln);
-                                let end = start_ln.max(ln);
-                                panel.comment_drag_end = None;
-                                panel.start_comment(path, start, end, drag_side, cx);
-                            }
-                        }
-                    });
-                    cx.stop_propagation();
-                })
-                .on_mouse_move(move |_, _window, cx| {
-                    entity_move.update(cx, |panel, cx| {
-                        if panel.comment_drag_start.is_some() {
-                            if panel.comment_drag_end != Some(ln) {
-                                panel.comment_drag_end = Some(ln);
-                                cx.notify();
-                            }
-                        }
-                    });
-                })
-                .child("+")
-                .into_any_element()
-        } else {
-            div().w(px(18.0)).flex_shrink_0().bg(gutter_bg_color).into_any_element()
-        };
-
-        // Check if this line is within an active drag selection (for row highlight)
-        let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, _)| {
-            if p != file_path { return false; }
-            if let Some(ln) = line_num {
-                let end = self.comment_drag_end.unwrap_or(*start);
-                let lo = (*start).min(end);
-                let hi = (*start).max(end);
-                ln >= lo && ln <= hi
-            } else {
-                false
-            }
-        });
-
-        let drag_highlight = if in_drag { rgba(0x89b4fa15) } else { row_bg };
-
-        // Text selection highlight
-        let line_selected = self.is_line_selected(global_line_idx);
-        let final_bg = if line_selected {
-            rgba(0x89b4fa30)
-        } else {
-            drag_highlight
-        };
-
-        // Mouse handlers for line selection
-        let entity_sel_down = cx.entity().clone();
-        let entity_sel_move = cx.entity().clone();
-        let gli = global_line_idx;
-
-        div()
-            .group("pr-diff-line")
-            .flex()
-            .flex_row()
-            .w_full()
-            .min_h(px(20.0))
-            .bg(final_bg)
-            .font_family("Menlo")
-            .text_xs()
-            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                entity_sel_down.update(cx, |panel, cx| {
-                    panel.copy_anchor_line = Some(gli);
-                    panel.copy_end_line = Some(gli);
-                    panel.copy_selecting = true;
-                    cx.notify();
-                });
-            })
-            .on_mouse_move(move |_, _window, cx| {
-                entity_sel_move.update(cx, |panel, cx| {
-                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
-                        panel.copy_end_line = Some(gli);
-                        cx.notify();
-                    }
-                });
-            })
-            // Line number on the far left
-            .child(
-                div()
-                    .w(px(44.0))
-                    .flex_shrink_0()
-                    .text_right()
-                    .pr(px(4.0))
-                    .pl(px(4.0))
-                    .bg(gutter_bg_color)
-                    .text_color(colors::text_muted())
-                    .child(line_num_str),
-            )
-            // Comment "+" button next to line number
-            .child(comment_btn)
-            .child(
-                div()
-                    .w(px(16.0))
-                    .flex_shrink_0()
-                    .text_color(text_col)
-                    .pl(px(4.0))
-                    .child(prefix.to_string()),
-            )
-            .child(content_el)
-    }
-
-    fn render_comment_form(&self, cx: &mut Context<Self>) -> Div {
-        let entity_cancel = cx.entity().clone();
-        let entity_submit = cx.entity().clone();
+    fn render_comment_form(&self, entity: &Entity<Self>) -> Div {
+        let entity_cancel = entity.clone();
+        let entity_submit = entity.clone();
 
         let mut form = div()
             .w_full()
@@ -1420,7 +1560,7 @@ impl PrDiffPanel {
         form
     }
 
-    fn render_comment_bubble(&self, comment_idx: usize, cx: &mut Context<Self>) -> Div {
+    fn render_comment_bubble(&self, comment_idx: usize, entity: &Entity<Self>) -> Div {
         let comment = &self.pr_comments[comment_idx];
         let author = &comment.user.login;
         let body = &comment.body;
@@ -1460,7 +1600,7 @@ impl PrDiffPanel {
         }
 
         // Reply button
-        let entity = cx.entity().clone();
+        let entity = entity.clone();
         let path = comment.path.clone();
         let line = comment.line;
         bubble = bubble.child(
@@ -1562,6 +1702,28 @@ enum LineSegment {
     },
 }
 
+/// Row descriptor for the virtualized flat diff list.
+enum FlatRow {
+    FileHeader { file_idx: usize },
+    EmptyFile { file_idx: usize },
+    Line {
+        file_idx: usize,
+        seg_idx: usize,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+    },
+    CollapsedContext {
+        file_idx: usize,
+        #[allow(dead_code)]
+        seg_idx: usize,
+        count: usize,
+        hunk_idx: usize,
+        direction: ExpandDirection,
+        is_last_in_file: bool,
+    },
+    LoadMore { remaining: usize },
+}
+
 // ── File tree builder ──
 
 enum TreeNode {
@@ -1642,6 +1804,11 @@ impl Render for PrDiffPanel {
         if self.needs_initial_refresh {
             self.needs_initial_refresh = false;
             self.refresh(cx);
+        }
+
+        // Rebuild the flat row cache if data has changed
+        if self.flat_cache_dirty {
+            self.rebuild_flat_cache();
         }
 
         let total_files = self.diff_files.len();
@@ -1924,49 +2091,24 @@ impl Render for PrDiffPanel {
                 ),
         );
 
-        // Diff content (scrollable) — paginated for large diffs
-        let files = self.diff_files.clone();
-        let render_limit = self.rendered_file_limit.min(files.len());
-        let line_counter = std::cell::Cell::new(0usize);
-        let line_texts = std::cell::RefCell::new(Vec::<String>::new());
+        // Diff content — virtualized with list (supports variable row heights for comments)
+        let entity_list = cx.entity().clone();
 
-        let mut diff_content = div()
-            .id("pr-diff-panel-content")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(100.0))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
-            .p_2();
+        let diff_content = list(
+            self.list_state.clone(),
+            move |ix, _window, cx| {
+                let panel = entity_list.read(cx);
+                panel.render_flat_row(ix, &entity_list)
+            },
+        )
+        .flex_1()
+        .min_w(px(100.0))
+        .p_2();
 
-        for (idx, file) in files.iter().enumerate().take(render_limit) {
-            diff_content = diff_content.child(
-                self.render_file_diff(file, idx, &line_counter, &line_texts, cx),
-            );
-        }
-
-        // Store collected line contents for copy support
-        self.copy_line_contents = line_texts.into_inner();
-
-        // Auto-load more files: show a sentinel and schedule the next batch
-        let remaining = files.len().saturating_sub(render_limit);
+        // Auto-load more files if there are un-rendered files
+        let render_limit = self.rendered_file_limit.min(self.diff_files.len());
+        let remaining = self.diff_files.len().saturating_sub(render_limit);
         if remaining > 0 {
-            diff_content = diff_content.child(
-                div()
-                    .w_full()
-                    .py_2()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors::text_muted())
-                            .child(format!("{remaining} more files...")),
-                    ),
-            );
-
-            // Schedule the next batch load after a brief delay
             let entity_more = cx.entity().clone();
             cx.spawn(async move |_, cx| {
                 cx.background_executor()
@@ -1977,6 +2119,7 @@ impl Render for PrDiffPanel {
                         let total = panel.diff_files.len();
                         if panel.rendered_file_limit < total {
                             panel.rendered_file_limit += FILE_RENDER_BATCH;
+                            panel.flat_cache_dirty = true;
                             cx.notify();
                         }
                     });
@@ -1985,8 +2128,11 @@ impl Render for PrDiffPanel {
             .detach();
         }
 
-        if let Some(target_idx) = self.scroll_to_file.take() {
-            self.scroll_handle.scroll_to_item(target_idx);
+        // Handle scroll-to-file: convert file_idx to flat row index
+        if let Some(target_file) = self.scroll_to_file.take() {
+            if let Some(&row_idx) = self.flat_file_starts.get(target_file) {
+                self.list_state.scroll_to_reveal_item(row_idx);
+            }
         }
 
         body = body.child(diff_content);

@@ -713,8 +713,10 @@ impl PrDiffPanel {
 
         self.cached_file_segments = all_segments;
         self.copy_line_contents = copy_texts;
+        let scroll_pos = self.list_state.logical_scroll_top();
         let old_count = self.list_state.item_count();
         self.list_state.splice(0..old_count, self.flat_rows.len());
+        self.list_state.scroll_to(scroll_pos);
         self.flat_cache_dirty = false;
     }
 
@@ -2088,11 +2090,11 @@ impl Render for PrDiffPanel {
         body = body.child(
             div()
                 .id("pr-tree-resize-handle")
-                .w(px(6.0))
+                .w(px(8.0))
+                .mx(px(-3.0))
                 .h_full()
                 .flex_shrink_0()
                 .cursor_col_resize()
-                .hover(|s| s.bg(colors::accent()))
                 .on_mouse_down(
                     MouseButton::Left,
                     move |event: &MouseDownEvent, _window, cx| {

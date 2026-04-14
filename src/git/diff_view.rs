@@ -1649,7 +1649,7 @@ impl Render for GitDiffPanel {
                 entity_move.update(cx, |panel, cx| {
                     if panel.resizing_tree {
                         let delta = f32::from(event.position.x) - panel.tree_drag_start_x;
-                        let new_w = (panel.tree_drag_start_width + delta).clamp(40.0, panel.width * 0.6);
+                        let new_w = (panel.tree_drag_start_width + delta).clamp(40.0, panel.width * 0.8);
                         panel.tree_width = new_w;
                         cx.notify();
                     }

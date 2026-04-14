@@ -18,6 +18,7 @@ mod tab;
 mod terminal;
 mod text_input;
 mod theme;
+mod updater;
 mod util;
 mod workspace;
 

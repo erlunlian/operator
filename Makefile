@@ -1,10 +1,11 @@
 SHELL := /bin/zsh -l
-.PHONY: help dev run release install open clean
+.PHONY: help dev run release dmg install open clean
 
 help:
 	@echo "make dev       Dev build with auto-reload on save"
 	@echo "make run       Single build and run"
 	@echo "make release   Build optimized .app bundle"
+	@echo "make dmg       Build release and create DMG installer"
 	@echo "make open      Build release and open the app"
 	@echo "make install   Build release and copy to /Applications"
 	@echo "make clean     Remove all build artifacts"
@@ -21,6 +22,10 @@ run:
 release:
 	./script/build-release
 
+# Build release and create DMG installer
+dmg: release
+	./script/create-dmg
+
 # Copy to /Applications
 install: release
 	cp -r target/release/Operator.app /Applications/
@@ -33,3 +38,4 @@ open:
 clean:
 	cargo clean
 	rm -rf target/release/Operator.app
+	rm -f target/release/Operator.dmg

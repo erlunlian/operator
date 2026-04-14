@@ -44,6 +44,8 @@ pub struct OperatorApp {
     quit_requested: bool,
     /// Drop indicator index for workspace sidebar drag reorder.
     ws_drop_index: Option<usize>,
+    /// Available update info (checked on startup).
+    pub update_info: Option<crate::updater::UpdateInfo>,
 }
 
 impl OperatorApp {
@@ -66,7 +68,7 @@ impl OperatorApp {
         Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
-        Self {
+        let mut app = Self {
             workspaces: vec![ws],
             active_workspace_ix: 0,
             sidebar_collapsed: false,
@@ -85,7 +87,10 @@ impl OperatorApp {
             recent_projects: RecentProjects::load(),
             quit_requested: false,
             ws_drop_index: None,
-        }
+            update_info: None,
+        };
+        app.check_for_updates(cx);
+        app
     }
 
     pub fn from_restored(
@@ -122,7 +127,7 @@ impl OperatorApp {
         Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
-        Self {
+        let mut app = Self {
             workspaces,
             active_workspace_ix,
             sidebar_collapsed,
@@ -141,7 +146,10 @@ impl OperatorApp {
             recent_projects: RecentProjects::load(),
             quit_requested: false,
             ws_drop_index: None,
-        }
+            update_info: None,
+        };
+        app.check_for_updates(cx);
+        app
     }
 
     fn register_quit_handler(cx: &mut Context<Self>) {
@@ -250,6 +258,25 @@ impl OperatorApp {
                 if ok.is_err() {
                     break;
                 }
+            }
+        })
+        .detach();
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::updater::check_for_update(&current) })
+                .await;
+            if let Some(info) = result {
+                let _ = cx.update(|cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        app.update_info = Some(info);
+                        cx.notify();
+                    });
+                });
             }
         })
         .detach();
@@ -1288,6 +1315,9 @@ impl Render for OperatorApp {
                     });
                 }),
                 sidebar_width,
+                self.update_info.as_ref().map(|info| {
+                    (info.latest_version.as_str(), info.download_url.as_str())
+                }),
             ))
         } else {
             None

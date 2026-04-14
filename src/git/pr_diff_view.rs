@@ -2101,16 +2101,20 @@ impl Render for PrDiffPanel {
         // Diff content — virtualized with list (supports variable row heights for comments)
         let entity_list = cx.entity().clone();
 
-        let diff_content = list(
+        let diff_list = list(
             self.list_state.clone(),
             move |ix, _window, cx| {
                 let panel = entity_list.read(cx);
                 panel.render_flat_row(ix, &entity_list)
             },
         )
-        .flex_1()
-        .min_w(px(100.0))
-        .p(px(16.0));
+        .flex_1();
+
+        let diff_content = div()
+            .flex_1()
+            .min_w(px(100.0))
+            .p(px(16.0))
+            .child(diff_list);
 
         // Auto-load more files if there are un-rendered files
         let render_limit = self.rendered_file_limit.min(self.diff_files.len());

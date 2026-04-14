@@ -1,4 +1,3 @@
-use std::time::Instant;
 
 /// Snapshot of process-level performance metrics.
 #[derive(Clone, Debug)]
@@ -13,8 +12,6 @@ pub struct ProcessMetrics {
     pub terminal_count: usize,
     /// Number of workspaces.
     pub workspace_count: usize,
-    /// Time at which this snapshot was collected.
-    pub sampled_at: Instant,
     /// Per-subsystem memory breakdown (estimated).
     pub subsystems: SubsystemMetrics,
 }
@@ -46,7 +43,6 @@ impl ProcessMetrics {
             thread_count,
             terminal_count,
             workspace_count,
-            sampled_at: Instant::now(),
             subsystems,
         }
     }

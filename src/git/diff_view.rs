@@ -1794,6 +1794,8 @@ impl Render for GitDiffPanel {
         .flex_1();
 
         let diff_content = div()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w(px(100.0))
             .p(px(16.0))

@@ -903,7 +903,7 @@ impl GitDiffPanel {
             .items_center()
             .w_full()
             .min_h(px(32.0))
-            .when(file_idx > 0, |d: Stateful<Div>| d.mt(px(12.0)))
+            .when(file_idx > 0, |d: Stateful<Div>| d.pt(px(12.0)))
             .px_3()
             .py(px(4.0))
             .bg(file_header_bg())

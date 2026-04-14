@@ -816,7 +816,8 @@ impl GitDiffPanel {
 
         self.cached_file_segments = all_segments;
         self.copy_line_contents = copy_texts;
-        self.list_state.reset(self.flat_rows.len());
+        let old_count = self.list_state.item_count();
+        self.list_state.splice(0..old_count, self.flat_rows.len());
         self.flat_cache_dirty = false;
     }
 
@@ -1646,7 +1647,7 @@ impl Render for GitDiffPanel {
                 entity_move.update(cx, |panel, cx| {
                     if panel.resizing_tree {
                         let delta = f32::from(event.position.x) - panel.tree_drag_start_x;
-                        let new_w = (panel.tree_drag_start_width + delta).clamp(80.0, panel.width - 100.0);
+                        let new_w = (panel.tree_drag_start_width + delta).clamp(40.0, panel.width * 0.6);
                         panel.tree_width = new_w;
                         cx.notify();
                     }
@@ -1760,7 +1761,7 @@ impl Render for GitDiffPanel {
             .flex()
             .flex_col()
             .w(px(tree_width))
-            .min_w(px(80.0))
+            .min_w(px(40.0))
             .h_full()
             .border_r_1()
             .border_color(colors::border())

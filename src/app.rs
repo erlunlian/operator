@@ -22,6 +22,12 @@ pub enum FocusRegion {
     RightPanel,
 }
 
+// Layout constraints
+const MIN_SIDEBAR_WIDTH: f32 = 120.0;
+const MAX_SIDEBAR_WIDTH: f32 = 500.0;
+const MIN_RIGHT_PANEL_WIDTH: f32 = 200.0;
+const MIN_CENTER_WIDTH: f32 = 100.0;
+
 pub struct OperatorApp {
     pub workspaces: Vec<Entity<Workspace>>,
     pub active_workspace_ix: usize,
@@ -1551,13 +1557,14 @@ impl Render for OperatorApp {
                 app_resize_move.update(cx, |app, cx| {
                     let x = f32::from(event.position.x);
                     if app.resizing_sidebar {
-                        app.sidebar_width = x.clamp(120.0, 500.0);
+                        app.sidebar_width = x.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
                         cx.notify();
                     }
                     if app.resizing_right_panel {
-                        // Right panel is on the right: width = window_width - mouse_x
                         let window_width = f32::from(window.bounds().size.width);
-                        let new_width = (window_width - x).clamp(200.0, window_width - 100.0);
+                        let left_edge = if app.sidebar_collapsed { 0.0 } else { app.sidebar_width };
+                        let max_right = window_width - left_edge - MIN_CENTER_WIDTH;
+                        let new_width = (window_width - x).clamp(MIN_RIGHT_PANEL_WIDTH, max_right);
                         app.right_panel.update(cx, |rp, cx| {
                             rp.width = new_width;
                             cx.notify();
@@ -1652,6 +1659,7 @@ impl Render for OperatorApp {
                 .flex_col()
                 .h_full()
                 .flex_shrink_0()
+                .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                     app_focus_right.update(cx, |app, cx| {
                         if app.focus_region != FocusRegion::RightPanel {

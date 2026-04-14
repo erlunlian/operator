@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -260,4 +261,145 @@ pub fn reply_to_comment(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).map_err(|e| e.to_string())
+}
+
+/// Thread info returned by the GraphQL query: which threads are resolved, and
+/// the mapping from top-level comment database_id → thread node_id (needed for
+/// the resolve/unresolve mutations).
+pub struct ThreadInfo {
+    pub resolved_ids: HashSet<u64>,
+    pub thread_node_ids: HashMap<u64, String>,
+}
+
+/// Fetch review thread metadata for a PR. Returns the set of resolved
+/// top-level comment database IDs **and** a map from comment database ID to
+/// the GraphQL node ID of its thread (needed for resolve/unresolve mutations).
+pub fn fetch_thread_info(repo_dir: &Path, owner: &str, repo: &str, pr_number: u64) -> ThreadInfo {
+    let query = format!(
+        r#"query {{
+  repository(owner: "{owner}", name: "{repo}") {{
+    pullRequest(number: {pr_number}) {{
+      reviewThreads(first: 100) {{
+        nodes {{
+          id
+          isResolved
+          comments(first: 1) {{
+            nodes {{
+              databaseId
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"#
+    );
+
+    let output = Command::new(gh_bin())
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .current_dir(repo_dir)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return ThreadInfo { resolved_ids: HashSet::new(), thread_node_ids: HashMap::new() },
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    #[derive(Deserialize)]
+    struct GqlResponse {
+        data: Option<GqlData>,
+    }
+    #[derive(Deserialize)]
+    struct GqlData {
+        repository: Option<GqlRepo>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GqlRepo {
+        pull_request: Option<GqlPr>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GqlPr {
+        review_threads: GqlConnection<GqlThread>,
+    }
+    #[derive(Deserialize)]
+    struct GqlConnection<T> {
+        nodes: Vec<T>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GqlThread {
+        id: String,
+        is_resolved: bool,
+        comments: GqlConnection<GqlComment>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GqlComment {
+        database_id: Option<u64>,
+    }
+
+    let resp: GqlResponse = match serde_json::from_str(&stdout) {
+        Ok(r) => r,
+        Err(_) => return ThreadInfo { resolved_ids: HashSet::new(), thread_node_ids: HashMap::new() },
+    };
+
+    let mut resolved_ids = HashSet::new();
+    let mut thread_node_ids = HashMap::new();
+    if let Some(data) = resp.data {
+        if let Some(repo_data) = data.repository {
+            if let Some(pr) = repo_data.pull_request {
+                for thread in pr.review_threads.nodes {
+                    if let Some(first) = thread.comments.nodes.first() {
+                        if let Some(db_id) = first.database_id {
+                            thread_node_ids.insert(db_id, thread.id.clone());
+                            if thread.is_resolved {
+                                resolved_ids.insert(db_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ThreadInfo { resolved_ids, thread_node_ids }
+}
+
+/// Resolve a review thread using its GraphQL node ID.
+pub fn resolve_review_thread(repo_dir: &Path, thread_node_id: &str) -> Result<(), String> {
+    let query = format!(
+        r#"mutation {{ resolveReviewThread(input: {{ threadId: "{thread_node_id}" }}) {{ thread {{ id }} }} }}"#
+    );
+    let output = Command::new(gh_bin())
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh api failed: {stderr}"));
+    }
+    Ok(())
+}
+
+/// Unresolve a review thread using its GraphQL node ID.
+pub fn unresolve_review_thread(repo_dir: &Path, thread_node_id: &str) -> Result<(), String> {
+    let query = format!(
+        r#"mutation {{ unresolveReviewThread(input: {{ threadId: "{thread_node_id}" }}) {{ thread {{ id }} }} }}"#
+    );
+    let output = Command::new(gh_bin())
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh api failed: {stderr}"));
+    }
+    Ok(())
 }

@@ -14,6 +14,10 @@ const DEFAULT_CONTEXT: usize = 3;
 const EXPAND_STEP: usize = 20;
 /// How many files to render initially before showing "Load more".
 const FILE_RENDER_BATCH: usize = 20;
+/// Minimum file-tree sidebar width in pixels.
+const MIN_TREE_WIDTH: f32 = 40.0;
+/// Maximum file-tree sidebar width in pixels.
+const MAX_TREE_WIDTH: f32 = 600.0;
 
 // ── Colors specific to the diff view ──
 
@@ -1637,16 +1641,17 @@ impl Render for GitDiffPanel {
             .id("diff-panel")
             .flex()
             .flex_col()
-            .w_full()
+            .size_full()
+            .min_w(px(0.0))
             .flex_1()
-            .h_full()
+            .overflow_hidden()
             .bg(colors::surface())
             // Handle tree resize drag across the whole panel
             .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_move.update(cx, |panel, cx| {
                     if panel.resizing_tree {
                         let delta = f32::from(event.position.x) - panel.tree_drag_start_x;
-                        let new_w = (panel.tree_drag_start_width + delta).clamp(40.0, panel.width - 40.0);
+                        let new_w = (panel.tree_drag_start_width + delta).clamp(MIN_TREE_WIDTH, MAX_TREE_WIDTH);
                         panel.tree_width = new_w;
                         cx.notify();
                     }
@@ -1761,6 +1766,8 @@ impl Render for GitDiffPanel {
             .flex()
             .flex_row()
             .flex_1()
+            .w_full()
+            .min_w(px(0.0))
             .overflow_hidden();
 
         // File tree sidebar
@@ -1769,7 +1776,7 @@ impl Render for GitDiffPanel {
             .flex()
             .flex_col()
             .w(px(tree_width))
-            .min_w(px(40.0))
+            .flex_shrink_0()
             .h_full()
             .border_r_1()
             .border_color(colors::border())
@@ -1814,7 +1821,8 @@ impl Render for GitDiffPanel {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(100.0))
+            .min_w(px(0.0))
+            .overflow_hidden()
             .px(px(16.0))
             .child(diff_list);
 

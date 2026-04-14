@@ -18,6 +18,10 @@ const DEFAULT_CONTEXT: usize = 3;
 const EXPAND_STEP: usize = 20;
 /// How many files to render initially before showing "Load more".
 const FILE_RENDER_BATCH: usize = 20;
+/// Minimum file-tree sidebar width in pixels.
+const MIN_TREE_WIDTH: f32 = 40.0;
+/// Maximum file-tree sidebar width in pixels.
+const MAX_TREE_WIDTH: f32 = 600.0;
 
 // ── Colors specific to the diff view ──
 
@@ -78,8 +82,8 @@ pub struct PrDiffPanel {
     // PR state
     pr_info: Option<PrInfo>,
     pr_comments: Vec<PrReviewComment>,
-    /// Index from (path, line_number) → indices into pr_comments.
-    comment_index: HashMap<(String, u32), Vec<usize>>,
+    /// Index from (path, line_number, side) → indices into pr_comments.
+    comment_index: HashMap<(String, u32, String), Vec<usize>>,
     gh_status: GhStatus,
     loading: bool,
 
@@ -94,6 +98,9 @@ pub struct PrDiffPanel {
     comment_drag_start: Option<(String, u32, CommentSide)>,
     /// Updated on mouse-move: the current end line of the drag
     comment_drag_end: Option<u32>,
+    /// Visual row range for drag highlight (global_line_idx based, side-agnostic)
+    comment_drag_start_gli: Option<usize>,
+    comment_drag_end_gli: Option<usize>,
 
     // UI state
     collapsed_files: HashSet<usize>,
@@ -142,6 +149,15 @@ pub struct PrDiffPanel {
     // "Copy as prompt" feedback — key identifies which button was clicked
     copied_prompt_key: Option<String>,
     _copied_comment_timer: Option<Task<()>>,
+
+    // Resolved thread tracking — top-level comment IDs whose threads are resolved
+    resolved_thread_ids: HashSet<u64>,
+    /// Map from top-level comment database ID → GraphQL thread node ID (for resolve/unresolve).
+    thread_node_ids: HashMap<u64, String>,
+    /// Resolved threads the user has manually expanded to view.
+    expanded_resolved: HashSet<u64>,
+    /// Comment threads the user has manually collapsed.
+    collapsed_comments: HashSet<u64>,
 }
 
 impl PrDiffPanel {
@@ -162,6 +178,8 @@ impl PrDiffPanel {
             submitting_comment: false,
             comment_drag_start: None,
             comment_drag_end: None,
+            comment_drag_start_gli: None,
+            comment_drag_end_gli: None,
             collapsed_files: HashSet::new(),
             collapsed_dirs: HashSet::new(),
             expanded_context: HashMap::new(),
@@ -189,6 +207,10 @@ impl PrDiffPanel {
             submitting_reply: false,
             copied_prompt_key: None,
             _copied_comment_timer: None,
+            resolved_thread_ids: HashSet::new(),
+            thread_node_ids: HashMap::new(),
+            expanded_resolved: HashSet::new(),
+            collapsed_comments: HashSet::new(),
         }
     }
 
@@ -224,6 +246,8 @@ impl PrDiffPanel {
             submitting_comment: false,
             comment_drag_start: None,
             comment_drag_end: None,
+            comment_drag_start_gli: None,
+            comment_drag_end_gli: None,
             collapsed_files: HashSet::new(),
             collapsed_dirs: HashSet::new(),
             expanded_context: HashMap::new(),
@@ -251,6 +275,10 @@ impl PrDiffPanel {
             submitting_reply: false,
             copied_prompt_key: None,
             _copied_comment_timer: None,
+            resolved_thread_ids: HashSet::new(),
+            thread_node_ids: HashMap::new(),
+            expanded_resolved: HashSet::new(),
+            collapsed_comments: HashSet::new(),
         }
     }
 
@@ -319,12 +347,18 @@ impl PrDiffPanel {
                 .background_executor()
                 .spawn(async move {
                     let gh_status = github::check_gh();
-                    let (pr_info, comments) = if gh_status == GhStatus::Available {
+                    let (pr_info, comments, thread_info) = if gh_status == GhStatus::Available {
                         let pr = github::detect_pr(&work_dir);
                         let comments = pr
                             .as_ref()
                             .map(|p| github::fetch_pr_comments(&work_dir, p.number))
                             .unwrap_or_default();
+                        let thread_info = pr
+                            .as_ref()
+                            .and_then(|p| {
+                                github::repo_owner_name(&work_dir)
+                                    .map(|(owner, repo)| github::fetch_thread_info(&work_dir, &owner, &repo, p.number))
+                            });
                         // Fetch the base ref so our local merge-base is up to date.
                         // This ensures the diff matches what GitHub shows.
                         let fetch_ref = pr
@@ -335,17 +369,17 @@ impl PrDiffPanel {
                             .args(["fetch", "origin", fetch_ref])
                             .current_dir(&work_dir)
                             .output();
-                        (pr, comments)
+                        (pr, comments, thread_info)
                     } else {
-                        (None, Vec::new())
+                        (None, Vec::new(), None)
                     };
-                    (gh_status, pr_info, comments)
+                    (gh_status, pr_info, comments, thread_info)
                 })
                 .await;
 
             let _ = cx.update(|cx| {
                 let _ = entity.update(cx, |panel, cx| {
-                    let (gh_status, pr_info, comments) = result;
+                    let (gh_status, pr_info, comments, thread_info) = result;
                     panel.gh_status = gh_status;
 
                     // Update base ref from PR info if needed
@@ -365,6 +399,13 @@ impl PrDiffPanel {
 
                     panel.pr_info = pr_info;
                     panel.pr_comments = comments;
+                    if let Some(info) = thread_info {
+                        panel.resolved_thread_ids = info.resolved_ids;
+                        panel.thread_node_ids = info.thread_node_ids;
+                    } else {
+                        panel.resolved_thread_ids.clear();
+                        panel.thread_node_ids.clear();
+                    }
                     panel.rebuild_comment_index();
                     panel.loading = false;
                     cx.notify();
@@ -382,8 +423,9 @@ impl PrDiffPanel {
                 continue;
             }
             if let Some(line) = comment.line {
+                let side = comment.side.clone().unwrap_or_else(|| "RIGHT".to_string());
                 self.comment_index
-                    .entry((comment.path.clone(), line))
+                    .entry((comment.path.clone(), line, side))
                     .or_default()
                     .push(idx);
             }
@@ -463,9 +505,10 @@ impl PrDiffPanel {
                         Ok(comment) => {
                             let idx = panel.pr_comments.len();
                             if let Some(line) = comment.line {
+                                let side = comment.side.clone().unwrap_or_else(|| "RIGHT".to_string());
                                 panel
                                     .comment_index
-                                    .entry((comment.path.clone(), line))
+                                    .entry((comment.path.clone(), line, side))
                                     .or_default()
                                     .push(idx);
                             }
@@ -545,6 +588,49 @@ impl PrDiffPanel {
                     cx.notify();
                 });
             });
+        })
+        .detach();
+    }
+
+    fn toggle_resolve_thread(&mut self, comment_id: u64, cx: &mut Context<Self>) {
+        let Some(work_dir) = self.work_dir.clone() else { return };
+        let Some(thread_node_id) = self.thread_node_ids.get(&comment_id).cloned() else { return };
+        let is_resolved = self.resolved_thread_ids.contains(&comment_id);
+
+        // Optimistically toggle the UI state
+        if is_resolved {
+            self.resolved_thread_ids.remove(&comment_id);
+        } else {
+            self.resolved_thread_ids.insert(comment_id);
+            self.expanded_resolved.remove(&comment_id);
+        }
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if is_resolved {
+                        github::unresolve_review_thread(&work_dir, &thread_node_id)
+                    } else {
+                        github::resolve_review_thread(&work_dir, &thread_node_id)
+                    }
+                })
+                .await;
+
+            // On failure, revert the optimistic update
+            if result.is_err() {
+                let _ = cx.update(|cx| {
+                    let _ = entity.update(cx, |panel, cx| {
+                        if is_resolved {
+                            panel.resolved_thread_ids.insert(comment_id);
+                        } else {
+                            panel.resolved_thread_ids.remove(&comment_id);
+                        }
+                        cx.notify();
+                    });
+                });
+            }
         })
         .detach();
     }
@@ -649,6 +735,19 @@ impl PrDiffPanel {
                     let adds = file.additions();
                     let dels = file.deletions();
 
+                    // Count unresolved and resolved top-level comments on this file
+                    let mut unresolved_count = 0usize;
+                    let mut resolved_count = 0usize;
+                    for c in &self.pr_comments {
+                        if c.in_reply_to_id.is_none() && c.path == file.path {
+                            if self.resolved_thread_ids.contains(&c.id) {
+                                resolved_count += 1;
+                            } else {
+                                unresolved_count += 1;
+                            }
+                        }
+                    }
+
                     container = container.child(
                         div()
                             .id(ElementId::Name(format!("pr-tree-file-{idx}").into()))
@@ -701,8 +800,53 @@ impl PrDiffPanel {
                                 div()
                                     .flex()
                                     .flex_row()
+                                    .items_center()
                                     .gap_1()
                                     .flex_shrink_0()
+                                    .when(unresolved_count > 0, |d: Div| {
+                                        d.child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .font_family(util::ICON_FONT)
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors::accent())
+                                                        .child("\u{f075}"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors::accent())
+                                                        .child(format!("{unresolved_count}")),
+                                                ),
+                                        )
+                                    })
+                                    .when(resolved_count > 0, |d: Div| {
+                                        d.child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .font_family(util::ICON_FONT)
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors::text_muted())
+                                                        .child("\u{f00c}"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors::text_muted())
+                                                        .child(format!("{resolved_count}")),
+                                                ),
+                                        )
+                                    })
                                     .when(adds > 0, |d: Div| {
                                         d.child(
                                             div()
@@ -1140,6 +1284,7 @@ impl PrDiffPanel {
         };
 
         // Comment "+" button
+        let gli = global_line_idx;
         let can_comment = self.can_comment();
         let has_line_num = line_num.is_some();
         let comment_btn: AnyElement = if can_comment && has_line_num {
@@ -1151,15 +1296,15 @@ impl PrDiffPanel {
             let path_up = file_path.to_string();
 
             // Check if this line is within a drag selection or active comment range
-            let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, _)| {
-                if p != file_path { return false; }
+            let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, s)| {
+                if p != file_path || *s != side { return false; }
                 let end = self.comment_drag_end.unwrap_or(*start);
                 let lo = (*start).min(end);
                 let hi = (*start).max(end);
                 ln >= lo && ln <= hi
             });
-            let in_active = self.active_comment_line.as_ref().map_or(false, |(p, start, end, _)| {
-                if p != file_path { return false; }
+            let in_active = self.active_comment_line.as_ref().map_or(false, |(p, start, end, s)| {
+                if p != file_path || *s != side { return false; }
                 let lo = (*start).min(*end);
                 let hi = (*start).max(*end);
                 ln >= lo && ln <= hi
@@ -1189,6 +1334,8 @@ impl PrDiffPanel {
                     entity_down.update(cx, |panel, cx| {
                         panel.comment_drag_start = Some((path, ln, side));
                         panel.comment_drag_end = None;
+                        panel.comment_drag_start_gli = Some(gli);
+                        panel.comment_drag_end_gli = Some(gli);
                         cx.notify();
                     });
                     cx.stop_propagation();
@@ -1203,6 +1350,8 @@ impl PrDiffPanel {
                                 let start = start_ln.min(ln);
                                 let end = start_ln.max(ln);
                                 panel.comment_drag_end = None;
+                                panel.comment_drag_start_gli = None;
+                                panel.comment_drag_end_gli = None;
                                 panel.start_comment(path, start, end, drag_side, cx);
                             }
                         }
@@ -1211,11 +1360,17 @@ impl PrDiffPanel {
                 })
                 .on_mouse_move(move |_, _window, cx| {
                     entity_move.update(cx, |panel, cx| {
-                        if panel.comment_drag_start.is_some()
-                            && panel.comment_drag_end != Some(ln)
-                        {
-                            panel.comment_drag_end = Some(ln);
-                            cx.notify();
+                        if panel.comment_drag_start.is_some() {
+                            let mut changed = false;
+                            if panel.comment_drag_end != Some(ln) {
+                                panel.comment_drag_end = Some(ln);
+                                changed = true;
+                            }
+                            if panel.comment_drag_end_gli != Some(gli) {
+                                panel.comment_drag_end_gli = Some(gli);
+                                changed = true;
+                            }
+                            if changed { cx.notify(); }
                         }
                     });
                 })
@@ -1229,22 +1384,22 @@ impl PrDiffPanel {
                 .into_any_element()
         };
 
-        // Check if this line is within an active drag selection (for row highlight)
-        let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, _)| {
-            if p != file_path { return false; }
-            if let Some(ln) = line_num {
-                let end = self.comment_drag_end.unwrap_or(*start);
-                let lo = (*start).min(end);
-                let hi = (*start).max(end);
-                ln >= lo && ln <= hi
-            } else {
-                false
+        // Check if this line is within an active drag selection (for row highlight).
+        // Use global_line_idx range so the visual highlight is side-agnostic —
+        // all rows in the dragged visual range light up regardless of LEFT/RIGHT.
+        let in_drag = match (self.comment_drag_start_gli, self.comment_drag_end_gli) {
+            (Some(start_gli), Some(end_gli)) => {
+                let lo = start_gli.min(end_gli);
+                let hi = start_gli.max(end_gli);
+                global_line_idx >= lo && global_line_idx <= hi
             }
-        });
+            _ => false,
+        };
 
-        // Also highlight lines within the active comment range (after drag completes)
-        let in_active_comment = self.active_comment_line.as_ref().map_or(false, |(p, start, end, _)| {
-            if p != file_path { return false; }
+        // Also highlight lines within the active comment range (after drag completes).
+        // This keeps side-awareness: the comment is attached to a specific side.
+        let in_active_comment = self.active_comment_line.as_ref().map_or(false, |(p, start, end, s)| {
+            if p != file_path || *s != side { return false; }
             if let Some(ln) = line_num {
                 let lo = (*start).min(*end);
                 let hi = (*start).max(*end);
@@ -1261,7 +1416,6 @@ impl PrDiffPanel {
         let entity_sel_move = entity.clone();
         let entity_row_up = entity.clone();
         let row_path = file_path.to_string();
-        let gli = global_line_idx;
 
         let line_row = div()
             .group("pr-diff-line")
@@ -1288,10 +1442,16 @@ impl PrDiffPanel {
                         changed = true;
                     }
                     // Track comment drag across the whole row, not just the "+" button
-                    if let Some(ln) = line_num {
-                        if panel.comment_drag_start.is_some() && panel.comment_drag_end != Some(ln) {
-                            panel.comment_drag_end = Some(ln);
+                    if panel.comment_drag_start.is_some() {
+                        if panel.comment_drag_end_gli != Some(gli) {
+                            panel.comment_drag_end_gli = Some(gli);
                             changed = true;
+                        }
+                        if let Some(ln) = line_num {
+                            if panel.comment_drag_end != Some(ln) {
+                                panel.comment_drag_end = Some(ln);
+                                changed = true;
+                            }
                         }
                     }
                     if changed {
@@ -1309,6 +1469,8 @@ impl PrDiffPanel {
                                     let start = start_ln.min(ln);
                                     let end = start_ln.max(ln);
                                     panel.comment_drag_end = None;
+                                    panel.comment_drag_start_gli = None;
+                                    panel.comment_drag_end_gli = None;
                                     panel.start_comment(path.clone(), start, end, drag_side, cx);
                                 }
                             }
@@ -1343,7 +1505,8 @@ impl PrDiffPanel {
         let has_comment_form = self.active_comment_line.as_ref().map_or(false, |(active_path, _start, end, active_side)| {
             active_path == file_path && line_num == Some(*end) && side == *active_side
         });
-        let has_comments = line_num.and_then(|ln| self.comment_index.get(&(file_path.to_string(), ln))).map_or(false, |v| !v.is_empty());
+        let side_str = side.api_str().to_string();
+        let has_comments = line_num.and_then(|ln| self.comment_index.get(&(file_path.to_string(), ln, side_str.clone()))).map_or(false, |v| !v.is_empty());
 
         if !has_comment_form && !has_comments {
             // Simple case: just the line, apply borders directly
@@ -1373,7 +1536,7 @@ impl PrDiffPanel {
 
         // Existing PR comments for this line
         if let Some(ln) = line_num {
-            if let Some(indices) = self.comment_index.get(&(file_path.to_string(), ln)) {
+            if let Some(indices) = self.comment_index.get(&(file_path.to_string(), ln, side_str)) {
                 for &idx in indices {
                     wrapper = wrapper.child(self.render_comment_bubble(idx, entity));
                 }
@@ -1772,6 +1935,44 @@ impl PrDiffPanel {
         format!("{header}\n{thread}")
     }
 
+    /// Build a combined prompt for all unresolved comment threads.
+    fn build_all_unresolved_prompt(&self) -> String {
+        let mut sections: Vec<String> = Vec::new();
+        for comment in &self.pr_comments {
+            // Only top-level comments (not replies)
+            if comment.in_reply_to_id.is_some() {
+                continue;
+            }
+            // Skip resolved threads
+            if self.resolved_thread_ids.contains(&comment.id) {
+                continue;
+            }
+            let replies: Vec<&PrReviewComment> = self
+                .pr_comments
+                .iter()
+                .filter(|c| c.in_reply_to_id == Some(comment.id))
+                .collect();
+            sections.push(self.build_thread_prompt(comment, &replies));
+        }
+        if sections.is_empty() {
+            return String::new();
+        }
+        let count = sections.len();
+        let preamble = format!(
+            "Address these {count} unresolved PR comment{}:\n",
+            if count == 1 { "" } else { "s" }
+        );
+        preamble + &sections.join("\n\n---\n\n")
+    }
+
+    /// Count unresolved top-level comment threads.
+    fn unresolved_comment_count(&self) -> usize {
+        self.pr_comments
+            .iter()
+            .filter(|c| c.in_reply_to_id.is_none() && !self.resolved_thread_ids.contains(&c.id))
+            .count()
+    }
+
     /// Render a small copy-as-prompt button with custom label.
     fn render_copy_prompt_btn(&self, key: String, label: &str, prompt_text: String, entity: &Entity<Self>) -> Stateful<Div> {
         let is_copied = self.copied_prompt_key.as_deref() == Some(&key);
@@ -1829,6 +2030,106 @@ impl PrDiffPanel {
             .iter()
             .filter(|c| c.in_reply_to_id == Some(comment_id))
             .collect();
+
+        let is_thread_resolved = self.resolved_thread_ids.contains(&comment_id);
+        let is_expanded_resolved = self.expanded_resolved.contains(&comment_id);
+        let is_manually_collapsed = self.collapsed_comments.contains(&comment_id);
+
+        // Show collapsed bar when resolved (and not manually expanded) or manually collapsed
+        let show_collapsed = (is_thread_resolved && !is_expanded_resolved) || is_manually_collapsed;
+        if show_collapsed {
+            let entity_expand = entity.clone();
+            let expand_cid = comment_id;
+            let reply_count = replies.len();
+            let summary = format!(
+                "{author}: {}",
+                body.lines().next().unwrap_or("").chars().take(60).collect::<String>(),
+            );
+
+            let mut bar = div()
+                .w_full()
+                .px_3()
+                .py(px(4.0))
+                .bg(comment_bg())
+                .border_t_1()
+                .border_b_1()
+                .border_color(comment_border())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2();
+
+            // Icon: checkmark for resolved, comment icon for manually collapsed
+            if is_thread_resolved {
+                bar = bar.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgba(0x2ea04399))
+                        .child("\u{f00c}")
+                        .font_family(util::ICON_FONT)
+                );
+            } else {
+                bar = bar.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .child("\u{f075}")
+                        .font_family(util::ICON_FONT)
+                );
+            }
+
+            // Summary text — click to expand
+            bar = bar.child(
+                div()
+                    .id(ElementId::Name(format!("pr-collapsed-expand-{comment_idx}").into()))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors::text()))
+                    .child(if reply_count > 0 {
+                        format!("{summary}  (+{reply_count} replies)")
+                    } else {
+                        summary
+                    })
+                    .on_click(move |_, _window, cx| {
+                        entity_expand.update(cx, |panel, cx| {
+                            if is_thread_resolved {
+                                panel.expanded_resolved.insert(expand_cid);
+                            }
+                            panel.collapsed_comments.remove(&expand_cid);
+                            cx.notify();
+                        });
+                    })
+            );
+
+            // Unresolve button for resolved threads
+            if is_thread_resolved {
+                let entity_unresolve = entity.clone();
+                let unresolve_cid = comment_id;
+                bar = bar.child(
+                    div()
+                        .id(ElementId::Name(format!("pr-collapsed-unresolve-{comment_idx}").into()))
+                        .px_2()
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(colors::accent()).bg(colors::surface_hover()))
+                        .child("Unresolve")
+                        .on_click(move |_, _window, cx| {
+                            entity_unresolve.update(cx, |panel, cx| {
+                                panel.toggle_resolve_thread(unresolve_cid, cx);
+                            });
+                        })
+                );
+            }
+
+            return bar;
+        }
 
         let mut bubble = div()
             .w_full()
@@ -2005,6 +2306,61 @@ impl PrDiffPanel {
                     .on_click(move |_, _window, cx| {
                         entity_reply.update(cx, |panel, cx| {
                             panel.start_reply(cid, comment_idx, cx);
+                        });
+                    }),
+            );
+        }
+
+        // Collapse button
+        {
+            let entity_collapse = entity.clone();
+            let collapse_cid = comment_id;
+            actions = actions.child(
+                div()
+                    .id(ElementId::Name(format!("pr-collapse-{comment_idx}").into()))
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors::accent()).bg(colors::surface_hover()))
+                    .child("Collapse")
+                    .on_click(move |_, _window, cx| {
+                        entity_collapse.update(cx, |panel, cx| {
+                            panel.collapsed_comments.insert(collapse_cid);
+                            panel.expanded_resolved.remove(&collapse_cid);
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        // Resolve / Unresolve button
+        let is_resolved = self.resolved_thread_ids.contains(&comment_id);
+        let has_thread_id = self.thread_node_ids.contains_key(&comment_id);
+        if has_thread_id {
+            let entity_resolve = entity.clone();
+            let resolve_cid = comment_id;
+            actions = actions.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("pr-resolve-{comment_idx}").into(),
+                    ))
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(if is_resolved { colors::accent() } else { colors::text_muted() })
+                    .cursor_pointer()
+                    .hover(|s| {
+                        s.text_color(colors::accent())
+                            .bg(colors::surface_hover())
+                    })
+                    .child(if is_resolved { "Unresolve" } else { "Resolve" })
+                    .on_click(move |_, _window, cx| {
+                        entity_resolve.update(cx, |panel, cx| {
+                            panel.toggle_resolve_thread(resolve_cid, cx);
                         });
                     }),
             );
@@ -2267,16 +2623,17 @@ impl Render for PrDiffPanel {
             .id("pr-diff-panel")
             .flex()
             .flex_col()
-            .w_full()
+            .size_full()
+            .min_w(px(0.0))
             .flex_1()
-            .h_full()
+            .overflow_hidden()
             .bg(colors::surface())
             .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_move.update(cx, |panel, cx| {
                     if panel.resizing_tree {
                         let delta = f32::from(event.position.x) - panel.tree_drag_start_x;
                         let new_w = (panel.tree_drag_start_width + delta)
-                            .clamp(40.0, panel.width - 40.0);
+                            .clamp(MIN_TREE_WIDTH, MAX_TREE_WIDTH);
                         panel.tree_width = new_w;
                         cx.notify();
                     }
@@ -2291,10 +2648,16 @@ impl Render for PrDiffPanel {
                             panel.resizing_tree = false;
                             changed = true;
                         }
-                        // Clear any abandoned comment drag
-                        if panel.comment_drag_start.is_some() {
-                            panel.comment_drag_start = None;
+                        // Finalize any in-progress comment drag (mouse-up may have
+                        // landed on a non-line row like a file header or collapse bar).
+                        if let Some((path, start_ln, drag_side)) = panel.comment_drag_start.take() {
+                            let end_ln = panel.comment_drag_end.unwrap_or(start_ln);
+                            let start = start_ln.min(end_ln);
+                            let end = start_ln.max(end_ln);
                             panel.comment_drag_end = None;
+                            panel.comment_drag_start_gli = None;
+                            panel.comment_drag_end_gli = None;
+                            panel.start_comment(path, start, end, drag_side, cx);
                             changed = true;
                         }
                         // End text selection and copy
@@ -2424,6 +2787,57 @@ impl Render for PrDiffPanel {
                 }),
         );
 
+        // "Copy all unresolved as prompt" button
+        let unresolved_count = self.unresolved_comment_count();
+        if unresolved_count > 0 {
+            let prompt_text = self.build_all_unresolved_prompt();
+            let entity_copy = cx.entity().clone();
+            let copy_key = "all-unresolved".to_string();
+            let is_copied = self.copied_prompt_key.as_deref() == Some("all-unresolved");
+            let label = if is_copied {
+                "Copied!".to_string()
+            } else {
+                format!("Copy {unresolved_count} unresolved as prompt")
+            };
+            header = header.child(
+                div()
+                    .id("pr-copy-all-unresolved")
+                    .ml_2()
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .hover(|s| {
+                        s.text_color(colors::accent())
+                            .bg(colors::surface_hover())
+                    })
+                    .child(label)
+                    .on_click(move |_, _window, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(prompt_text.clone()));
+                        entity_copy.update(cx, |panel, cx| {
+                            panel.copy_selecting = false;
+                            panel.copied_prompt_key = Some(copy_key.clone());
+                            panel._copied_comment_timer = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(1500))
+                                    .await;
+                                let _ = cx.update(|cx| {
+                                    let _ = this.update(cx, |panel, cx| {
+                                        panel.copied_prompt_key = None;
+                                        cx.notify();
+                                    });
+                                });
+                            }));
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
         panel = panel.child(header);
 
         // ── gh status hint (only shown after we've actually checked) ──
@@ -2503,6 +2917,8 @@ impl Render for PrDiffPanel {
             .flex()
             .flex_row()
             .flex_1()
+            .w_full()
+            .min_w(px(0.0))
             .overflow_hidden();
 
         // File tree sidebar
@@ -2511,7 +2927,7 @@ impl Render for PrDiffPanel {
             .flex()
             .flex_col()
             .w(px(tree_width))
-            .min_w(px(40.0))
+            .flex_shrink_0()
             .h_full()
             .border_r_1()
             .border_color(colors::border())
@@ -2559,7 +2975,8 @@ impl Render for PrDiffPanel {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(100.0))
+            .min_w(px(0.0))
+            .overflow_x_hidden()
             .px(px(16.0))
             .child(diff_list);
 

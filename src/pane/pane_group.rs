@@ -658,7 +658,7 @@ impl PaneGroup {
         // or when center doesn't have focus at all (right panel focused).
         let is_focused_pane = focused_group_id == Some(group_id);
         if !is_focused_pane && (has_splits || focused_group_id.is_none()) {
-            leaf = leaf.opacity(0.7);
+            leaf = leaf.opacity(0.85);
         }
 
         leaf.into_any_element()

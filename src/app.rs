@@ -1563,6 +1563,7 @@ impl Render for OperatorApp {
                             app.resizing_right_panel = true;
                             cx.notify();
                         });
+                        cx.stop_propagation();
                     }),
             );
 
@@ -1583,7 +1584,7 @@ impl Render for OperatorApp {
                 })
                 .child(rp);
             if !right_focused {
-                right_wrapper = right_wrapper.opacity(0.7);
+                right_wrapper = right_wrapper.opacity(0.85);
             }
             root = root.child(right_wrapper);
         }

@@ -894,7 +894,7 @@ impl GitDiffPanel {
         let (icon, icon_color) = if just_copied {
             ("\u{f00c}", colors::diff_added()) // nf-fa-check
         } else {
-            ("\u{eb8c}", colors::text_muted()) // nf-cod-copy
+            ("\u{f0c5}", colors::text_muted()) // nf-fa-copy
         };
         let path_for_copy = file.path.clone();
         let entity_copy = entity.clone();
@@ -1788,6 +1788,7 @@ impl Render for GitDiffPanel {
                         panel.tree_drag_start_width = panel.tree_width;
                         cx.notify();
                     });
+                    cx.stop_propagation();
                 }),
         );
 

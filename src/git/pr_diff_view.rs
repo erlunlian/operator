@@ -216,6 +216,16 @@ impl PrDiffPanel {
         }
     }
 
+    /// Estimate total heap bytes for all cached diff data.
+    pub fn estimated_bytes(&self) -> usize {
+        self.diff_files.iter().map(|f| f.estimated_bytes()).sum()
+    }
+
+    /// Number of cached diff files.
+    pub fn file_count(&self) -> usize {
+        self.diff_files.len()
+    }
+
     #[allow(dead_code)]
     pub fn git_dir(&self) -> Option<PathBuf> {
         self.repo.as_ref().map(|r| r.git_dir())
@@ -791,8 +801,15 @@ impl PrDiffPanel {
     }
 
     /// Flatten a file's hunks into renderable segments.
+    /// Flatten a file's hunks into renderable segments.
+    ///
+    /// When `source_lines` is available, expanding context can reach beyond hunk
+    /// boundaries and inter-hunk gaps are shown as collapsible bars.
     fn flatten_file_lines(&self, file: &DiffFile, file_idx: usize) -> Vec<LineSegment> {
+        let source = file.source_lines.as_deref();
+        let total_source = source.map(|s| s.len()).unwrap_or(0);
         let mut segments: Vec<LineSegment> = Vec::new();
+        let mut last_shown_ln: usize = 0;
 
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             let lines = &hunk.lines;
@@ -806,6 +823,9 @@ impl PrDiffPanel {
                 .copied()
                 .unwrap_or((0, 0));
 
+            let hunk_start_ln = lines.iter().find_map(|l| l.new_lineno).unwrap_or(1) as usize;
+            let hunk_end_ln = lines.iter().rev().find_map(|l| l.new_lineno).unwrap_or(1) as usize;
+
             let change_indices: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -814,37 +834,142 @@ impl PrDiffPanel {
                 .collect();
 
             if change_indices.is_empty() {
-                segments.push(LineSegment::CollapsedContext {
-                    count: lines.len(),
-                    hunk_idx,
-                    direction: ExpandDirection::Top,
-                });
+                if source.is_some() {
+                    let hidden = hunk_end_ln.saturating_sub(last_shown_ln);
+                    if hidden > 0 {
+                        segments.push(LineSegment::CollapsedContext {
+                            count: hidden,
+                            hunk_idx,
+                            direction: ExpandDirection::Top,
+                        });
+                    }
+                    last_shown_ln = hunk_end_ln;
+                } else {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: lines.len(),
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
                 continue;
             }
 
             let first_change = *change_indices.first().unwrap();
             let last_change = *change_indices.last().unwrap();
 
-            let visible_start = first_change.saturating_sub(DEFAULT_CONTEXT + extra_top);
-            let visible_end = (last_change + DEFAULT_CONTEXT + extra_bottom + 1).min(lines.len());
+            let hunk_vis_start = first_change.saturating_sub(DEFAULT_CONTEXT + extra_top);
+            let hunk_vis_end = (last_change + DEFAULT_CONTEXT + extra_bottom + 1).min(lines.len());
 
-            if visible_start > 0 {
-                segments.push(LineSegment::CollapsedContext {
-                    count: visible_start,
-                    hunk_idx,
-                    direction: ExpandDirection::Top,
-                });
+            let overflow_top = (DEFAULT_CONTEXT + extra_top).saturating_sub(first_change);
+            let hunk_bottom_ctx = lines.len().saturating_sub(last_change + 1);
+            let overflow_bottom = (DEFAULT_CONTEXT + extra_bottom).saturating_sub(hunk_bottom_ctx);
+
+            if let Some(source) = source {
+                let source_top_ln = if overflow_top > 0 {
+                    hunk_start_ln
+                        .saturating_sub(overflow_top)
+                        .max(last_shown_ln + 1)
+                        .max(1)
+                } else {
+                    hunk_start_ln
+                };
+
+                let gap = source_top_ln.saturating_sub(last_shown_ln + 1);
+                if gap > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: gap,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+
+                if overflow_top > 0 {
+                    for ln in source_top_ln..hunk_start_ln {
+                        let idx = ln - 1;
+                        if let Some(sl) = source.get(idx) {
+                            segments.push(LineSegment::Line(DiffLine {
+                                kind: DiffLineKind::Context,
+                                content: sl.content.clone(),
+                                old_lineno: None,
+                                new_lineno: Some(ln as u32),
+                                highlights: sl.highlights.clone(),
+                            }));
+                        }
+                    }
+                }
+
+                if hunk_vis_start > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hunk_vis_start,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+
+                for line in &lines[hunk_vis_start..hunk_vis_end] {
+                    segments.push(LineSegment::Line(line.clone()));
+                }
+
+                let hidden_in_hunk_below = lines.len().saturating_sub(hunk_vis_end);
+                if hidden_in_hunk_below > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hidden_in_hunk_below,
+                        hunk_idx,
+                        direction: ExpandDirection::Bottom,
+                    });
+                }
+
+                let source_bottom_ln = if overflow_bottom > 0 {
+                    (hunk_end_ln + overflow_bottom).min(total_source)
+                } else {
+                    hunk_end_ln
+                };
+                if overflow_bottom > 0 {
+                    for ln in (hunk_end_ln + 1)..=source_bottom_ln {
+                        let idx = ln - 1;
+                        if let Some(sl) = source.get(idx) {
+                            segments.push(LineSegment::Line(DiffLine {
+                                kind: DiffLineKind::Context,
+                                content: sl.content.clone(),
+                                old_lineno: None,
+                                new_lineno: Some(ln as u32),
+                                highlights: sl.highlights.clone(),
+                            }));
+                        }
+                    }
+                }
+
+                last_shown_ln = source_bottom_ln;
+            } else {
+                if hunk_vis_start > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hunk_vis_start,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+
+                for line in &lines[hunk_vis_start..hunk_vis_end] {
+                    segments.push(LineSegment::Line(line.clone()));
+                }
+
+                let hidden_below = lines.len().saturating_sub(hunk_vis_end);
+                if hidden_below > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hidden_below,
+                        hunk_idx,
+                        direction: ExpandDirection::Bottom,
+                    });
+                }
             }
+        }
 
-            for line in &lines[visible_start..visible_end] {
-                segments.push(LineSegment::Line(line.clone()));
-            }
-
-            let hidden_below = lines.len().saturating_sub(visible_end);
-            if hidden_below > 0 {
+        if source.is_some() && total_source > last_shown_ln && !file.hunks.is_empty() {
+            let remaining = total_source - last_shown_ln;
+            if remaining > 0 {
                 segments.push(LineSegment::CollapsedContext {
-                    count: hidden_below,
-                    hunk_idx,
+                    count: remaining,
+                    hunk_idx: file.hunks.len() - 1,
                     direction: ExpandDirection::Bottom,
                 });
             }
@@ -933,8 +1058,9 @@ impl PrDiffPanel {
                             .flex()
                             .flex_row()
                             .items_center()
+                            .justify_center()
                             .w_full()
-                            .h(px(26.0))
+                            .h(px(22.0))
                             .bg(collapse_bar_bg())
                             .border_t_1()
                             .border_b_1()
@@ -956,19 +1082,6 @@ impl PrDiffPanel {
                             })
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .w(px(32.0))
-                                    .flex_shrink_0()
-                                    .text_color(colors::text_muted())
-                                    .text_xs()
-                                    .child("\u{25BC}")
-                                    .child("\u{25B2}"),
-                            )
-                            .child(
-                                div()
-                                    .ml_1()
                                     .text_xs()
                                     .text_color(colors::text_muted())
                                     .child(label),

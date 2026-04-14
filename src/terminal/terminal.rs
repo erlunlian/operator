@@ -219,21 +219,24 @@ impl TerminalModel {
                     cursor.line.0.hash(&mut hasher);
                     cursor.column.0.hash(&mut hasher);
 
-                    // Hash ALL visible lines for accurate change detection
-                    let mut bottom_lines: Vec<String> = Vec::new();
+                    // Hash all visible cells and collect bottom lines for Claude status detection.
+                    // Reuse a single String buffer across lines to avoid per-line allocations.
+                    let bottom_start = screen_lines.saturating_sub(8);
+                    let mut bottom_lines: Vec<String> = Vec::with_capacity(8);
+                    let mut line_buf = String::with_capacity(cols);
                     for line_idx in 0..screen_lines {
                         let row = &grid[alacritty_terminal::index::Line(line_idx as i32)];
-                        let mut line_text_full = String::new();
+                        let need_text = line_idx >= bottom_start;
+                        if need_text { line_buf.clear(); }
                         for col_idx in 0..cols {
                             let cell = &row[alacritty_terminal::index::Column(col_idx)];
                             cell.c.hash(&mut hasher);
-                            if cell.c != '\0' {
-                                line_text_full.push(cell.c);
+                            if need_text && cell.c != '\0' {
+                                line_buf.push(cell.c);
                             }
                         }
-                        // Collect bottom lines (with spaces) for Claude status detection
-                        if line_idx >= screen_lines.saturating_sub(8) {
-                            let trimmed = line_text_full.trim();
+                        if need_text {
+                            let trimmed = line_buf.trim();
                             if !trimmed.is_empty() {
                                 bottom_lines.push(trimmed.to_string());
                             }
@@ -322,6 +325,27 @@ impl TerminalModel {
     /// Clear the unread flag — called when the user focuses on this terminal's tab.
     pub fn mark_claude_as_read(&self) {
         *self.has_unread_response.lock().unwrap() = false;
+    }
+
+    /// Estimate the memory used by this terminal's grid (screen + scrollback).
+    /// Returns (total_bytes, total_lines, columns).
+    pub fn estimated_grid_bytes(&self) -> (usize, usize, usize) {
+        use alacritty_terminal::grid::Dimensions;
+        let term = self.term.lock();
+        let total_lines = term.grid().total_lines();
+        let cols = term.grid().columns();
+        // 24 bytes per Cell (asserted by alacritty_terminal)
+        let bytes = total_lines * cols * 24;
+        (bytes, total_lines, cols)
+    }
+}
+
+impl Drop for TerminalModel {
+    fn drop(&mut self) {
+        // Tell the event loop (and its PTY reader thread) to shut down.
+        // Without this, the thread keeps running and holds the Arc<Term>
+        // (with all its scrollback history) alive indefinitely.
+        let _ = self.event_loop_sender.send(Msg::Shutdown);
     }
 }
 

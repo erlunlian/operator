@@ -7,6 +7,7 @@ extern crate objc;
 mod actions;
 mod app;
 mod command_center;
+mod debug;
 mod editor;
 mod git;
 mod pane;
@@ -99,6 +100,7 @@ fn main() {
             KeyBinding::new("cmd-w", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
             KeyBinding::new("escape", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("ctrl-shift-d", ToggleDebugPanel, None),
         ]);
 
 

@@ -21,5 +21,6 @@ actions!(
         FindInFile,
         SearchWorkspace,
         Quit,
+        ToggleDebugPanel,
     ]
 );

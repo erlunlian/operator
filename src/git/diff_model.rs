@@ -31,14 +31,63 @@ pub enum FileStatus {
     Renamed,
 }
 
+/// A line from the full source file with precomputed syntax highlights.
+#[derive(Clone)]
+pub struct SourceLine {
+    pub content: String,
+    pub highlights: Option<Vec<HighlightSpan>>,
+}
+
 #[derive(Clone)]
 pub struct DiffFile {
     pub path: String,
     pub status: FileStatus,
     pub hunks: Vec<DiffHunk>,
+    /// Full new-side file content split into lines, with precomputed highlights.
+    /// Used for correct multiline syntax highlighting and expanding context
+    /// beyond hunk boundaries.
+    pub source_lines: Option<Vec<SourceLine>>,
+}
+
+impl SourceLine {
+    /// Estimate heap bytes used by this source line.
+    pub fn estimated_bytes(&self) -> usize {
+        self.content.capacity()
+            + self
+                .highlights
+                .as_ref()
+                .map(|v| v.capacity() * std::mem::size_of::<HighlightSpan>())
+                .unwrap_or(0)
+    }
+}
+
+impl DiffLine {
+    /// Estimate heap bytes used by this diff line.
+    pub fn estimated_bytes(&self) -> usize {
+        self.content.capacity()
+            + self
+                .highlights
+                .as_ref()
+                .map(|v| v.capacity() * std::mem::size_of::<HighlightSpan>())
+                .unwrap_or(0)
+    }
 }
 
 impl DiffFile {
+    /// Estimate total heap bytes used by this file's diff data.
+    pub fn estimated_bytes(&self) -> usize {
+        let hunks: usize = self.hunks.iter().map(|h| {
+            h._header.capacity()
+                + h.lines.iter().map(|l| l.estimated_bytes()).sum::<usize>()
+        }).sum();
+        let source_lines: usize = self
+            .source_lines
+            .as_ref()
+            .map(|sl| sl.iter().map(|l| l.estimated_bytes()).sum())
+            .unwrap_or(0);
+        self.path.capacity() + hunks + source_lines
+    }
+
     /// Count added lines across all hunks.
     pub fn additions(&self) -> usize {
         self.hunks

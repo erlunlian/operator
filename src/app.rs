@@ -4,6 +4,8 @@ use std::rc::Rc;
 
 use crate::actions::*;
 use crate::command_center::{CommandAction, CommandCenter};
+use crate::debug::DebugPanel;
+use crate::debug::metrics::SubsystemMetrics;
 use crate::git::{GitDiffPanel, PrDiffPanel};
 use crate::recent_projects::RecentProjects;
 use crate::right_panel::{RightPanel, RightPanelTab};
@@ -44,6 +46,13 @@ pub struct OperatorApp {
     quit_requested: bool,
     /// Drop indicator index for workspace sidebar drag reorder.
     ws_drop_index: Option<usize>,
+    /// Handle to the current diff file-watcher task. Dropped (cancelled) before
+    /// starting a new watcher so old watchers don't accumulate.
+    diff_watcher_task: Option<Task<()>>,
+    /// Debug overlay showing live process metrics.
+    debug_panel: Entity<DebugPanel>,
+    /// Background task that periodically logs metrics to stderr.
+    _metrics_log_task: Task<()>,
 }
 
 impl OperatorApp {
@@ -63,7 +72,9 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
-        Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let diff_watcher_task = Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let debug_panel = cx.new(|cx| DebugPanel::new(cx));
+        let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
         Self {
@@ -85,6 +96,9 @@ impl OperatorApp {
             recent_projects: RecentProjects::load(),
             quit_requested: false,
             ws_drop_index: None,
+            diff_watcher_task,
+            debug_panel,
+            _metrics_log_task: metrics_log_task,
         }
     }
 
@@ -119,7 +133,9 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
-        Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let diff_watcher_task = Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let debug_panel = cx.new(|cx| DebugPanel::new(cx));
+        let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
         Self {
@@ -141,6 +157,9 @@ impl OperatorApp {
             recent_projects: RecentProjects::load(),
             quit_requested: false,
             ws_drop_index: None,
+            diff_watcher_task,
+            debug_panel,
+            _metrics_log_task: metrics_log_task,
         }
     }
 
@@ -173,15 +192,115 @@ impl OperatorApp {
         .detach();
     }
 
-    fn start_diff_watcher_from_right_panel(right_panel: Entity<RightPanel>, cx: &mut Context<Self>) {
-        let diff_panel = right_panel.read(cx).diff_panel.clone();
-        Self::start_diff_watcher(diff_panel, cx);
+    /// Count total terminal tabs across all workspaces.
+    fn count_terminals(&self, cx: &App) -> usize {
+        self.workspaces
+            .iter()
+            .map(|ws| {
+                let ws = ws.read(cx);
+                ws.layout
+                    .as_ref()
+                    .map(|pg| {
+                        crate::pane::pane_group::count_total_tabs(&pg.read(cx).root)
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
-    fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) {
+    /// Collect per-subsystem memory metrics from the app state.
+    fn collect_subsystem_metrics(&self, cx: &App) -> SubsystemMetrics {
+        use crate::pane::pane_group::collect_all_tabs;
+        use crate::tab::tab::TabContent;
+
+        let mut sub = SubsystemMetrics::default();
+
+        // Terminal grid memory across all workspaces
+        for ws in &self.workspaces {
+            let ws = ws.read(cx);
+            if let Some(pg) = &ws.layout {
+                let tabs = collect_all_tabs(&pg.read(cx).root);
+                for tab in tabs {
+                    let tab = tab.read(cx);
+                    if let TabContent::Terminal(tv) = &tab.content {
+                        let tm = tv.read(cx).terminal.read(cx);
+                        let (bytes, lines, cols) = tm.estimated_grid_bytes();
+                        sub.terminal_grid_bytes += bytes;
+                        sub.terminal_details.push((lines, cols, bytes));
+                    }
+                }
+            }
+        }
+
+        // Git diff panel
+        let rp = self.right_panel.read(cx);
+        let dp = rp.diff_panel.read(cx);
+        sub.git_diff_bytes = dp.estimated_bytes();
+        sub.git_diff_files = dp.file_count();
+
+        // PR diff panel
+        let pr = rp.pr_diff_panel.read(cx);
+        sub.pr_diff_bytes = pr.estimated_bytes();
+        sub.pr_diff_files = pr.file_count();
+
+        sub
+    }
+
+    /// Spawn a background task that logs metrics to stderr every 30 seconds.
+    fn start_metrics_logging(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_spawn(async {
+                    smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                })
+                .await;
+
+                let data = this
+                    .read_with(cx, |app, cx| {
+                        let tc = app.count_terminals(cx);
+                        let wc = app.workspaces.len();
+                        let sub = app.collect_subsystem_metrics(cx);
+                        (tc, wc, sub)
+                    })
+                    .ok();
+
+                if let Some((tc, wc, sub)) = data {
+                    let m = crate::debug::ProcessMetrics::collect(tc, wc, sub);
+                    log::info!(
+                        "[perf] rss={} threads={} terminals={} grid_mem={} git_diff={} ({} files) pr_diff={} ({} files) tracked={} untracked={} workspaces={}",
+                        m.resident_display(),
+                        m.thread_count,
+                        m.terminal_count,
+                        crate::debug::metrics::format_bytes(m.subsystems.terminal_grid_bytes as u64),
+                        crate::debug::metrics::format_bytes(m.subsystems.git_diff_bytes as u64),
+                        m.subsystems.git_diff_files,
+                        crate::debug::metrics::format_bytes(m.subsystems.pr_diff_bytes as u64),
+                        m.subsystems.pr_diff_files,
+                        crate::debug::metrics::format_bytes(m.tracked_total() as u64),
+                        crate::debug::metrics::format_bytes(m.untracked_bytes()),
+                        m.workspace_count,
+                    );
+                    // Log per-terminal details at debug level
+                    for (i, (lines, cols, bytes)) in m.subsystems.terminal_details.iter().enumerate() {
+                        log::debug!(
+                            "[perf]   terminal[{i}]: {lines} lines x {cols} cols = {}",
+                            crate::debug::metrics::format_bytes(*bytes as u64),
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    fn start_diff_watcher_from_right_panel(right_panel: Entity<RightPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let diff_panel = right_panel.read(cx).diff_panel.clone();
+        Self::start_diff_watcher(diff_panel, cx)
+    }
+
+    fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
         // Get the .git directory to watch
         let git_dir = diff_panel.read(cx).git_dir();
-        let Some(git_dir) = git_dir else { return };
+        let Some(git_dir) = git_dir else { return None };
 
         // Create a channel-based file watcher using the `notify` crate.
         // We watch the .git dir for changes to index, HEAD, refs, etc.
@@ -203,7 +322,7 @@ impl OperatorApp {
             },
         ) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
         // Watch the .git directory (index, HEAD, refs changes)
@@ -213,7 +332,7 @@ impl OperatorApp {
         // Spawn a background thread that blocks on the watcher channel,
         // then pokes the UI when something changes.
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        cx.spawn(async move |_app, cx| {
+        let task = cx.spawn(async move |_app, cx| {
             // Keep the watcher alive for the lifetime of this task
             let _watcher = watcher;
             loop {
@@ -251,8 +370,8 @@ impl OperatorApp {
                     break;
                 }
             }
-        })
-        .detach();
+        });
+        Some(task)
     }
 
     pub fn active_workspace(&self) -> &Entity<Workspace> {
@@ -264,6 +383,9 @@ impl OperatorApp {
         self.cache_editor_files(cx);
         self.workspaces.remove(self.active_workspace_ix);
         if self.workspaces.is_empty() {
+            // Stop the file watcher — no workspace means no .git dir to watch
+            self.diff_watcher_task = None;
+
             // Instead of quitting, create a fresh uninitialized workspace
             let ws = cx.new(|cx| Workspace::new_empty(cx));
             cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
@@ -651,6 +773,19 @@ impl OperatorApp {
         }
     }
 
+    fn toggle_debug_panel(
+        &mut self,
+        _: &ToggleDebugPanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.debug_panel.update(cx, |panel, cx| {
+            panel.toggle();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn request_quit(
         &mut self,
         _: &Quit,
@@ -900,6 +1035,9 @@ impl OperatorApp {
 
     /// Point the right panel at a new working directory and restart the file watcher.
     fn update_right_panel_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        // Drop the old watcher task so it stops watching the previous .git dir
+        self.diff_watcher_task = None;
+
         self.right_panel.update(cx, |rp, cx| {
             rp.diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
@@ -916,7 +1054,7 @@ impl OperatorApp {
             rp.set_directory(dir, cx);
         });
         let diff_panel = self.right_panel.read(cx).diff_panel.clone();
-        Self::start_diff_watcher(diff_panel, cx);
+        self.diff_watcher_task = Self::start_diff_watcher(diff_panel, cx);
     }
 
     /// Open the OS directory picker and set directory on the active workspace.
@@ -1329,6 +1467,7 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_command_center))
             .on_action(cx.listener(Self::find_file))
             .on_action(cx.listener(Self::search_workspace))
+            .on_action(cx.listener(Self::toggle_debug_panel))
             .on_action(cx.listener(Self::request_quit))
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 app_resize_move.update(cx, |app, cx| {
@@ -1523,6 +1662,20 @@ impl Render for OperatorApp {
                         .child("\u{F06FE}"), // nf-cod-layout_sidebar_right
                 ),
         );
+
+        // Debug overlay (update counts and subsystem data only when visible)
+        {
+            let visible = self.debug_panel.read(cx).visible;
+            if visible {
+                let tc = self.count_terminals(cx);
+                let wc = self.workspaces.len();
+                let sub = self.collect_subsystem_metrics(cx);
+                self.debug_panel.update(cx, |panel, _cx| {
+                    panel.update_subsystems(tc, wc, sub);
+                });
+            }
+            root = root.child(self.debug_panel.clone());
+        }
 
         // Quit confirmation dialog
         if self.quit_requested {

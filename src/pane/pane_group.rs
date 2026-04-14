@@ -1143,6 +1143,16 @@ pub fn count_total_tabs(node: &SplitNode) -> usize {
     }
 }
 
+/// Collect all tab entities from the tree.
+pub fn collect_all_tabs(node: &SplitNode) -> Vec<Entity<Tab>> {
+    match node {
+        SplitNode::Leaf(group) => group.tabs.clone(),
+        SplitNode::Split { children, .. } => {
+            children.iter().flat_map(collect_all_tabs).collect()
+        }
+    }
+}
+
 /// Remove empty leaf nodes from the tree and simplify single-child splits.
 fn prune_empty_leaves(node: &mut SplitNode) {
     if let SplitNode::Split {

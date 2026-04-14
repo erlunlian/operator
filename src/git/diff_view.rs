@@ -76,7 +76,7 @@ pub struct GitDiffPanel {
     tree_drag_start_x: f32,
     /// Tree width at drag start.
     tree_drag_start_width: f32,
-    scroll_handle: UniformListScrollHandle,
+    list_state: ListState,
     /// Which file just had its path copied (shows checkmark briefly).
     copied_file_key: Option<(DiffSection, usize)>,
     /// Timer handle to clear the copied indicator.
@@ -97,7 +97,7 @@ pub struct GitDiffPanel {
     // Virtual scroll cache
     /// Pre-flattened line segments per file (indexed by file_idx within active section).
     cached_file_segments: Vec<Vec<LineSegment>>,
-    /// Flat row descriptors for the uniform_list.
+    /// Flat row descriptors for the list.
     flat_rows: Vec<FlatRow>,
     /// file_idx → index of its FileHeader row in flat_rows.
     flat_file_starts: Vec<usize>,
@@ -135,7 +135,7 @@ impl GitDiffPanel {
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
-            scroll_handle: UniformListScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             copied_file_key: None,
             _copied_timer: None,
             scroll_to_file: None,
@@ -190,7 +190,7 @@ impl GitDiffPanel {
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
-            scroll_handle: UniformListScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             copied_file_key: None,
             _copied_timer: None,
             scroll_to_file: None,
@@ -816,10 +816,11 @@ impl GitDiffPanel {
 
         self.cached_file_segments = all_segments;
         self.copy_line_contents = copy_texts;
+        self.list_state.reset(self.flat_rows.len());
         self.flat_cache_dirty = false;
     }
 
-    /// Render a single flat row. Called from the uniform_list callback.
+    /// Render a single flat row. Called from the list callback.
     fn render_flat_row(&self, row_idx: usize, entity: &Entity<Self>) -> AnyElement {
         match &self.flat_rows[row_idx] {
             FlatRow::FileHeader { file_idx } => self.render_file_header(*file_idx, entity),
@@ -1773,24 +1774,19 @@ impl Render for GitDiffPanel {
                 }),
         );
 
-        // Diff content — virtualized with uniform_list
-        let row_count = self.flat_rows.len();
+        // Diff content — virtualized with list (supports variable row heights)
         let entity_list = cx.entity().clone();
 
-        let diff_content = uniform_list(
-            "diff-content",
-            row_count,
-            move |range, _window, cx| {
+        let diff_content = list(
+            self.list_state.clone(),
+            move |ix, _window, cx| {
                 let panel = entity_list.read(cx);
-                range
-                    .map(|ix| panel.render_flat_row(ix, &entity_list))
-                    .collect()
+                panel.render_flat_row(ix, &entity_list)
             },
         )
         .flex_1()
         .min_w(px(100.0))
-        .p_2()
-        .track_scroll(self.scroll_handle.clone());
+        .p_2();
 
         // Auto-load more files if there are un-rendered files
         let render_limit = self.rendered_file_limit.min(self.active_files().len());
@@ -1818,7 +1814,7 @@ impl Render for GitDiffPanel {
         // Handle scroll-to-file: convert file_idx to flat row index
         if let Some(target_file) = self.scroll_to_file.take() {
             if let Some(&row_idx) = self.flat_file_starts.get(target_file) {
-                self.scroll_handle.scroll_to_item(row_idx, ScrollStrategy::Top);
+                self.list_state.scroll_to_reveal_item(row_idx);
             }
         }
 

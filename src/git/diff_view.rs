@@ -889,9 +889,9 @@ impl GitDiffPanel {
         let entity_hdr = entity.clone();
         let just_copied = self.copied_file_key == Some(file_key);
         let (icon, icon_color) = if just_copied {
-            ("\u{2713}", colors::diff_added())
+            ("\u{f00c}", colors::diff_added()) // nf-fa-check
         } else {
-            ("\u{2750}", colors::text_muted())
+            ("\u{eb8c}", colors::text_muted()) // nf-cod-copy
         };
         let path_for_copy = file.path.clone();
         let entity_copy = entity.clone();
@@ -981,7 +981,13 @@ impl GitDiffPanel {
                             .text_color(colors::text())
                             .child(file_path),
                     )
-                    .child(div().text_color(icon_color).child(icon))
+                    .child(
+                        div()
+                            .text_color(icon_color)
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(11.0))
+                            .child(icon),
+                    )
             })
             // Spacer
             .child(div().flex_1())
@@ -1787,7 +1793,7 @@ impl Render for GitDiffPanel {
         )
         .flex_1()
         .min_w(px(100.0))
-        .p_2();
+        .p_3();
 
         // Auto-load more files if there are un-rendered files
         let render_limit = self.rendered_file_limit.min(self.active_files().len());

@@ -132,6 +132,16 @@ pub struct PrDiffPanel {
     flat_file_starts: Vec<usize>,
     /// Whether the flat cache needs rebuilding before next render.
     flat_cache_dirty: bool,
+
+    // Reply to existing comment thread
+    /// The comment ID we're replying to, and the index in pr_comments.
+    reply_to: Option<(u64, usize)>,
+    reply_input: Option<Entity<TextInput>>,
+    submitting_reply: bool,
+
+    // "Copy as prompt" feedback — key identifies which button was clicked
+    copied_prompt_key: Option<String>,
+    _copied_comment_timer: Option<Task<()>>,
 }
 
 impl PrDiffPanel {
@@ -174,6 +184,11 @@ impl PrDiffPanel {
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
+            reply_to: None,
+            reply_input: None,
+            submitting_reply: false,
+            copied_prompt_key: None,
+            _copied_comment_timer: None,
         }
     }
 
@@ -231,6 +246,11 @@ impl PrDiffPanel {
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
+            reply_to: None,
+            reply_input: None,
+            submitting_reply: false,
+            copied_prompt_key: None,
+            _copied_comment_timer: None,
         }
     }
 
@@ -452,6 +472,71 @@ impl PrDiffPanel {
                             panel.pr_comments.push(comment);
                             panel.active_comment_line = None;
                             panel.comment_input = None;
+                        }
+                        Err(_) => {
+                            // Keep the input open so user can retry
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn start_reply(&mut self, comment_id: u64, comment_idx: usize, cx: &mut Context<Self>) {
+        let entity = cx.entity().clone();
+        let input = cx.new(|cx| {
+            let mut ti = TextInput::new(cx);
+            ti.set_placeholder("Write a reply...");
+            let entity_submit = entity.clone();
+            ti.set_on_submit(Rc::new(move |text, _window, cx| {
+                if !text.trim().is_empty() {
+                    let text = text.to_string();
+                    let _ = entity_submit.update(cx, |panel, cx| {
+                        panel.submit_reply(text, cx);
+                    });
+                }
+            }));
+            ti.set_on_cancel(Rc::new(move |_window, cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    panel.reply_to = None;
+                    panel.reply_input = None;
+                    cx.notify();
+                });
+            }));
+            ti
+        });
+        self.reply_to = Some((comment_id, comment_idx));
+        self.reply_input = Some(input);
+        cx.notify();
+    }
+
+    fn submit_reply(&mut self, body: String, cx: &mut Context<Self>) {
+        let Some(work_dir) = self.work_dir.clone() else { return };
+        let Some(ref pr_info) = self.pr_info else { return };
+        let Some((comment_id, _)) = self.reply_to else { return };
+
+        let pr_number = pr_info.number;
+        self.submitting_reply = true;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    github::reply_to_comment(&work_dir, pr_number, comment_id, &body)
+                })
+                .await;
+
+            let _ = cx.update(|cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    panel.submitting_reply = false;
+                    match result {
+                        Ok(comment) => {
+                            panel.pr_comments.push(comment);
+                            panel.reply_to = None;
+                            panel.reply_input = None;
                         }
                         Err(_) => {
                             // Keep the input open so user can retry
@@ -996,6 +1081,12 @@ impl PrDiffPanel {
 
         let line_num_str = line_num.map(|n| format!("{n}")).unwrap_or_default();
         let content = line.content.trim_end();
+        let line_selected = self.is_line_selected(global_line_idx);
+        let text_bg = if line_selected {
+            rgba(0x89b4fa30)
+        } else {
+            rgba(0x00000000)
+        };
 
         // Syntax highlighted content
         let content_el: AnyElement = if let Some(highlights) = line.highlights.as_ref() {
@@ -1003,6 +1094,7 @@ impl PrDiffPanel {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
+                    .bg(text_bg)
                     .text_color(text_col)
                     .pl(px(4.0))
                     .child(content.to_string())
@@ -1030,6 +1122,7 @@ impl PrDiffPanel {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
+                    .bg(text_bg)
                     .text_color(text_col)
                     .pl(px(4.0))
                     .child(styled)
@@ -1039,6 +1132,7 @@ impl PrDiffPanel {
             div()
                 .flex_1()
                 .min_w(px(0.0))
+                .bg(text_bg)
                 .text_color(text_col)
                 .pl(px(4.0))
                 .child(content.to_string())
@@ -1056,18 +1150,21 @@ impl PrDiffPanel {
             let path_down = file_path.to_string();
             let path_up = file_path.to_string();
 
-            let in_drag = self
-                .comment_drag_start
-                .as_ref()
-                .map_or(false, |(p, start, _)| {
-                    if p != file_path {
-                        return false;
-                    }
-                    let end = self.comment_drag_end.unwrap_or(*start);
-                    let lo = (*start).min(end);
-                    let hi = (*start).max(end);
-                    ln >= lo && ln <= hi
-                });
+            // Check if this line is within a drag selection or active comment range
+            let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, _)| {
+                if p != file_path { return false; }
+                let end = self.comment_drag_end.unwrap_or(*start);
+                let lo = (*start).min(end);
+                let hi = (*start).max(end);
+                ln >= lo && ln <= hi
+            });
+            let in_active = self.active_comment_line.as_ref().map_or(false, |(p, start, end, _)| {
+                if p != file_path { return false; }
+                let lo = (*start).min(*end);
+                let hi = (*start).max(*end);
+                ln >= lo && ln <= hi
+            });
+            let gutter_highlight = in_drag || in_active;
 
             div()
                 .id(ElementId::Name(
@@ -1082,15 +1179,11 @@ impl PrDiffPanel {
                 .text_size(px(11.0))
                 .text_color(colors::accent())
                 .cursor_pointer()
-                .bg(if in_drag {
-                    rgba(0x89b4fa30)
-                } else {
-                    gutter_bg_color
-                })
+                .bg(if gutter_highlight { rgba(0xf9e2af40) } else { gutter_bg_color })
                 .opacity(0.0)
-                .when(in_drag, |d: Stateful<Div>| d.opacity(1.0))
-                .group_hover("pr-diff-line", |s| s.opacity(1.0))
-                .hover(|s| s.bg(rgba(0x89b4fa20)))
+                .when(gutter_highlight, |d: Stateful<Div>| d.opacity(1.0))
+                .group_hover("pr-diff-line", |s| s.opacity(1.0).bg(rgba(0x89b4fa30)).text_color(colors::accent()))
+                .hover(|s| s.bg(rgba(0x89b4fa40)))
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                     let path = path_down.clone();
                     entity_down.update(cx, |panel, cx| {
@@ -1136,35 +1229,38 @@ impl PrDiffPanel {
                 .into_any_element()
         };
 
-        // Drag highlight
-        let in_drag = self
-            .comment_drag_start
-            .as_ref()
-            .map_or(false, |(p, start, _)| {
-                if p != file_path {
-                    return false;
-                }
-                if let Some(ln) = line_num {
-                    let end = self.comment_drag_end.unwrap_or(*start);
-                    let lo = (*start).min(end);
-                    let hi = (*start).max(end);
-                    ln >= lo && ln <= hi
-                } else {
-                    false
-                }
-            });
-        let drag_highlight = if in_drag { rgba(0x89b4fa15) } else { row_bg };
+        // Check if this line is within an active drag selection (for row highlight)
+        let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, _)| {
+            if p != file_path { return false; }
+            if let Some(ln) = line_num {
+                let end = self.comment_drag_end.unwrap_or(*start);
+                let lo = (*start).min(end);
+                let hi = (*start).max(end);
+                ln >= lo && ln <= hi
+            } else {
+                false
+            }
+        });
 
-        // Selection highlight
-        let line_selected = self.is_line_selected(global_line_idx);
-        let final_bg = if line_selected {
-            rgba(0x89b4fa30)
-        } else {
-            drag_highlight
-        };
+        // Also highlight lines within the active comment range (after drag completes)
+        let in_active_comment = self.active_comment_line.as_ref().map_or(false, |(p, start, end, _)| {
+            if p != file_path { return false; }
+            if let Some(ln) = line_num {
+                let lo = (*start).min(*end);
+                let hi = (*start).max(*end);
+                ln >= lo && ln <= hi
+            } else {
+                false
+            }
+        });
 
+        let drag_highlight = if in_drag || in_active_comment { rgba(0xf9e2af30) } else { row_bg };
+
+        // Mouse handlers for line selection and comment drag
         let entity_sel_down = entity.clone();
         let entity_sel_move = entity.clone();
+        let entity_row_up = entity.clone();
+        let row_path = file_path.to_string();
         let gli = global_line_idx;
 
         let line_row = div()
@@ -1173,7 +1269,7 @@ impl PrDiffPanel {
             .flex_row()
             .w_full()
             .min_h(px(20.0))
-            .bg(final_bg)
+            .bg(drag_highlight)
             .font_family("Menlo")
             .text_xs()
             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
@@ -1186,11 +1282,39 @@ impl PrDiffPanel {
             })
             .on_mouse_move(move |_, _window, cx| {
                 entity_sel_move.update(cx, |panel, cx| {
+                    let mut changed = false;
                     if panel.copy_selecting && panel.copy_end_line != Some(gli) {
                         panel.copy_end_line = Some(gli);
+                        changed = true;
+                    }
+                    // Track comment drag across the whole row, not just the "+" button
+                    if let Some(ln) = line_num {
+                        if panel.comment_drag_start.is_some() && panel.comment_drag_end != Some(ln) {
+                            panel.comment_drag_end = Some(ln);
+                            changed = true;
+                        }
+                    }
+                    if changed {
                         cx.notify();
                     }
                 });
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let path = row_path.clone();
+                move |_, _window, cx| {
+                    if let Some(ln) = line_num {
+                        entity_row_up.update(cx, |panel, cx| {
+                            if let Some((ref drag_path, start_ln, drag_side)) = panel.comment_drag_start.take() {
+                                if drag_path == &path {
+                                    let start = start_ln.min(ln);
+                                    let end = start_ln.max(ln);
+                                    panel.comment_drag_end = None;
+                                    panel.start_comment(path.clone(), start, end, drag_side, cx);
+                                }
+                            }
+                        });
+                    }
+                }
             })
             .child(
                 div()
@@ -1210,6 +1334,7 @@ impl PrDiffPanel {
                     .flex_shrink_0()
                     .text_color(text_col)
                     .pl(px(4.0))
+                    .bg(text_bg)
                     .child(prefix.to_string()),
             )
             .child(content_el);
@@ -1506,16 +1631,23 @@ impl PrDiffPanel {
             .flex_col()
             .gap_2();
 
-        // Show line range label for multi-line comments
-        if let Some((_, start, end, _)) = &self.active_comment_line {
-            if start != end {
-                form = form.child(
-                    div()
-                        .text_xs()
-                        .text_color(colors::text_muted())
-                        .child(format!("Lines {start}–{end}")),
-                );
-            }
+        // Show line range label
+        if let Some((_, start, end, side)) = &self.active_comment_line {
+            let prefix = match side {
+                CommentSide::Left => "L",
+                CommentSide::Right => "R",
+            };
+            let label = if start != end {
+                format!("Comment on lines {prefix}{start}\u{2013}{prefix}{end}")
+            } else {
+                format!("Comment on line {prefix}{start}")
+            };
+            form = form.child(
+                div()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .child(label),
+            );
         }
 
         if let Some(ref input) = self.comment_input {
@@ -1581,7 +1713,111 @@ impl PrDiffPanel {
         form
     }
 
-    fn render_comment_bubble(&self, comment_idx: usize, entity: &Entity<Self>) -> Div {
+    /// Build a prompt header with file name, line numbers, and the relevant code.
+    fn build_prompt_header(&self, comment: &PrReviewComment) -> String {
+        let path = &comment.path;
+        let start = comment.start_line.unwrap_or_else(|| comment.line.unwrap_or(0));
+        let end = comment.line.unwrap_or(start);
+
+        let line_label = if start == end {
+            format!("line {end}")
+        } else {
+            format!("lines {start}-{end}")
+        };
+
+        let mut code_lines: Vec<String> = Vec::new();
+        let is_left = comment.side.as_deref() == Some("LEFT");
+        for file in &self.diff_files {
+            if file.path != *path {
+                continue;
+            }
+            for hunk in &file.hunks {
+                for line in &hunk.lines {
+                    let ln = if is_left {
+                        line.old_lineno
+                    } else {
+                        line.new_lineno.or(line.old_lineno)
+                    };
+                    if let Some(ln) = ln {
+                        if ln >= start && ln <= end {
+                            code_lines.push(line.content.trim_end().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let code_block = if code_lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n```\n{}\n```\n", code_lines.join("\n"))
+        };
+
+        format!("Address this PR comment in {path} ({line_label}):{code_block}")
+    }
+
+    /// Build a prompt for a single comment (main or reply).
+    fn build_single_comment_prompt(&self, comment: &PrReviewComment, body: &str, author: &str) -> String {
+        let header = self.build_prompt_header(comment);
+        format!("{header}\n@{author}: {body}")
+    }
+
+    /// Build a prompt for the full thread (main comment + all replies).
+    fn build_thread_prompt(&self, comment: &PrReviewComment, replies: &[&PrReviewComment]) -> String {
+        let header = self.build_prompt_header(comment);
+        let mut thread = format!("@{}: {}", comment.user.login, comment.body);
+        for reply in replies {
+            thread.push_str(&format!("\n  @{}: {}", reply.user.login, reply.body));
+        }
+        format!("{header}\n{thread}")
+    }
+
+    /// Render a small copy-as-prompt button with custom label.
+    fn render_copy_prompt_btn(&self, key: String, label: &str, prompt_text: String, entity: &Entity<Self>) -> Stateful<Div> {
+        let is_copied = self.copied_prompt_key.as_deref() == Some(&key);
+        let entity = entity.clone();
+        let key_for_click = key.clone();
+        let display = if is_copied { "Copied!".to_string() } else { label.to_string() };
+        div()
+            .id(ElementId::Name(format!("pr-copy-{key}").into()))
+            .px_1()
+            .py(px(1.0))
+            .rounded(px(3.0))
+            .text_size(px(10.0))
+            .text_color(colors::text_muted())
+            .cursor_pointer()
+            .hover(|s| {
+                s.text_color(colors::accent())
+                    .bg(colors::surface_hover())
+            })
+            .child(display)
+            .on_click(move |_, _window, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(ClipboardItem::new_string(prompt_text.clone()));
+                entity.update(cx, |panel, cx| {
+                    panel.copy_selecting = false;
+                    panel.copied_prompt_key = Some(key_for_click.clone());
+                    panel._copied_comment_timer = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(1500))
+                            .await;
+                        let _ = cx.update(|cx| {
+                            let _ = this.update(cx, |panel, cx| {
+                                panel.copied_prompt_key = None;
+                                cx.notify();
+                            });
+                        });
+                    }));
+                    cx.notify();
+                });
+            })
+    }
+
+    fn render_comment_bubble(
+        &self,
+        comment_idx: usize,
+        entity: &Entity<Self>,
+    ) -> Div {
         let comment = &self.pr_comments[comment_idx];
         let author = &comment.user.login;
         let body = &comment.body;
@@ -1606,55 +1842,224 @@ impl PrDiffPanel {
             .flex_col()
             .gap_1();
 
-        // Main comment
-        bubble = bubble.child(self.render_single_comment(author, body));
+        // Line range header
+        if let Some(line) = comment.line {
+            let side_prefix = match comment.side.as_deref() {
+                Some("LEFT") => "L",
+                _ => "R",
+            };
+            let label = if let Some(start) = comment.start_line {
+                if start != line {
+                    let start_prefix = match comment.start_side.as_deref().or(comment.side.as_deref()) {
+                        Some("LEFT") => "L",
+                        _ => "R",
+                    };
+                    format!("Comment on lines {start_prefix}{start}\u{2013}{side_prefix}{line}")
+                } else {
+                    format!("Comment on line {side_prefix}{line}")
+                }
+            } else {
+                format!("Comment on line {side_prefix}{line}")
+            };
+            bubble = bubble.child(
+                div()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .pb(px(2.0))
+                    .child(label),
+            );
+        }
 
-        // Replies
-        for reply in replies {
+        // Main comment with hover copy button inline with author
+        let main_prompt = self.build_single_comment_prompt(comment, body, author);
+        let main_btn = self.render_copy_prompt_btn(
+            format!("main-{comment_idx}"),
+            "Copy as prompt",
+            main_prompt,
+            entity,
+        );
+        bubble = bubble.child(self.render_single_comment(author, body, Some(main_btn), format!("pr-comment-{comment_idx}").into()));
+
+        // Replies, each with hover copy button inline with author
+        for (i, reply) in replies.iter().enumerate() {
+            let reply_prompt = self.build_single_comment_prompt(comment, &reply.body, &reply.user.login);
+            let reply_btn = self.render_copy_prompt_btn(
+                format!("reply-{comment_idx}-{i}"),
+                "Copy as prompt",
+                reply_prompt,
+                entity,
+            );
             bubble = bubble.child(
                 div()
                     .pl_3()
                     .border_l_2()
                     .border_color(comment_border())
-                    .child(self.render_single_comment(&reply.user.login, &reply.body)),
+                    .child(self.render_single_comment(&reply.user.login, &reply.body, Some(reply_btn), format!("pr-reply-c-{comment_idx}-{i}").into())),
             );
         }
 
-        // Reply button
-        let entity = entity.clone();
-        let path = comment.path.clone();
-        let line = comment.line;
-        bubble = bubble.child(
-            div()
-                .id(ElementId::Name(
-                    format!("pr-reply-{comment_idx}").into(),
-                ))
-                .mt_1()
-                .px_2()
-                .py(px(3.0))
-                .rounded(px(4.0))
-                .text_xs()
-                .text_color(colors::text_muted())
-                .cursor_pointer()
-                .hover(|s| {
-                    s.text_color(colors::accent())
-                        .bg(colors::surface_hover())
-                })
-                .child("Reply")
-                .on_click(move |_, _window, cx| {
-                    if let Some(ln) = line {
-                        entity.update(cx, |panel, cx| {
-                            panel.start_comment(path.clone(), ln, ln, CommentSide::Right, cx);
+        // Inline reply form (rendered as part of the thread)
+        let is_replying = self.reply_to.map_or(false, |(_, idx)| idx == comment_idx);
+        if is_replying {
+            if let Some(ref input) = self.reply_input {
+                let entity_cancel = entity.clone();
+                let entity_submit = entity.clone();
+                let submitting = self.submitting_reply;
+
+                bubble = bubble.child(
+                    div()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(comment_border())
+                        .mt_1()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(input.clone())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("pr-reply-cancel")
+                                        .px_2()
+                                        .py(px(4.0))
+                                        .rounded(px(4.0))
+                                        .text_xs()
+                                        .text_color(colors::text_muted())
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(colors::text()).bg(colors::surface_hover()))
+                                        .child("Cancel")
+                                        .on_click(move |_, _window, cx| {
+                                            entity_cancel.update(cx, |panel, cx| {
+                                                panel.reply_to = None;
+                                                panel.reply_input = None;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("pr-reply-submit")
+                                        .px_2()
+                                        .py(px(4.0))
+                                        .rounded(px(4.0))
+                                        .text_xs()
+                                        .text_color(gpui::rgb(0xffffff))
+                                        .bg(colors::accent())
+                                        .cursor_pointer()
+                                        .when(!submitting, |d: Stateful<Div>| {
+                                            d.hover(|s| s.opacity(0.8))
+                                        })
+                                        .when(submitting, |d: Stateful<Div>| d.opacity(0.5))
+                                        .child(if submitting { "Posting..." } else { "Reply" })
+                                        .on_click(move |_, _window, cx| {
+                                            entity_submit.update(cx, |panel, cx| {
+                                                if let Some(ref input) = panel.reply_input {
+                                                    let text = input.read(cx).text.clone();
+                                                    if !text.trim().is_empty() {
+                                                        panel.submit_reply(text, cx);
+                                                    }
+                                                }
+                                            });
+                                        }),
+                                ),
+                        ),
+                );
+            }
+        }
+
+        // Thread-level action buttons row
+        let has_replies = self.pr_comments.iter().any(|c| c.in_reply_to_id == Some(comment_id));
+        let thread_prompt = self.build_thread_prompt(comment, &self.pr_comments.iter().filter(|c| c.in_reply_to_id == Some(comment_id)).collect::<Vec<_>>());
+        let entity_reply = entity.clone();
+        let cid = comment_id;
+
+        let mut actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .mt_1();
+
+        if !is_replying {
+            actions = actions.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("pr-reply-{comment_idx}").into(),
+                    ))
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .cursor_pointer()
+                    .hover(|s| {
+                        s.text_color(colors::accent())
+                            .bg(colors::surface_hover())
+                    })
+                    .child("Reply")
+                    .on_click(move |_, _window, cx| {
+                        entity_reply.update(cx, |panel, cx| {
+                            panel.start_reply(cid, comment_idx, cx);
                         });
-                    }
-                }),
-        );
+                    }),
+            );
+        }
+
+        if has_replies {
+            let thread_key = format!("thread-{comment_idx}");
+            let is_thread_copied = self.copied_prompt_key.as_deref() == Some(&thread_key);
+            let entity_thread = entity.clone();
+            actions = actions.child(
+                div()
+                    .id(ElementId::Name(format!("pr-copy-{thread_key}").into()))
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .cursor_pointer()
+                    .hover(|s| {
+                        s.text_color(colors::accent())
+                            .bg(colors::surface_hover())
+                    })
+                    .child(if is_thread_copied { "Copied!" } else { "Copy thread as prompt" })
+                    .on_click(move |_, _window, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(thread_prompt.clone()));
+                        entity_thread.update(cx, |panel, cx| {
+                            panel.copy_selecting = false;
+                            panel.copied_prompt_key = Some(thread_key.clone());
+                            panel._copied_comment_timer = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(1500))
+                                    .await;
+                                let _ = cx.update(|cx| {
+                                    let _ = this.update(cx, |panel, cx| {
+                                        panel.copied_prompt_key = None;
+                                        cx.notify();
+                                    });
+                                });
+                            }));
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        bubble = bubble.child(actions);
 
         bubble
     }
 
-    fn render_single_comment(&self, author: &str, body: &str) -> Div {
+    fn render_single_comment(&self, author: &str, body: &str, copy_btn: Option<Stateful<Div>>, group_name: SharedString) -> Div {
+        let gn = group_name.clone();
         div()
+            .group(group_name)
             .flex()
             .flex_col()
             .gap(px(2.0))
@@ -1690,7 +2095,15 @@ impl PrDiffPanel {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(colors::text())
                             .child(author.to_string()),
-                    ),
+                    )
+                    .when_some(copy_btn, |d, btn| {
+                        d.child(
+                            btn
+                                .ml_2()
+                                .opacity(0.0)
+                                .group_hover(gn, |s| s.opacity(1.0)),
+                        )
+                    }),
             )
             .child({
                 let mut body_el = div()

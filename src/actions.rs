@@ -21,5 +21,15 @@ actions!(
         FindInFile,
         SearchWorkspace,
         Quit,
+        OpenDirectory,
+        ActivateWorkspace1,
+        ActivateWorkspace2,
+        ActivateWorkspace3,
+        ActivateWorkspace4,
+        ActivateWorkspace5,
+        ActivateWorkspace6,
+        ActivateWorkspace7,
+        ActivateWorkspace8,
+        ActivateWorkspace9,
     ]
 );

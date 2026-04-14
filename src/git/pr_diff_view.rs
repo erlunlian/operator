@@ -804,14 +804,13 @@ impl PrDiffPanel {
         let path_for_copy = file.path.clone();
         let entity_copy = entity.clone();
 
-        div()
+        let header = div()
             .id(ElementId::Name(format!("pr-fhdr-{file_idx}").into()))
             .flex()
             .flex_row()
             .items_center()
             .w_full()
             .min_h(px(32.0))
-            .when(file_idx > 0, |d: Stateful<Div>| d.pt(px(12.0)))
             .px_3()
             .py(px(4.0))
             .bg(file_header_bg())
@@ -920,8 +919,16 @@ impl PrDiffPanel {
                                 .child(format!("-{dels}")),
                         )
                     }),
-            )
-            .into_any_element()
+            );
+
+        if file_idx > 0 {
+            div()
+                .pt(px(12.0))
+                .child(header)
+                .into_any_element()
+        } else {
+            header.into_any_element()
+        }
     }
 
     fn render_empty_file(&self, file_idx: usize) -> AnyElement {

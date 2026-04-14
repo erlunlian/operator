@@ -1774,11 +1774,11 @@ impl Render for GitDiffPanel {
         body = body.child(
             div()
                 .id("tree-resize-handle")
-                .w(px(8.0))
-                .mx(px(-3.0))
+                .w(px(6.0))
                 .h_full()
                 .flex_shrink_0()
                 .cursor_col_resize()
+                .hover(|s| s.bg(colors::accent()))
                 .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
                     entity_down.update(cx, |panel, cx| {
                         panel.resizing_tree = true;

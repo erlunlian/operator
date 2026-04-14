@@ -1389,19 +1389,31 @@ impl Render for OperatorApp {
                         cx.notify();
                     });
                 })),
-                Some(Rc::new(move |from_ix, to_ix, _window, cx| {
+                Some(Rc::new(move |from_ix, to_slot, _window, cx| {
                     app_entity4.update(cx, |app, cx| {
-                        if from_ix == to_ix || from_ix >= app.workspaces.len() || to_ix >= app.workspaces.len() {
+                        if from_ix >= app.workspaces.len() || to_slot > app.workspaces.len() {
+                            return;
+                        }
+                        // to_slot is a gap index (0..=len). After removing from_ix,
+                        // slots above from_ix shift down by 1.
+                        let insert_ix = if from_ix < to_slot {
+                            to_slot - 1
+                        } else {
+                            to_slot
+                        };
+                        if insert_ix == from_ix {
+                            app.ws_drop_index = None;
+                            cx.notify();
                             return;
                         }
                         let ws = app.workspaces.remove(from_ix);
-                        app.workspaces.insert(to_ix, ws);
+                        app.workspaces.insert(insert_ix, ws);
                         // Update active index to follow the active workspace
                         if app.active_workspace_ix == from_ix {
-                            app.active_workspace_ix = to_ix;
-                        } else if from_ix < app.active_workspace_ix && to_ix >= app.active_workspace_ix {
+                            app.active_workspace_ix = insert_ix;
+                        } else if from_ix < app.active_workspace_ix && insert_ix >= app.active_workspace_ix {
                             app.active_workspace_ix -= 1;
-                        } else if from_ix > app.active_workspace_ix && to_ix <= app.active_workspace_ix {
+                        } else if from_ix > app.active_workspace_ix && insert_ix <= app.active_workspace_ix {
                             app.active_workspace_ix += 1;
                         }
                         app.ws_drop_index = None;

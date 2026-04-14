@@ -1,5 +1,6 @@
-use gpui::*;
 use std::rc::Rc;
+
+use gpui::*;
 
 use crate::theme::colors;
 use crate::util;
@@ -59,6 +60,7 @@ fn drop_indicator() -> Div {
     div()
         .h(px(2.0))
         .w_full()
+        .mx_3()
         .bg(colors::accent())
         .rounded_full()
 }
@@ -132,7 +134,7 @@ impl WorkspaceSidebar {
             let on_drop_index_change = on_drop_index_change.clone();
             let on_drag_end = on_drag_end.clone();
 
-            // Show drop indicator line before this card
+            // Show drop indicator before this card
             if drop_index == Some(ix) {
                 sidebar = sidebar.child(drop_indicator());
             }
@@ -140,7 +142,7 @@ impl WorkspaceSidebar {
             let card = Self::render_card(
                 ws, is_active, ix, workspaces.len(),
                 on_select, on_close, on_reorder,
-                on_drop_index_change, on_drag_end,
+                drop_index, on_drop_index_change, on_drag_end,
             );
             sidebar = sidebar.child(card);
         }
@@ -198,6 +200,7 @@ impl WorkspaceSidebar {
         on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
         on_close: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
         on_reorder: Option<Rc<dyn Fn(usize, usize, &mut Window, &mut App)>>,
+        drop_index: Option<usize>,
         on_drop_index_change: Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>,
         on_drag_end: Rc<dyn Fn(&mut Window, &mut App)>,
     ) -> Stateful<Div> {
@@ -253,13 +256,18 @@ impl WorkspaceSidebar {
             })
         });
 
-        // Track drag position for drop indicator
+        // Track drag position for drop indicator.
+        // on_drag_move fires on EVERY element that registered it (capture phase),
+        // so we must check that the cursor is actually within this card's bounds.
         {
             let on_change = on_drop_index_change.clone();
             card = card.on_drag_move::<WorkspaceDragPayload>(
                 move |event: &DragMoveEvent<WorkspaceDragPayload>, window, cx| {
                     let bounds = event.bounds;
                     let pos = event.event.position;
+                    if !bounds.contains(&pos) {
+                        return;
+                    }
                     let mid_y = bounds.origin.y + bounds.size.height / 2.0;
                     let target = if pos.y < mid_y { ix } else { ix + 1 };
                     // Don't show indicator right next to the dragged item (no-op position)
@@ -274,11 +282,13 @@ impl WorkspaceSidebar {
             );
         }
 
-        // Drop support (reorder)
+        // Drop support (reorder) — use the computed drop_index, not the card ix.
         if let Some(on_reorder) = on_reorder {
             let on_drag_end = on_drag_end.clone();
             card = card.on_drop(move |payload: &WorkspaceDragPayload, window, cx| {
-                on_reorder(payload.ix, ix, window, cx);
+                if let Some(target) = drop_index {
+                    on_reorder(payload.ix, target, window, cx);
+                }
                 on_drag_end(window, cx);
             });
         }

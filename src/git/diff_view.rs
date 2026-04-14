@@ -1837,7 +1837,10 @@ impl Render for GitDiffPanel {
         // Handle scroll-to-file: convert file_idx to flat row index
         if let Some(target_file) = self.scroll_to_file.take() {
             if let Some(&row_idx) = self.flat_file_starts.get(target_file) {
-                self.list_state.scroll_to_reveal_item(row_idx);
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: row_idx,
+                    offset_in_item: px(0.),
+                });
             }
         }
 

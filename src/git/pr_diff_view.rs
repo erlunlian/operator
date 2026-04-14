@@ -924,14 +924,11 @@ impl PrDiffPanel {
                     }),
             );
 
-        if file_idx > 0 {
-            div()
-                .pt(px(12.0))
-                .child(header)
-                .into_any_element()
-        } else {
-            header.into_any_element()
-        }
+        let top_pad = if file_idx > 0 { 12.0 } else { 16.0 };
+        div()
+            .pt(px(top_pad))
+            .child(header)
+            .into_any_element()
     }
 
     fn render_empty_file(&self, file_idx: usize) -> AnyElement {
@@ -2126,7 +2123,7 @@ impl Render for PrDiffPanel {
             .flex_col()
             .flex_1()
             .min_w(px(100.0))
-            .p(px(16.0))
+            .px(px(16.0))
             .child(diff_list);
 
         // Auto-load more files if there are un-rendered files

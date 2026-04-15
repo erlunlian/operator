@@ -1,4 +1,4 @@
-use git2::{BranchType, Delta, Diff, DiffOptions, Repository};
+use git2::{BranchType, Delta, Diff, DiffFile as GitDiffFile, DiffOptions, Repository};
 use std::path::{Path, PathBuf};
 
 use super::diff_model::*;
@@ -46,7 +46,7 @@ impl GitRepo {
         };
 
         match diff {
-            Some(d) => Self::extract_files(&d),
+            Some(d) => self.extract_files(&d),
             None => Vec::new(),
         }
     }
@@ -60,7 +60,7 @@ impl GitRepo {
         let diff = self.repo.diff_index_to_workdir(None, Some(&mut opts)).ok();
 
         match diff {
-            Some(d) => Self::extract_files(&d),
+            Some(d) => self.extract_files(&d),
             None => Vec::new(),
         }
     }
@@ -177,7 +177,7 @@ impl GitRepo {
         };
 
         match diff {
-            Some(d) => Self::extract_files(&d),
+            Some(d) => self.extract_files(&d),
             None => Vec::new(),
         }
     }
@@ -221,7 +221,7 @@ impl GitRepo {
             .map(|c| c.id().to_string())
     }
 
-    fn extract_files(diff: &Diff) -> Vec<DiffFile> {
+    fn extract_files(&self, diff: &Diff) -> Vec<DiffFile> {
         let mut diff_files = Vec::new();
 
         for delta_idx in 0..diff.deltas().len() {
@@ -275,74 +275,115 @@ impl GitRepo {
                 }
             }
 
-            diff_files.push(DiffFile {
+            // Read full file content for proper syntax highlighting context.
+            let new_content = self.read_diff_file_content(&delta.new_file(), &path);
+            let old_content = self.read_diff_file_content(&delta.old_file(), &path);
+
+            let mut file = DiffFile {
                 path,
                 status,
                 hunks,
-            });
-        }
-
-        // Precompute syntax highlights for each file's diff lines.
-        for file in &mut diff_files {
-            let Some(lang) = syntax::detect_language(&file.path) else {
-                continue;
+                source_lines: None,
             };
-            // Collect trimmed content strings (owned) so we don't borrow file.hunks.
-            let all_lines: Vec<String> = file
-                .hunks
-                .iter()
-                .flat_map(|h| h.lines.iter())
-                .map(|l| l.content.trim_end().to_string())
-                .collect();
-            let full_text = all_lines.join("\n");
-            let spans = syntax::highlight_source(&full_text, lang);
-            if spans.is_empty() {
-                continue;
-            }
 
-            // Split global spans back to per-line highlights.
-            let mut per_line: Vec<Option<Vec<syntax::HighlightSpan>>> =
-                Vec::with_capacity(all_lines.len());
-            let mut offset = 0usize;
-            for line_text in &all_lines {
-                let line_start = offset;
-                let line_end = offset + line_text.len();
-                let line_spans: Vec<_> = spans
-                    .iter()
-                    .filter(|s| s.byte_range.start < line_end && s.byte_range.end > line_start)
-                    .filter_map(|s| {
-                        let start = s.byte_range.start.max(line_start) - line_start;
-                        let end = s.byte_range.end.min(line_end) - line_start;
-                        if start < end
-                            && end <= line_text.len()
-                            && line_text.is_char_boundary(start)
-                            && line_text.is_char_boundary(end)
-                        {
-                            Some(syntax::HighlightSpan {
-                                byte_range: start..end,
-                                color: s.color,
-                            })
-                        } else {
-                            None
+            // Precompute syntax highlights using full file context.
+            if let Some(lang) = syntax::detect_language(&file.path) {
+                let new_source_lines = new_content
+                    .as_deref()
+                    .map(|c| Self::highlight_full_file(c, lang));
+                let old_source_lines = old_content
+                    .as_deref()
+                    .map(|c| Self::highlight_full_file(c, lang));
+
+                // Map highlights to diff lines by their actual file line numbers.
+                for hunk in &mut file.hunks {
+                    for diff_line in &mut hunk.lines {
+                        let (source, lineno) = match diff_line.kind {
+                            DiffLineKind::Removed => (&old_source_lines, diff_line.old_lineno),
+                            _ => (&new_source_lines, diff_line.new_lineno),
+                        };
+                        if let (Some(lines), Some(n)) = (source, lineno) {
+                            let idx = (n as usize).saturating_sub(1);
+                            if let Some(sl) = lines.get(idx) {
+                                diff_line.highlights = sl.highlights.clone();
+                            }
                         }
-                    })
-                    .collect();
-                per_line.push(if line_spans.is_empty() { None } else { Some(line_spans) });
-                offset = line_end + 1;
+                    }
+                }
+
+                // Store new-side source lines for context expansion.
+                file.source_lines = new_source_lines;
             }
 
-            // Apply highlights back to diff lines.
-            let mut idx = 0;
-            for hunk in &mut file.hunks {
-                for diff_line in &mut hunk.lines {
-                    if idx < per_line.len() {
-                        diff_line.highlights = per_line[idx].take();
-                    }
-                    idx += 1;
-                }
-            }
+            diff_files.push(file);
         }
 
         diff_files
+    }
+
+    /// Read the content of a file referenced by a diff entry.
+    /// Tries the git blob first, falls back to reading from the working directory.
+    fn read_diff_file_content(&self, diff_file: &GitDiffFile<'_>, path: &str) -> Option<String> {
+        let oid = diff_file.id();
+        if !oid.is_zero() {
+            if let Ok(blob) = self.repo.find_blob(oid) {
+                return std::str::from_utf8(blob.content())
+                    .ok()
+                    .map(|s| s.to_string());
+            }
+        }
+        // Fall back to working directory (for unstaged new-side files).
+        self.repo
+            .workdir()
+            .and_then(|w| std::fs::read_to_string(w.join(path)).ok())
+    }
+
+    /// Highlight a full file and return per-line SourceLine entries.
+    fn highlight_full_file(source: &str, lang: &str) -> Vec<SourceLine> {
+        let spans = syntax::highlight_source(source, lang);
+        let mut result = Vec::new();
+        let mut offset = 0usize;
+
+        for line_text in source.split('\n') {
+            let line_start = offset;
+            let line_end = offset + line_text.len();
+            let trimmed = line_text.trim_end();
+
+            let line_spans: Vec<_> = spans
+                .iter()
+                .filter(|s| s.byte_range.start < line_end && s.byte_range.end > line_start)
+                .filter_map(|s| {
+                    let start = s.byte_range.start.max(line_start) - line_start;
+                    let end = s.byte_range.end.min(line_end) - line_start;
+                    // Clamp to trimmed length so spans don't extend past visible content.
+                    let end = end.min(trimmed.len());
+                    if start < end
+                        && end <= trimmed.len()
+                        && trimmed.is_char_boundary(start)
+                        && trimmed.is_char_boundary(end)
+                    {
+                        Some(syntax::HighlightSpan {
+                            byte_range: start..end,
+                            color: s.color,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            result.push(SourceLine {
+                content: trimmed.to_string(),
+                highlights: if line_spans.is_empty() {
+                    None
+                } else {
+                    Some(line_spans)
+                },
+            });
+
+            offset = line_end + 1; // +1 for the '\n'
+        }
+
+        result
     }
 }

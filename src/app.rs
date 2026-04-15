@@ -4,6 +4,8 @@ use std::rc::Rc;
 
 use crate::actions::*;
 use crate::command_center::{CommandAction, CommandCenter};
+use crate::debug::DebugPanel;
+use crate::debug::metrics::SubsystemMetrics;
 use crate::git::{GitDiffPanel, PrDiffPanel};
 use crate::recent_projects::RecentProjects;
 use crate::right_panel::{RightPanel, RightPanelTab};
@@ -19,6 +21,12 @@ pub enum FocusRegion {
     Center,
     RightPanel,
 }
+
+// Layout constraints
+const MIN_SIDEBAR_WIDTH: f32 = 120.0;
+const MAX_SIDEBAR_WIDTH: f32 = 500.0;
+const MIN_RIGHT_PANEL_WIDTH: f32 = 200.0;
+const MIN_CENTER_WIDTH: f32 = 100.0;
 
 pub struct OperatorApp {
     pub workspaces: Vec<Entity<Workspace>>,
@@ -46,6 +54,13 @@ pub struct OperatorApp {
     ws_drop_index: Option<usize>,
     /// Available update info (checked on startup).
     pub update_info: Option<crate::updater::UpdateInfo>,
+    /// Handle to the current diff file-watcher task. Dropped (cancelled) before
+    /// starting a new watcher so old watchers don't accumulate.
+    diff_watcher_task: Option<Task<()>>,
+    /// Debug overlay showing live process metrics.
+    debug_panel: Entity<DebugPanel>,
+    /// Background task that periodically logs metrics to stderr.
+    _metrics_log_task: Task<()>,
 }
 
 impl OperatorApp {
@@ -65,7 +80,9 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
-        Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let diff_watcher_task = Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let debug_panel = cx.new(|cx| DebugPanel::new(cx));
+        let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
         let mut app = Self {
@@ -88,6 +105,9 @@ impl OperatorApp {
             quit_requested: false,
             ws_drop_index: None,
             update_info: None,
+            diff_watcher_task,
+            debug_panel,
+            _metrics_log_task: metrics_log_task,
         };
         app.check_for_updates(cx);
         app
@@ -124,7 +144,9 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
-        Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let diff_watcher_task = Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
+        let debug_panel = cx.new(|cx| DebugPanel::new(cx));
+        let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
         let mut app = Self {
@@ -147,6 +169,9 @@ impl OperatorApp {
             quit_requested: false,
             ws_drop_index: None,
             update_info: None,
+            diff_watcher_task,
+            debug_panel,
+            _metrics_log_task: metrics_log_task,
         };
         app.check_for_updates(cx);
         app
@@ -181,15 +206,115 @@ impl OperatorApp {
         .detach();
     }
 
-    fn start_diff_watcher_from_right_panel(right_panel: Entity<RightPanel>, cx: &mut Context<Self>) {
-        let diff_panel = right_panel.read(cx).diff_panel.clone();
-        Self::start_diff_watcher(diff_panel, cx);
+    /// Count total terminal tabs across all workspaces.
+    fn count_terminals(&self, cx: &App) -> usize {
+        self.workspaces
+            .iter()
+            .map(|ws| {
+                let ws = ws.read(cx);
+                ws.layout
+                    .as_ref()
+                    .map(|pg| {
+                        crate::pane::pane_group::count_total_tabs(&pg.read(cx).root)
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
-    fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) {
+    /// Collect per-subsystem memory metrics from the app state.
+    fn collect_subsystem_metrics(&self, cx: &App) -> SubsystemMetrics {
+        use crate::pane::pane_group::collect_all_tabs;
+        use crate::tab::tab::TabContent;
+
+        let mut sub = SubsystemMetrics::default();
+
+        // Terminal grid memory across all workspaces
+        for ws in &self.workspaces {
+            let ws = ws.read(cx);
+            if let Some(pg) = &ws.layout {
+                let tabs = collect_all_tabs(&pg.read(cx).root);
+                for tab in tabs {
+                    let tab = tab.read(cx);
+                    if let TabContent::Terminal(tv) = &tab.content {
+                        let tm = tv.read(cx).terminal.read(cx);
+                        let (bytes, lines, cols) = tm.estimated_grid_bytes();
+                        sub.terminal_grid_bytes += bytes;
+                        sub.terminal_details.push((lines, cols, bytes));
+                    }
+                }
+            }
+        }
+
+        // Git diff panel
+        let rp = self.right_panel.read(cx);
+        let dp = rp.diff_panel.read(cx);
+        sub.git_diff_bytes = dp.estimated_bytes();
+        sub.git_diff_files = dp.file_count();
+
+        // PR diff panel
+        let pr = rp.pr_diff_panel.read(cx);
+        sub.pr_diff_bytes = pr.estimated_bytes();
+        sub.pr_diff_files = pr.file_count();
+
+        sub
+    }
+
+    /// Spawn a background task that logs metrics to stderr every 30 seconds.
+    fn start_metrics_logging(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_spawn(async {
+                    smol::Timer::after(std::time::Duration::from_secs(30)).await;
+                })
+                .await;
+
+                let data = this
+                    .read_with(cx, |app, cx| {
+                        let tc = app.count_terminals(cx);
+                        let wc = app.workspaces.len();
+                        let sub = app.collect_subsystem_metrics(cx);
+                        (tc, wc, sub)
+                    })
+                    .ok();
+
+                if let Some((tc, wc, sub)) = data {
+                    let m = crate::debug::ProcessMetrics::collect(tc, wc, sub);
+                    log::info!(
+                        "[perf] rss={} threads={} terminals={} grid_mem={} git_diff={} ({} files) pr_diff={} ({} files) tracked={} untracked={} workspaces={}",
+                        m.resident_display(),
+                        m.thread_count,
+                        m.terminal_count,
+                        crate::debug::metrics::format_bytes(m.subsystems.terminal_grid_bytes as u64),
+                        crate::debug::metrics::format_bytes(m.subsystems.git_diff_bytes as u64),
+                        m.subsystems.git_diff_files,
+                        crate::debug::metrics::format_bytes(m.subsystems.pr_diff_bytes as u64),
+                        m.subsystems.pr_diff_files,
+                        crate::debug::metrics::format_bytes(m.tracked_total() as u64),
+                        crate::debug::metrics::format_bytes(m.untracked_bytes()),
+                        m.workspace_count,
+                    );
+                    // Log per-terminal details at debug level
+                    for (i, (lines, cols, bytes)) in m.subsystems.terminal_details.iter().enumerate() {
+                        log::debug!(
+                            "[perf]   terminal[{i}]: {lines} lines x {cols} cols = {}",
+                            crate::debug::metrics::format_bytes(*bytes as u64),
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    fn start_diff_watcher_from_right_panel(right_panel: Entity<RightPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let diff_panel = right_panel.read(cx).diff_panel.clone();
+        Self::start_diff_watcher(diff_panel, cx)
+    }
+
+    fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
         // Get the .git directory to watch
         let git_dir = diff_panel.read(cx).git_dir();
-        let Some(git_dir) = git_dir else { return };
+        let Some(git_dir) = git_dir else { return None };
 
         // Create a channel-based file watcher using the `notify` crate.
         // We watch the .git dir for changes to index, HEAD, refs, etc.
@@ -211,7 +336,7 @@ impl OperatorApp {
             },
         ) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
         // Watch the .git directory (index, HEAD, refs changes)
@@ -221,7 +346,7 @@ impl OperatorApp {
         // Spawn a background thread that blocks on the watcher channel,
         // then pokes the UI when something changes.
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        cx.spawn(async move |_app, cx| {
+        let task = cx.spawn(async move |_app, cx| {
             // Keep the watcher alive for the lifetime of this task
             let _watcher = watcher;
             loop {
@@ -259,8 +384,8 @@ impl OperatorApp {
                     break;
                 }
             }
-        })
-        .detach();
+        });
+        Some(task)
     }
 
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
@@ -291,6 +416,9 @@ impl OperatorApp {
         self.cache_editor_files(cx);
         self.workspaces.remove(self.active_workspace_ix);
         if self.workspaces.is_empty() {
+            // Stop the file watcher — no workspace means no .git dir to watch
+            self.diff_watcher_task = None;
+
             // Instead of quitting, create a fresh uninitialized workspace
             let ws = cx.new(|cx| Workspace::new_empty(cx));
             cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
@@ -678,6 +806,19 @@ impl OperatorApp {
         }
     }
 
+    fn toggle_debug_panel(
+        &mut self,
+        _: &ToggleDebugPanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.debug_panel.update(cx, |panel, cx| {
+            panel.toggle();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn request_quit(
         &mut self,
         _: &Quit,
@@ -925,8 +1066,19 @@ impl OperatorApp {
         cx.notify();
     }
 
+    /// Switch to workspace N (0-indexed) via Cmd+1..9 shortcut.
+    fn activate_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.workspaces.len() {
+            self.switch_to_workspace(ix, cx);
+            self.focus_handle.focus(window);
+        }
+    }
+
     /// Point the right panel at a new working directory and restart the file watcher.
     fn update_right_panel_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        // Drop the old watcher task so it stops watching the previous .git dir
+        self.diff_watcher_task = None;
+
         self.right_panel.update(cx, |rp, cx| {
             rp.diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
@@ -943,7 +1095,7 @@ impl OperatorApp {
             rp.set_directory(dir, cx);
         });
         let diff_panel = self.right_panel.read(cx).diff_panel.clone();
-        Self::start_diff_watcher(diff_panel, cx);
+        self.diff_watcher_task = Self::start_diff_watcher(diff_panel, cx);
     }
 
     /// Open the OS directory picker and set directory on the active workspace.
@@ -965,6 +1117,54 @@ impl OperatorApp {
                     let _ = cx.update(|cx| {
                         let _ = this.update(cx, |app, cx| {
                             app.open_directory(dir, cx);
+                        });
+                    });
+                }
+            }
+            let _ = cx.update(|cx| {
+                let _ = this.update(cx, |app, cx| {
+                    app.picker_open = false;
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Cmd+O: open directory picker, always create a new workspace with the chosen directory.
+    fn open_directory_in_new_workspace(&mut self, _: &OpenDirectory, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker_open {
+            return;
+        }
+        self.picker_open = true;
+
+        let paths_rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths_rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let _ = cx.update(|cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.cache_editor_files(cx);
+                            app.recent_projects.add(dir.clone());
+
+                            let dir_name = dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Workspace".to_string());
+                            let new_ws = cx.new(|cx| Workspace::new(&dir_name, dir.clone(), cx));
+                            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
+                            app.workspaces.push(new_ws);
+                            app.active_workspace_ix = app.workspaces.len() - 1;
+                            app.update_right_panel_dir(dir, cx);
+                            app.command_center.update(cx, |cc, _cx| {
+                                cc.invalidate_file_index();
+                            });
+                            cx.notify();
                         });
                     });
                 }
@@ -1278,19 +1478,31 @@ impl Render for OperatorApp {
                         cx.notify();
                     });
                 })),
-                Some(Rc::new(move |from_ix, to_ix, _window, cx| {
+                Some(Rc::new(move |from_ix, to_slot, _window, cx| {
                     app_entity4.update(cx, |app, cx| {
-                        if from_ix == to_ix || from_ix >= app.workspaces.len() || to_ix >= app.workspaces.len() {
+                        if from_ix >= app.workspaces.len() || to_slot > app.workspaces.len() {
+                            return;
+                        }
+                        // to_slot is a gap index (0..=len). After removing from_ix,
+                        // slots above from_ix shift down by 1.
+                        let insert_ix = if from_ix < to_slot {
+                            to_slot - 1
+                        } else {
+                            to_slot
+                        };
+                        if insert_ix == from_ix {
+                            app.ws_drop_index = None;
+                            cx.notify();
                             return;
                         }
                         let ws = app.workspaces.remove(from_ix);
-                        app.workspaces.insert(to_ix, ws);
+                        app.workspaces.insert(insert_ix, ws);
                         // Update active index to follow the active workspace
                         if app.active_workspace_ix == from_ix {
-                            app.active_workspace_ix = to_ix;
-                        } else if from_ix < app.active_workspace_ix && to_ix >= app.active_workspace_ix {
+                            app.active_workspace_ix = insert_ix;
+                        } else if from_ix < app.active_workspace_ix && insert_ix >= app.active_workspace_ix {
                             app.active_workspace_ix -= 1;
-                        } else if from_ix > app.active_workspace_ix && to_ix <= app.active_workspace_ix {
+                        } else if from_ix > app.active_workspace_ix && insert_ix <= app.active_workspace_ix {
                             app.active_workspace_ix += 1;
                         }
                         app.ws_drop_index = None;
@@ -1357,18 +1569,30 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_command_center))
             .on_action(cx.listener(Self::find_file))
             .on_action(cx.listener(Self::search_workspace))
+            .on_action(cx.listener(Self::toggle_debug_panel))
             .on_action(cx.listener(Self::request_quit))
+            .on_action(cx.listener(Self::open_directory_in_new_workspace))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace1, window, cx| this.activate_workspace(0, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace2, window, cx| this.activate_workspace(1, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace3, window, cx| this.activate_workspace(2, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace4, window, cx| this.activate_workspace(3, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace5, window, cx| this.activate_workspace(4, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace6, window, cx| this.activate_workspace(5, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace7, window, cx| this.activate_workspace(6, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace8, window, cx| this.activate_workspace(7, window, cx)))
+            .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace9, window, cx| this.activate_workspace(8, window, cx)))
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 app_resize_move.update(cx, |app, cx| {
                     let x = f32::from(event.position.x);
                     if app.resizing_sidebar {
-                        app.sidebar_width = x.clamp(120.0, 500.0);
+                        app.sidebar_width = x.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
                         cx.notify();
                     }
                     if app.resizing_right_panel {
-                        // Right panel is on the right: width = window_width - mouse_x
                         let window_width = f32::from(window.bounds().size.width);
-                        let new_width = (window_width - x).clamp(200.0, window_width - 100.0);
+                        let left_edge = if app.sidebar_collapsed { 0.0 } else { app.sidebar_width };
+                        let max_right = window_width - left_edge - MIN_CENTER_WIDTH;
+                        let new_width = (window_width - x).clamp(MIN_RIGHT_PANEL_WIDTH, max_right);
                         app.right_panel.update(cx, |rp, cx| {
                             rp.width = new_width;
                             cx.notify();
@@ -1452,6 +1676,7 @@ impl Render for OperatorApp {
                             app.resizing_right_panel = true;
                             cx.notify();
                         });
+                        cx.stop_propagation();
                     }),
             );
 
@@ -1462,6 +1687,7 @@ impl Render for OperatorApp {
                 .flex_col()
                 .h_full()
                 .flex_shrink_0()
+                .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                     app_focus_right.update(cx, |app, cx| {
                         if app.focus_region != FocusRegion::RightPanel {
@@ -1472,7 +1698,7 @@ impl Render for OperatorApp {
                 })
                 .child(rp);
             if !right_focused {
-                right_wrapper = right_wrapper.opacity(0.7);
+                right_wrapper = right_wrapper.opacity(0.85);
             }
             root = root.child(right_wrapper);
         }
@@ -1551,6 +1777,20 @@ impl Render for OperatorApp {
                         .child("\u{F06FE}"), // nf-cod-layout_sidebar_right
                 ),
         );
+
+        // Debug overlay (update counts and subsystem data only when visible)
+        {
+            let visible = self.debug_panel.read(cx).visible;
+            if visible {
+                let tc = self.count_terminals(cx);
+                let wc = self.workspaces.len();
+                let sub = self.collect_subsystem_metrics(cx);
+                self.debug_panel.update(cx, |panel, _cx| {
+                    panel.update_subsystems(tc, wc, sub);
+                });
+            }
+            root = root.child(self.debug_panel.clone());
+        }
 
         // Quit confirmation dialog
         if self.quit_requested {

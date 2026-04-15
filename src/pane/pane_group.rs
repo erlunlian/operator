@@ -658,7 +658,7 @@ impl PaneGroup {
         // or when center doesn't have focus at all (right panel focused).
         let is_focused_pane = focused_group_id == Some(group_id);
         if !is_focused_pane && (has_splits || focused_group_id.is_none()) {
-            leaf = leaf.opacity(0.7);
+            leaf = leaf.opacity(0.85);
         }
 
         leaf.into_any_element()
@@ -1139,6 +1139,16 @@ pub fn count_total_tabs(node: &SplitNode) -> usize {
         SplitNode::Leaf(group) => group.tabs.len(),
         SplitNode::Split { children, .. } => {
             children.iter().map(count_total_tabs).sum()
+        }
+    }
+}
+
+/// Collect all tab entities from the tree.
+pub fn collect_all_tabs(node: &SplitNode) -> Vec<Entity<Tab>> {
+    match node {
+        SplitNode::Leaf(group) => group.tabs.clone(),
+        SplitNode::Split { children, .. } => {
+            children.iter().flat_map(collect_all_tabs).collect()
         }
     }
 }

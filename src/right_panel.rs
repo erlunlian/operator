@@ -235,6 +235,7 @@ impl Render for RightPanel {
             .h_full()
             .w(px(self.width))
             .flex_shrink_0()
+            .overflow_hidden()
             .bg(colors::bg())
             .border_l_1()
             .border_color(colors::border())

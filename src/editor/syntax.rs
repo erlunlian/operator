@@ -1,4 +1,6 @@
 use gpui::Rgba;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -81,11 +83,29 @@ fn make_config(
     Some(config)
 }
 
-pub fn highlight_source(source: &str, lang: &str) -> Vec<HighlightSpan> {
+// Cache compiled HighlightConfigurations per language. These are expensive to
+// build (compiles tree-sitter highlight queries into internal state machines)
+// but identical for every file of the same language.
+thread_local! {
+    static CONFIG_CACHE: RefCell<HashMap<&'static str, HighlightConfiguration>> =
+        RefCell::new(HashMap::new());
+}
+
+fn with_cached_config<R>(lang: &'static str, f: impl FnOnce(&HighlightConfiguration) -> R) -> Option<R> {
+    CONFIG_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(lang) {
+            let config = build_config(lang)?;
+            cache.insert(lang, config);
+        }
+        cache.get(lang).map(f)
+    })
+}
+
+fn build_config(lang: &str) -> Option<HighlightConfiguration> {
     // TypeScript extends JavaScript — its highlight query only covers TS-specific
     // syntax, so we concatenate the JS base query with the TS additions.
-    let ts_highlights;
-    let config = match lang {
+    match lang {
         "rust" => make_config(
             tree_sitter_rust::LANGUAGE.into(),
             tree_sitter_rust::HIGHLIGHTS_QUERY,
@@ -110,60 +130,68 @@ pub fn highlight_source(source: &str, lang: &str) -> Vec<HighlightSpan> {
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             ),
         ),
-        "typescript" | "tsx" => {
-            ts_highlights = format!(
+        "typescript" => {
+            let combined = format!(
                 "{}\n{}",
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
             );
-            let language = if lang == "tsx" {
-                tree_sitter_typescript::LANGUAGE_TSX
-            } else {
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT
-            };
-            make_config(language.into(), &ts_highlights)
+            make_config(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), &combined)
+        }
+        "tsx" => {
+            let combined = format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            );
+            make_config(tree_sitter_typescript::LANGUAGE_TSX.into(), &combined)
         }
         "markdown" => make_config(
             tree_sitter_md::LANGUAGE.into(),
             tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
         ),
-        _ => return vec![],
-    };
-
-    let Some(config) = config else {
-        return vec![];
-    };
-
-    let mut highlighter = Highlighter::new();
-    let highlights = match highlighter.highlight(&config, source.as_bytes(), None, |_| None) {
-        Ok(h) => h,
-        Err(_) => return vec![],
-    };
-
-    let mut spans = Vec::new();
-    let mut current_color: Option<Rgba> = None;
-
-    for event in highlights {
-        match event {
-            Ok(HighlightEvent::Source { start, end }) => {
-                // Only emit spans with actual syntax highlighting colors,
-                // skip default-colored (unhighlighted) text regions
-                if let Some(color) = current_color {
-                    spans.push(HighlightSpan {
-                        byte_range: start..end,
-                        color,
-                    });
-                }
-            }
-            Ok(HighlightEvent::HighlightStart(h)) => {
-                current_color = Some(highlight_color(h.0));
-            }
-            Ok(HighlightEvent::HighlightEnd) => {
-                current_color = None;
-            }
-            Err(_) => break,
-        }
+        _ => None,
     }
+}
 
-    spans
+pub fn highlight_source(source: &str, lang: &str) -> Vec<HighlightSpan> {
+    // SAFETY: lang values come from detect_language() which always returns
+    // &'static str literals, so this transmute just restores the original lifetime.
+    let lang_static: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(lang) };
+
+    with_cached_config(lang_static, |config| {
+        let mut highlighter = Highlighter::new();
+        let highlights = match highlighter.highlight(config, source.as_bytes(), None, |_| None) {
+            Ok(h) => h,
+            Err(_) => return vec![],
+        };
+
+        let mut spans = Vec::new();
+        let mut current_color: Option<Rgba> = None;
+
+        for event in highlights {
+            match event {
+                Ok(HighlightEvent::Source { start, end }) => {
+                    // Only emit spans with actual syntax highlighting colors,
+                    // skip default-colored (unhighlighted) text regions
+                    if let Some(color) = current_color {
+                        spans.push(HighlightSpan {
+                            byte_range: start..end,
+                            color,
+                        });
+                    }
+                }
+                Ok(HighlightEvent::HighlightStart(h)) => {
+                    current_color = Some(highlight_color(h.0));
+                }
+                Ok(HighlightEvent::HighlightEnd) => {
+                    current_color = None;
+                }
+                Err(_) => break,
+            }
+        }
+
+        spans
+    })
+    .unwrap_or_default()
 }

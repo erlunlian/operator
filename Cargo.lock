@@ -3986,6 +3986,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "smol",
  "tree-sitter",
  "tree-sitter-highlight",
  "tree-sitter-javascript",

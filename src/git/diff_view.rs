@@ -14,6 +14,10 @@ const DEFAULT_CONTEXT: usize = 3;
 const EXPAND_STEP: usize = 20;
 /// How many files to render initially before showing "Load more".
 const FILE_RENDER_BATCH: usize = 20;
+/// Minimum file-tree sidebar width in pixels.
+const MIN_TREE_WIDTH: f32 = 40.0;
+/// Maximum file-tree sidebar width in pixels.
+const MAX_TREE_WIDTH: f32 = 600.0;
 
 // ── Colors specific to the diff view ──
 
@@ -76,7 +80,7 @@ pub struct GitDiffPanel {
     tree_drag_start_x: f32,
     /// Tree width at drag start.
     tree_drag_start_width: f32,
-    scroll_handle: ScrollHandle,
+    list_state: ListState,
     /// Which file just had its path copied (shows checkmark briefly).
     copied_file_key: Option<(DiffSection, usize)>,
     /// Timer handle to clear the copied indicator.
@@ -93,6 +97,16 @@ pub struct GitDiffPanel {
     copy_anchor_line: Option<usize>,
     copy_end_line: Option<usize>,
     copy_line_contents: Vec<String>,
+
+    // Virtual scroll cache
+    /// Pre-flattened line segments per file (indexed by file_idx within active section).
+    cached_file_segments: Vec<Vec<LineSegment>>,
+    /// Flat row descriptors for the list.
+    flat_rows: Vec<FlatRow>,
+    /// file_idx → index of its FileHeader row in flat_rows.
+    flat_file_starts: Vec<usize>,
+    /// Whether the flat cache needs rebuilding before next render.
+    flat_cache_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -125,7 +139,7 @@ impl GitDiffPanel {
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             copied_file_key: None,
             _copied_timer: None,
             scroll_to_file: None,
@@ -135,6 +149,10 @@ impl GitDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            cached_file_segments: Vec::new(),
+            flat_rows: Vec::new(),
+            flat_file_starts: Vec::new(),
+            flat_cache_dirty: true,
         }
     }
 
@@ -176,7 +194,7 @@ impl GitDiffPanel {
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             copied_file_key: None,
             _copied_timer: None,
             scroll_to_file: None,
@@ -186,7 +204,23 @@ impl GitDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            cached_file_segments: Vec::new(),
+            flat_rows: Vec::new(),
+            flat_file_starts: Vec::new(),
+            flat_cache_dirty: true,
         }
+    }
+
+    /// Estimate total heap bytes for all cached diff data.
+    pub fn estimated_bytes(&self) -> usize {
+        let staged: usize = self.staged_files.iter().map(|f| f.estimated_bytes()).sum();
+        let unstaged: usize = self.unstaged_files.iter().map(|f| f.estimated_bytes()).sum();
+        staged + unstaged
+    }
+
+    /// Number of cached diff files (staged + unstaged).
+    pub fn file_count(&self) -> usize {
+        self.staged_files.len() + self.unstaged_files.len()
     }
 
     pub fn git_dir(&self) -> Option<std::path::PathBuf> {
@@ -227,9 +261,19 @@ impl GitDiffPanel {
             self.branch = repo.current_branch();
             self.staged_files = repo.staged_diff();
             self.unstaged_files = repo.unstaged_diff();
-            self.expanded_context.clear();
-            self.rendered_file_limit = FILE_RENDER_BATCH;
+            // Keep expanded_context — expand state should persist across refreshes.
+            // It only resets on structural changes (stage/unstage/revert) via
+            // reset_expanded_context().
+            self.flat_cache_dirty = true;
         }
+    }
+
+    /// Clear expanded context state. Called after structural changes
+    /// (stage, unstage, revert) that shift file indices.
+    fn reset_expanded_context(&mut self) {
+        self.expanded_context.clear();
+        self.rendered_file_limit = FILE_RENDER_BATCH;
+        self.flat_cache_dirty = true;
     }
 
     fn stage_file(&mut self, file_idx: usize) {
@@ -238,6 +282,7 @@ impl GitDiffPanel {
                 let path = file.path.clone();
                 if repo.stage_file(&path).is_ok() {
                     self.refresh();
+                    self.reset_expanded_context();
                 }
             }
         }
@@ -249,6 +294,7 @@ impl GitDiffPanel {
                 let path = file.path.clone();
                 if repo.unstage_file(&path).is_ok() {
                     self.refresh();
+                    self.reset_expanded_context();
                 }
             }
         }
@@ -261,6 +307,7 @@ impl GitDiffPanel {
                 let status = file.status.clone();
                 if repo.revert_file(&path, &status).is_ok() {
                     self.refresh();
+                    self.reset_expanded_context();
                 }
             }
         }
@@ -277,6 +324,7 @@ impl GitDiffPanel {
                 let _ = repo.revert_file(path, status);
             }
             self.refresh();
+            self.reset_expanded_context();
         }
     }
 
@@ -287,6 +335,7 @@ impl GitDiffPanel {
                 let _ = repo.stage_file(path);
             }
             self.refresh();
+            self.reset_expanded_context();
         }
     }
 
@@ -297,6 +346,7 @@ impl GitDiffPanel {
                 let _ = repo.unstage_file(path);
             }
             self.refresh();
+            self.reset_expanded_context();
         }
     }
 
@@ -392,6 +442,7 @@ impl GitDiffPanel {
                     if count > 0 {
                         panel.active_section = section;
                         panel.expanded_context.clear();
+                        panel.flat_cache_dirty = true;
                     }
                     cx.notify();
                 });
@@ -644,6 +695,7 @@ impl GitDiffPanel {
                                         panel.rendered_file_limit = idx + 1;
                                     }
                                     panel.scroll_to_file = Some(idx);
+                                    panel.flat_cache_dirty = true;
                                     cx.notify();
                                 });
                             })
@@ -684,30 +736,155 @@ impl GitDiffPanel {
         container
     }
 
-    // ── File diff section ──
+    // ── Virtual scroll cache ──
 
-    fn render_file_diff(
-        &self,
-        file: &DiffFile,
-        file_idx: usize,
-        section: DiffSection,
-        line_counter: &std::cell::Cell<usize>,
-        line_texts: &std::cell::RefCell<Vec<String>>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    /// Rebuild the flat row cache from current state.
+    /// Called at the start of render when `flat_cache_dirty` is true.
+    fn rebuild_flat_cache(&mut self) {
+        let section = self.active_section;
+        let files = self.active_files();
+        let render_limit = self.rendered_file_limit.min(files.len());
+
+        // Phase 1: flatten segments for each file
+        let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(render_limit);
+        for file_idx in 0..render_limit {
+            let file_key = (section, file_idx);
+            if self.collapsed_files.contains(&file_key) || files[file_idx].hunks.is_empty() {
+                all_segments.push(Vec::new());
+            } else {
+                let segs = self.flatten_file_lines(&files[file_idx].clone(), file_idx, section);
+                all_segments.push(segs);
+            }
+        }
+
+        // Phase 2: build flat rows
+        self.flat_rows.clear();
+        self.flat_file_starts.clear();
+        let mut copy_texts: Vec<String> = Vec::new();
+        let mut global_line_idx = 0usize;
+        let files_len = self.active_files().len();
+
+        for file_idx in 0..render_limit {
+            self.flat_file_starts.push(self.flat_rows.len());
+            self.flat_rows.push(FlatRow::FileHeader { file_idx });
+
+            let file_key = (section, file_idx);
+            if self.collapsed_files.contains(&file_key) {
+                continue;
+            }
+
+            if self.active_files()[file_idx].hunks.is_empty() {
+                self.flat_rows.push(FlatRow::EmptyFile { file_idx });
+                continue;
+            }
+
+            let segments = &all_segments[file_idx];
+            let num_segs = segments.len();
+
+            for (seg_idx, seg) in segments.iter().enumerate() {
+                let is_last = seg_idx == num_segs - 1;
+                match seg {
+                    LineSegment::Line(line) => {
+                        copy_texts.push(line.content.trim_end().to_string());
+                        self.flat_rows.push(FlatRow::Line {
+                            file_idx,
+                            seg_idx,
+                            global_line_idx,
+                            is_last_in_file: is_last,
+                        });
+                        global_line_idx += 1;
+                    }
+                    LineSegment::CollapsedContext {
+                        count,
+                        hunk_idx,
+                        direction,
+                        ..
+                    } => {
+                        self.flat_rows.push(FlatRow::CollapsedContext {
+                            file_idx,
+                            seg_idx,
+                            count: *count,
+                            hunk_idx: *hunk_idx,
+                            direction: *direction,
+                            is_last_in_file: is_last,
+                        });
+                    }
+                }
+            }
+        }
+
+        let remaining = files_len.saturating_sub(render_limit);
+        if remaining > 0 {
+            self.flat_rows.push(FlatRow::LoadMore { remaining });
+        }
+
+        self.cached_file_segments = all_segments;
+        self.copy_line_contents = copy_texts;
+        let scroll_pos = self.list_state.logical_scroll_top();
+        let old_count = self.list_state.item_count();
+        self.list_state.splice(0..old_count, self.flat_rows.len());
+        self.list_state.scroll_to(scroll_pos);
+        self.flat_cache_dirty = false;
+    }
+
+    /// Render a single flat row. Called from the list callback.
+    fn render_flat_row(&self, row_idx: usize, entity: &Entity<Self>) -> AnyElement {
+        match &self.flat_rows[row_idx] {
+            FlatRow::FileHeader { file_idx } => self.render_file_header(*file_idx, entity),
+            FlatRow::EmptyFile { file_idx } => self.render_empty_file(*file_idx),
+            FlatRow::Line {
+                file_idx,
+                seg_idx,
+                global_line_idx,
+                is_last_in_file,
+            } => {
+                let seg = &self.cached_file_segments[*file_idx][*seg_idx];
+                if let LineSegment::Line(line) = seg {
+                    self.render_line_row(line, *file_idx, *global_line_idx, *is_last_in_file, entity)
+                } else {
+                    div().into_any_element()
+                }
+            }
+            FlatRow::CollapsedContext {
+                file_idx,
+                seg_idx: _,
+                count,
+                hunk_idx,
+                direction,
+                is_last_in_file,
+            } => self.render_collapsed_row(
+                *file_idx,
+                *count,
+                *hunk_idx,
+                *direction,
+                *is_last_in_file,
+                row_idx,
+                entity,
+            ),
+            FlatRow::LoadMore { remaining } => div()
+                .w_full()
+                .py_2()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .child(format!("{remaining} more files...")),
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn render_file_header(&self, file_idx: usize, entity: &Entity<Self>) -> AnyElement {
+        let files = self.active_files();
+        let file = &files[file_idx];
         let adds = file.additions();
         let dels = file.deletions();
-        let file_key = (section, file_idx);
+        let file_key = (self.active_section, file_idx);
         let is_collapsed = self.collapsed_files.contains(&file_key);
-        let entity_hdr = cx.entity().clone();
         let file_path = file.path.clone();
-
-        let mut container = div()
-            .id(ElementId::Name(format!("fdiff-{file_idx}").into()))
-            .flex()
-            .flex_col()
-            .w_full()
-            .mb_2();
+        let section = self.active_section;
 
         let status_color = match file.status {
             FileStatus::Added => colors::diff_added(),
@@ -716,383 +893,220 @@ impl GitDiffPanel {
             FileStatus::Renamed => colors::accent(),
         };
 
-        // File diff header — always visible
-        container = container.child(
-            div()
-                .id(ElementId::Name(format!("fhdr-{file_idx}").into()))
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .min_h(px(32.0))
-                .px_3()
-                .py(px(4.0))
-                .bg(file_header_bg())
-                .border_1()
-                .border_color(colors::border())
-                .when(is_collapsed, |d: Stateful<Div>| d.rounded_md())
-                .when(!is_collapsed, |d: Stateful<Div>| d.rounded_t_md())
-                .cursor_pointer()
-                .hover(|s| s.bg(colors::surface_hover()))
-                .on_click(move |_, _window, cx| {
-                    entity_hdr.update(cx, |panel, cx| {
-                        if panel.collapsed_files.contains(&file_key) {
-                            panel.collapsed_files.remove(&file_key);
-                        } else {
-                            panel.collapsed_files.insert(file_key);
-                        }
-                        cx.notify();
-                    });
-                })
-                // Status dot
-                .child(
-                    div()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .rounded_full()
-                        .bg(status_color)
-                        .flex_shrink_0()
-                        .mr_2(),
-                )
-                // File path + copy icon (grouped together, click copies)
-                .child({
-                    let path_for_copy = file.path.clone();
-                    let just_copied = self.copied_file_key == Some(file_key);
-                    let entity_copy = cx.entity().clone();
-                    let (icon, icon_color) = if just_copied {
-                        ("\u{2713}", colors::diff_added()) // checkmark in green
-                    } else {
-                        ("\u{2750}", colors::text_muted()) // copy icon
-                    };
-                    div()
-                        .id(ElementId::Name(format!("fcopy-{file_idx}").into()))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .flex_shrink_0()
-                        .gap(px(5.0))
-                        .cursor_pointer()
-                        .text_xs()
-                        .border_b_1()
-                        .border_color(gpui::rgba(0x00000000))
-                        .hover(|s| s.border_color(colors::accent()))
-                        .on_click(move |_, _window, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                path_for_copy.clone(),
-                            ));
-                            let entity = entity_copy.clone();
-                            entity_copy.update(cx, |panel, cx| {
-                                panel.copied_file_key = Some(file_key);
-                                cx.notify();
-                            });
-                            let fk = file_key;
-                            cx.defer(move |cx| {
-                                entity.update(cx, |panel, cx| {
-                                    panel._copied_timer = Some(cx.spawn(async move |this, cx| {
-                                        cx.background_executor()
-                                            .timer(std::time::Duration::from_millis(1500))
-                                            .await;
-                                        let _ = cx.update(|cx| {
-                                            let _ = this.update(cx, |panel, cx| {
-                                                if panel.copied_file_key == Some(fk) {
-                                                    panel.copied_file_key = None;
-                                                }
-                                                cx.notify();
-                                            });
-                                        });
-                                    }));
-                                });
-                            });
-                            cx.stop_propagation();
-                        })
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors::text())
-                                .child(file_path),
-                        )
-                        .child(
-                            div()
-                                .text_color(icon_color)
-                                .child(icon),
-                        )
-                })
-                // Spacer so stats + actions stay on the right
-                .child(div().flex_1())
-                // Stats (+N -M)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_1()
-                        .flex_shrink_0()
-                        .ml_2()
-                        .when(adds > 0, |d: Div| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors::diff_added())
-                                    .child(format!("+{adds}")),
-                            )
-                        })
-                        .when(dels > 0, |d: Div| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(colors::diff_removed())
-                                    .child(format!("-{dels}")),
-                            )
-                        }),
-                )
-                // Action buttons
-                .child({
-                    let mut actions = div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
-                        .flex_shrink_0()
-                        .ml_2();
-                    match section {
-                        DiffSection::Unstaged => {
-                            let entity_revert = cx.entity().clone();
-                            actions = actions.child(
-                                action_btn(format!("hdr-revert-{file_idx}"), "\u{21BA}")
-                                    .on_click(move |_, _window, cx| {
-                                        entity_revert.update(cx, |panel, cx| {
-                                            panel.pending_revert = Some(RevertTarget::Single(file_idx));
-                                            cx.notify();
-                                        });
-                                        cx.stop_propagation();
-                                    }),
-                            );
-                            let entity_stage = cx.entity().clone();
-                            actions = actions.child(
-                                action_btn(format!("hdr-stage-{file_idx}"), "+")
-                                    .on_click(move |_, _window, cx| {
-                                        entity_stage.update(cx, |panel, cx| {
-                                            panel.stage_file(file_idx);
-                                            cx.notify();
-                                        });
-                                        cx.stop_propagation();
-                                    }),
-                            );
-                        }
-                        DiffSection::Staged => {
-                            let entity_unstage = cx.entity().clone();
-                            actions = actions.child(
-                                action_btn(format!("hdr-unstage-{file_idx}"), "\u{2212}")
-                                    .on_click(move |_, _window, cx| {
-                                        entity_unstage.update(cx, |panel, cx| {
-                                            panel.unstage_file(file_idx);
-                                            cx.notify();
-                                        });
-                                        cx.stop_propagation();
-                                    }),
-                            );
-                        }
-                    }
-                    actions
-                }),
-        );
+        let entity_hdr = entity.clone();
+        let just_copied = self.copied_file_key == Some(file_key);
+        let (icon, icon_color) = if just_copied {
+            ("\u{f00c}", colors::diff_added()) // nf-fa-check
+        } else {
+            ("\u{f0c5}", colors::text_muted()) // nf-fa-copy
+        };
+        let path_for_copy = file.path.clone();
+        let entity_copy = entity.clone();
 
-        // Diff body — only when expanded
-        if !is_collapsed {
-            if file.hunks.is_empty() {
-                container = container.child(
-                    div()
-                        .w_full()
-                        .px_3()
-                        .py_3()
-                        .bg(colors::surface())
-                        .border_1()
-                        .border_t_0()
-                        .border_color(colors::border())
-                        .rounded_b_md()
-                        .text_xs()
-                        .text_color(colors::text_muted())
-                        .child("This file has no content"),
-                );
-            } else {
-                let all_lines = self.flatten_file_lines(file, file_idx, section);
-                container = container.child(self.render_line_blocks(&all_lines, file_idx, section, line_counter, line_texts, cx));
-            }
-        }
-
-        container
-    }
-
-    /// Flatten a file's hunks into a list of renderable segments.
-    fn flatten_file_lines(&self, file: &DiffFile, file_idx: usize, section: DiffSection) -> Vec<LineSegment> {
-        let mut segments: Vec<LineSegment> = Vec::new();
-
-        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-            let lines = &hunk.lines;
-            if lines.is_empty() {
-                continue;
-            }
-
-            let (extra_top, extra_bottom) = self
-                .expanded_context
-                .get(&(section, file_idx, hunk_idx))
-                .copied()
-                .unwrap_or((0, 0));
-
-            let change_indices: Vec<usize> = lines
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| !matches!(l.kind, DiffLineKind::Context))
-                .map(|(i, _)| i)
-                .collect();
-
-            if change_indices.is_empty() {
-                segments.push(LineSegment::CollapsedContext {
-                    count: lines.len(),
-                    _file_idx: file_idx,
-                    hunk_idx,
-                    direction: ExpandDirection::Top,
-                });
-                continue;
-            }
-
-            let first_change = *change_indices.first().unwrap();
-            let last_change = *change_indices.last().unwrap();
-
-            let visible_start = first_change.saturating_sub(DEFAULT_CONTEXT + extra_top);
-            let visible_end = (last_change + DEFAULT_CONTEXT + extra_bottom + 1).min(lines.len());
-
-            if visible_start > 0 {
-                segments.push(LineSegment::CollapsedContext {
-                    count: visible_start,
-                    _file_idx: file_idx,
-                    hunk_idx,
-                    direction: ExpandDirection::Top,
-                });
-            }
-
-            for line in &lines[visible_start..visible_end] {
-                segments.push(LineSegment::Line(line.clone()));
-            }
-
-            let hidden_below = lines.len().saturating_sub(visible_end);
-            if hidden_below > 0 {
-                segments.push(LineSegment::CollapsedContext {
-                    count: hidden_below,
-                    _file_idx: file_idx,
-                    hunk_idx,
-                    direction: ExpandDirection::Bottom,
-                });
-            }
-        }
-
-        segments
-    }
-
-    fn render_line_blocks(
-        &self,
-        segments: &[LineSegment],
-        file_idx: usize,
-        section: DiffSection,
-        line_counter: &std::cell::Cell<usize>,
-        line_texts: &std::cell::RefCell<Vec<String>>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let mut block = div()
+        let header = div()
+            .id(ElementId::Name(format!("fdiff-hdr-{file_idx}").into()))
             .flex()
-            .flex_col()
+            .flex_row()
+            .items_center()
             .w_full()
-            .border_l_1()
-            .border_r_1()
-            .border_b_1()
+            .min_h(px(32.0))
+            .px_3()
+            .py(px(4.0))
+            .bg(file_header_bg())
+            .border_1()
+            .border_color(colors::border())
+            .when(is_collapsed, |d: Stateful<Div>| d.rounded_md())
+            .when(!is_collapsed, |d: Stateful<Div>| d.rounded_t_md())
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()))
+            .on_click(move |_, _window, cx| {
+                entity_hdr.update(cx, |panel, cx| {
+                    if panel.collapsed_files.contains(&file_key) {
+                        panel.collapsed_files.remove(&file_key);
+                    } else {
+                        panel.collapsed_files.insert(file_key);
+                    }
+                    panel.flat_cache_dirty = true;
+                    cx.notify();
+                });
+            })
+            // Status dot
+            .child(
+                div()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(status_color)
+                    .flex_shrink_0()
+                    .mr_2(),
+            )
+            // File path + copy icon
+            .child({
+                div()
+                    .id(ElementId::Name(format!("fdiff-fcopy-{file_idx}").into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap(px(5.0))
+                    .cursor_pointer()
+                    .text_xs()
+                    .border_b_1()
+                    .border_color(gpui::rgba(0x00000000))
+                    .hover(|s| s.border_color(colors::accent()))
+                    .on_click(move |_, _window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(path_for_copy.clone()));
+                        let entity = entity_copy.clone();
+                        entity_copy.update(cx, |panel, cx| {
+                            panel.copied_file_key = Some(file_key);
+                            cx.notify();
+                        });
+                        let fk = file_key;
+                        cx.defer(move |cx| {
+                            entity.update(cx, |panel, cx| {
+                                panel._copied_timer = Some(cx.spawn(async move |this, cx| {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(1500))
+                                        .await;
+                                    let _ = cx.update(|cx| {
+                                        let _ = this.update(cx, |panel, cx| {
+                                            if panel.copied_file_key == Some(fk) {
+                                                panel.copied_file_key = None;
+                                            }
+                                            cx.notify();
+                                        });
+                                    });
+                                }));
+                            });
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors::text())
+                            .child(file_path),
+                    )
+                    .child(
+                        div()
+                            .text_color(icon_color)
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(11.0))
+                            .child(icon),
+                    )
+            })
+            // Spacer
+            .child(div().flex_1())
+            // Stats (+N -M)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .ml_2()
+                    .when(adds > 0, |d: Div| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors::diff_added())
+                                .child(format!("+{adds}")),
+                        )
+                    })
+                    .when(dels > 0, |d: Div| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors::diff_removed())
+                                .child(format!("-{dels}")),
+                        )
+                    }),
+            )
+            // Action buttons
+            .child({
+                let mut actions = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .flex_shrink_0()
+                    .ml_2();
+                match section {
+                    DiffSection::Unstaged => {
+                        let entity_revert = entity.clone();
+                        actions = actions.child(
+                            action_btn(format!("fdiff-revert-{file_idx}"), "\u{21BA}")
+                                .on_click(move |_, _window, cx| {
+                                    entity_revert.update(cx, |panel, cx| {
+                                        panel.pending_revert = Some(RevertTarget::Single(file_idx));
+                                        cx.notify();
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                        );
+                        let entity_stage = entity.clone();
+                        actions = actions.child(
+                            action_btn(format!("fdiff-stage-{file_idx}"), "+")
+                                .on_click(move |_, _window, cx| {
+                                    entity_stage.update(cx, |panel, cx| {
+                                        panel.stage_file(file_idx);
+                                        cx.notify();
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                        );
+                    }
+                    DiffSection::Staged => {
+                        let entity_unstage = entity.clone();
+                        actions = actions.child(
+                            action_btn(format!("fdiff-unstage-{file_idx}"), "\u{2212}")
+                                .on_click(move |_, _window, cx| {
+                                    entity_unstage.update(cx, |panel, cx| {
+                                        panel.unstage_file(file_idx);
+                                        cx.notify();
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                        );
+                    }
+                }
+                actions
+            });
+
+        let top_pad = if file_idx > 0 { 12.0 } else { 16.0 };
+        div()
+            .pt(px(top_pad))
+            .child(header)
+            .into_any_element()
+    }
+
+    fn render_empty_file(&self, file_idx: usize) -> AnyElement {
+        div()
+            .id(ElementId::Name(format!("fdiff-empty-{file_idx}").into()))
+            .w_full()
+            .px_3()
+            .py_3()
+            .bg(colors::surface())
+            .border_1()
+            .border_t_0()
             .border_color(colors::border())
             .rounded_b_md()
-            .overflow_hidden();
-
-        for (seg_idx, seg) in segments.iter().enumerate() {
-            match seg {
-                LineSegment::Line(line) => {
-                    let gli = line_counter.get();
-                    line_counter.set(gli + 1);
-                    line_texts
-                        .borrow_mut()
-                        .push(line.content.trim_end().to_string());
-                    block = block.child(self.render_diff_line(line, gli, cx));
-                }
-                LineSegment::CollapsedContext {
-                    count,
-                    hunk_idx,
-                    direction,
-                    ..
-                } => {
-                    let entity = cx.entity().clone();
-                    let hunk_idx = *hunk_idx;
-                    let dir = *direction;
-                    let label = format!("{count} unmodified lines");
-
-                    block = block.child(
-                        div()
-                            .id(ElementId::Name(
-                                format!("collapse-{file_idx}-{seg_idx}").into(),
-                            ))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .w_full()
-                            .h(px(26.0))
-                            .bg(collapse_bar_bg())
-                            .border_t_1()
-                            .border_b_1()
-                            .border_color(colors::border())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(colors::surface_hover()))
-                            .on_click(move |_, _window, cx| {
-                                entity.update(cx, |panel, cx| {
-                                    let entry = panel
-                                        .expanded_context
-                                        .entry((section, file_idx, hunk_idx))
-                                        .or_insert((0, 0));
-                                    match dir {
-                                        ExpandDirection::Top => entry.0 += EXPAND_STEP,
-                                        ExpandDirection::Bottom => entry.1 += EXPAND_STEP,
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .w(px(32.0))
-                                    .flex_shrink_0()
-                                    .text_color(colors::text_muted())
-                                    .text_xs()
-                                    .child("\u{25BC}")
-                                    .child("\u{25B2}"),
-                            )
-                            .child(
-                                div()
-                                    .ml_1()
-                                    .text_xs()
-                                    .text_color(colors::text_muted())
-                                    .child(label),
-                            ),
-                    );
-                }
-            }
-        }
-
-        block
+            .text_xs()
+            .text_color(colors::text_muted())
+            .child("This file has no content")
+            .into_any_element()
     }
 
-    fn render_diff_line(&self, line: &DiffLine, global_line_idx: usize, cx: &mut Context<Self>) -> Div {
+    fn render_line_row(
+        &self,
+        line: &DiffLine,
+        _file_idx: usize,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+        entity: &Entity<Self>,
+    ) -> AnyElement {
         let (row_bg, gutter_bg_color, text_col, prefix) = match line.kind {
-            DiffLineKind::Added => (
-                added_line_bg(),
-                added_gutter_bg(),
-                colors::diff_added(),
-                "+",
-            ),
+            DiffLineKind::Added => (added_line_bg(), added_gutter_bg(), colors::diff_added(), "+"),
             DiffLineKind::Removed => (
                 removed_line_bg(),
                 removed_gutter_bg(),
@@ -1112,8 +1126,8 @@ impl GitDiffPanel {
             _ => line.new_lineno.or(line.old_lineno),
         };
         let line_num_str = line_num.map(|n| format!("{n}")).unwrap_or_default();
-
         let content = line.content.trim_end();
+
         let content_el: AnyElement = if let Some(highlights) = line.highlights.as_ref() {
             if highlights.is_empty() {
                 div()
@@ -1126,9 +1140,11 @@ impl GitDiffPanel {
             } else {
                 let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
                     .iter()
-                    .filter(|s| s.byte_range.end <= content.len()
-                        && content.is_char_boundary(s.byte_range.start)
-                        && content.is_char_boundary(s.byte_range.end))
+                    .filter(|s| {
+                        s.byte_range.end <= content.len()
+                            && content.is_char_boundary(s.byte_range.start)
+                            && content.is_char_boundary(s.byte_range.end)
+                    })
                     .map(|s| {
                         (
                             s.byte_range.clone(),
@@ -1162,8 +1178,8 @@ impl GitDiffPanel {
         let line_selected = self.is_line_selected(global_line_idx);
         let final_bg = if line_selected { rgba(0x89b4fa30) } else { row_bg };
 
-        let entity_sel_down = cx.entity().clone();
-        let entity_sel_move = cx.entity().clone();
+        let entity_sel_down = entity.clone();
+        let entity_sel_move = entity.clone();
         let gli = global_line_idx;
 
         div()
@@ -1174,6 +1190,10 @@ impl GitDiffPanel {
             .bg(final_bg)
             .font_family("Menlo")
             .text_xs()
+            .border_l_1()
+            .border_r_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                 entity_sel_down.update(cx, |panel, cx| {
                     panel.copy_anchor_line = Some(gli);
@@ -1210,7 +1230,262 @@ impl GitDiffPanel {
                     .child(prefix.to_string()),
             )
             .child(content_el)
+            .into_any_element()
     }
+
+    fn render_collapsed_row(
+        &self,
+        file_idx: usize,
+        count: usize,
+        hunk_idx: usize,
+        direction: ExpandDirection,
+        is_last_in_file: bool,
+        row_idx: usize,
+        entity: &Entity<Self>,
+    ) -> AnyElement {
+        let entity = entity.clone();
+        let label = format!("{count} unmodified lines");
+        let dir = direction;
+        let section = self.active_section;
+
+        div()
+            .id(ElementId::Name(
+                format!("fdiff-collapse-{file_idx}-{row_idx}").into(),
+            ))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(22.0))
+            .bg(collapse_bar_bg())
+            .border_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Stateful<Div>| d.rounded_b_md())
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()))
+            .on_click(move |_, _window, cx| {
+                entity.update(cx, |panel, cx| {
+                    let entry = panel
+                        .expanded_context
+                        .entry((section, file_idx, hunk_idx))
+                        .or_insert((0, 0));
+                    match dir {
+                        ExpandDirection::Top => entry.0 += EXPAND_STEP,
+                        ExpandDirection::Bottom => entry.1 += EXPAND_STEP,
+                    }
+                    panel.flat_cache_dirty = true;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors::text_muted())
+                    .child(label),
+            )
+            .into_any_element()
+    }
+
+    /// Flatten a file's hunks into a list of renderable segments.
+    ///
+    /// When `source_lines` is available on the file, expanding context can reach
+    /// beyond hunk boundaries into the full file, and inter-hunk gaps are shown
+    /// as collapsible bars.
+    fn flatten_file_lines(&self, file: &DiffFile, file_idx: usize, section: DiffSection) -> Vec<LineSegment> {
+        let source = file.source_lines.as_deref();
+        let total_source = source.map(|s| s.len()).unwrap_or(0);
+        let mut segments: Vec<LineSegment> = Vec::new();
+        // Track last new_lineno shown (1-indexed), for inter-hunk gap computation.
+        let mut last_shown_ln: usize = 0;
+
+        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+            let lines = &hunk.lines;
+            if lines.is_empty() {
+                continue;
+            }
+
+            let (extra_top, extra_bottom) = self
+                .expanded_context
+                .get(&(section, file_idx, hunk_idx))
+                .copied()
+                .unwrap_or((0, 0));
+
+            // New-side file line range of this hunk.
+            let hunk_start_ln = lines.iter().find_map(|l| l.new_lineno).unwrap_or(1) as usize;
+            let hunk_end_ln = lines.iter().rev().find_map(|l| l.new_lineno).unwrap_or(1) as usize;
+
+            let change_indices: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| !matches!(l.kind, DiffLineKind::Context))
+                .map(|(i, _)| i)
+                .collect();
+
+            if change_indices.is_empty() {
+                if source.is_some() {
+                    let hidden = hunk_end_ln.saturating_sub(last_shown_ln);
+                    if hidden > 0 {
+                        segments.push(LineSegment::CollapsedContext {
+                            count: hidden,
+                            _file_idx: file_idx,
+                            hunk_idx,
+                            direction: ExpandDirection::Top,
+                        });
+                    }
+                    last_shown_ln = hunk_end_ln;
+                } else {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: lines.len(),
+                        _file_idx: file_idx,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+                continue;
+            }
+
+            let first_change = *change_indices.first().unwrap();
+            let last_change = *change_indices.last().unwrap();
+
+            // Hunk-local visible range (clamped to hunk bounds).
+            let hunk_vis_start = first_change.saturating_sub(DEFAULT_CONTEXT + extra_top);
+            let hunk_vis_end = (last_change + DEFAULT_CONTEXT + extra_bottom + 1).min(lines.len());
+
+            // How many extra lines we want beyond the hunk boundaries.
+            let overflow_top = (DEFAULT_CONTEXT + extra_top).saturating_sub(first_change);
+            let hunk_bottom_ctx = lines.len().saturating_sub(last_change + 1);
+            let overflow_bottom = (DEFAULT_CONTEXT + extra_bottom).saturating_sub(hunk_bottom_ctx);
+
+            if let Some(source) = source {
+                // How far back into the file to reach.
+                let source_top_ln = if overflow_top > 0 {
+                    hunk_start_ln
+                        .saturating_sub(overflow_top)
+                        .max(last_shown_ln + 1)
+                        .max(1)
+                } else {
+                    hunk_start_ln
+                };
+
+                // Inter-hunk / pre-hunk gap collapse bar.
+                let gap = source_top_ln.saturating_sub(last_shown_ln + 1);
+                if gap > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: gap,
+                        _file_idx: file_idx,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+
+                // Source lines before the hunk (expanded beyond its boundary).
+                if overflow_top > 0 {
+                    for ln in source_top_ln..hunk_start_ln {
+                        let idx = ln - 1;
+                        if let Some(sl) = source.get(idx) {
+                            segments.push(LineSegment::Line(DiffLine {
+                                kind: DiffLineKind::Context,
+                                content: sl.content.clone(),
+                                old_lineno: None,
+                                new_lineno: Some(ln as u32),
+                                highlights: sl.highlights.clone(),
+                            }));
+                        }
+                    }
+                }
+
+                // Within-hunk hidden top (when we haven't overflowed).
+                if hunk_vis_start > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hunk_vis_start,
+                        _file_idx: file_idx,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+
+                // Visible hunk lines.
+                for line in &lines[hunk_vis_start..hunk_vis_end] {
+                    segments.push(LineSegment::Line(line.clone()));
+                }
+
+                // Within-hunk hidden bottom.
+                let hidden_in_hunk_below = lines.len().saturating_sub(hunk_vis_end);
+                if hidden_in_hunk_below > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hidden_in_hunk_below,
+                        _file_idx: file_idx,
+                        hunk_idx,
+                        direction: ExpandDirection::Bottom,
+                    });
+                }
+
+                // Source lines after the hunk (expanded beyond its boundary).
+                let source_bottom_ln = if overflow_bottom > 0 {
+                    (hunk_end_ln + overflow_bottom).min(total_source)
+                } else {
+                    hunk_end_ln
+                };
+                if overflow_bottom > 0 {
+                    for ln in (hunk_end_ln + 1)..=source_bottom_ln {
+                        let idx = ln - 1;
+                        if let Some(sl) = source.get(idx) {
+                            segments.push(LineSegment::Line(DiffLine {
+                                kind: DiffLineKind::Context,
+                                content: sl.content.clone(),
+                                old_lineno: None,
+                                new_lineno: Some(ln as u32),
+                                highlights: sl.highlights.clone(),
+                            }));
+                        }
+                    }
+                }
+
+                last_shown_ln = source_bottom_ln;
+            } else {
+                // No source lines — original within-hunk-only logic.
+                if hunk_vis_start > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hunk_vis_start,
+                        _file_idx: file_idx,
+                        hunk_idx,
+                        direction: ExpandDirection::Top,
+                    });
+                }
+
+                for line in &lines[hunk_vis_start..hunk_vis_end] {
+                    segments.push(LineSegment::Line(line.clone()));
+                }
+
+                let hidden_below = lines.len().saturating_sub(hunk_vis_end);
+                if hidden_below > 0 {
+                    segments.push(LineSegment::CollapsedContext {
+                        count: hidden_below,
+                        _file_idx: file_idx,
+                        hunk_idx,
+                        direction: ExpandDirection::Bottom,
+                    });
+                }
+            }
+        }
+
+        // Collapse bar for file lines after the last hunk.
+        if source.is_some() && total_source > last_shown_ln && !file.hunks.is_empty() {
+            let remaining = total_source - last_shown_ln;
+            if remaining > 0 {
+                segments.push(LineSegment::CollapsedContext {
+                    count: remaining,
+                    _file_idx: file_idx,
+                    hunk_idx: file.hunks.len() - 1,
+                    direction: ExpandDirection::Bottom,
+                });
+            }
+        }
+
+        segments
+    }
+
 }
 
 // ── Shared action button helper ──
@@ -1245,10 +1520,33 @@ enum LineSegment {
     Line(DiffLine),
     CollapsedContext {
         count: usize,
+        #[allow(dead_code)]
         _file_idx: usize,
         hunk_idx: usize,
         direction: ExpandDirection,
     },
+}
+
+/// Row descriptor for the virtualized flat diff list.
+enum FlatRow {
+    FileHeader { file_idx: usize },
+    EmptyFile { file_idx: usize },
+    Line {
+        file_idx: usize,
+        seg_idx: usize,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+    },
+    CollapsedContext {
+        file_idx: usize,
+        #[allow(dead_code)]
+        seg_idx: usize,
+        count: usize,
+        hunk_idx: usize,
+        direction: ExpandDirection,
+        is_last_in_file: bool,
+    },
+    LoadMore { remaining: usize },
 }
 
 // ── File tree builder ──
@@ -1327,6 +1625,11 @@ fn insert_into_tree(
 
 impl Render for GitDiffPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Rebuild the flat row cache if data has changed
+        if self.flat_cache_dirty {
+            self.rebuild_flat_cache();
+        }
+
         let total_file_count = self.staged_files.len() + self.unstaged_files.len();
         let total_adds = self.total_additions();
         let total_dels = self.total_deletions();
@@ -1338,16 +1641,17 @@ impl Render for GitDiffPanel {
             .id("diff-panel")
             .flex()
             .flex_col()
-            .w_full()
+            .size_full()
+            .min_w(px(0.0))
             .flex_1()
-            .h_full()
+            .overflow_hidden()
             .bg(colors::surface())
             // Handle tree resize drag across the whole panel
             .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_move.update(cx, |panel, cx| {
                     if panel.resizing_tree {
                         let delta = f32::from(event.position.x) - panel.tree_drag_start_x;
-                        let new_w = (panel.tree_drag_start_width + delta).clamp(80.0, panel.width - 100.0);
+                        let new_w = (panel.tree_drag_start_width + delta).clamp(MIN_TREE_WIDTH, MAX_TREE_WIDTH);
                         panel.tree_width = new_w;
                         cx.notify();
                     }
@@ -1400,7 +1704,7 @@ impl Render for GitDiffPanel {
                         .child(if total_file_count == 0 {
                             "No Changes".to_string()
                         } else {
-                            format!("{section_label} \u{00B7} {active_count} files")
+                            section_label.to_string()
                         }),
                 )
                 .when(total_adds > 0 || total_dels > 0, |d: Div| {
@@ -1410,6 +1714,15 @@ impl Render for GitDiffPanel {
                             .flex()
                             .flex_row()
                             .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors::text_muted())
+                                    .child(format!(
+                                        "{active_count} file{}",
+                                        if active_count == 1 { "" } else { "s" }
+                                    )),
+                            )
                             .when(total_adds > 0, |d: Div| {
                                 d.child(
                                     div()
@@ -1453,6 +1766,8 @@ impl Render for GitDiffPanel {
             .flex()
             .flex_row()
             .flex_1()
+            .w_full()
+            .min_w(px(0.0))
             .overflow_hidden();
 
         // File tree sidebar
@@ -1461,7 +1776,7 @@ impl Render for GitDiffPanel {
             .flex()
             .flex_col()
             .w(px(tree_width))
-            .min_w(px(80.0))
+            .flex_shrink_0()
             .h_full()
             .border_r_1()
             .border_color(colors::border())
@@ -1486,62 +1801,46 @@ impl Render for GitDiffPanel {
                         panel.tree_drag_start_width = panel.tree_width;
                         cx.notify();
                     });
+                    cx.stop_propagation();
                 }),
         );
 
-        // Diff content (scrollable) — only shows active section, paginated
-        let section = self.active_section;
-        let files = self.active_files().to_vec();
-        let render_limit = self.rendered_file_limit.min(files.len());
-        let line_counter = std::cell::Cell::new(0usize);
-        let line_texts = std::cell::RefCell::new(Vec::<String>::new());
+        // Diff content — virtualized with list (supports variable row heights)
+        let entity_list = cx.entity().clone();
 
-        let mut diff_content = div()
-            .id("diff-panel-content")
+        let diff_list = list(
+            self.list_state.clone(),
+            move |ix, _window, cx| {
+                let panel = entity_list.read(cx);
+                panel.render_flat_row(ix, &entity_list)
+            },
+        )
+        .flex_1();
+
+        let diff_content = div()
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(100.0))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
-            .p_2();
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .px(px(16.0))
+            .child(diff_list);
 
-        for (idx, file) in files.iter().enumerate().take(render_limit) {
-            diff_content = diff_content.child(
-                self.render_file_diff(file, idx, section, &line_counter, &line_texts, cx),
-            );
-        }
-
-        self.copy_line_contents = line_texts.into_inner();
-
-        // Auto-load more files: show a sentinel and schedule the next batch
-        let remaining = files.len().saturating_sub(render_limit);
+        // Auto-load more files if there are un-rendered files
+        let render_limit = self.rendered_file_limit.min(self.active_files().len());
+        let remaining = self.active_files().len().saturating_sub(render_limit);
         if remaining > 0 {
-            diff_content = diff_content.child(
-                div()
-                    .w_full()
-                    .py_2()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors::text_muted())
-                            .child(format!("{remaining} more files...")),
-                    ),
-            );
-
-            // Schedule the next batch load after a brief delay
             let entity_more = cx.entity().clone();
-            let total = files.len();
             cx.spawn(async move |_, cx| {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(50))
                     .await;
                 let _ = cx.update(|cx| {
                     let _ = entity_more.update(cx, |panel, cx| {
+                        let total = panel.active_files().len();
                         if panel.rendered_file_limit < total {
                             panel.rendered_file_limit += FILE_RENDER_BATCH;
+                            panel.flat_cache_dirty = true;
                             cx.notify();
                         }
                     });
@@ -1550,9 +1849,14 @@ impl Render for GitDiffPanel {
             .detach();
         }
 
-        // Handle scroll-to-file request
-        if let Some(target_idx) = self.scroll_to_file.take() {
-            self.scroll_handle.scroll_to_item(target_idx);
+        // Handle scroll-to-file: convert file_idx to flat row index
+        if let Some(target_file) = self.scroll_to_file.take() {
+            if let Some(&row_idx) = self.flat_file_starts.get(target_file) {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: row_idx,
+                    offset_in_item: px(0.),
+                });
+            }
         }
 
         body = body.child(diff_content);

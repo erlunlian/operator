@@ -219,21 +219,24 @@ impl TerminalModel {
                     cursor.line.0.hash(&mut hasher);
                     cursor.column.0.hash(&mut hasher);
 
-                    // Hash ALL visible lines for accurate change detection
-                    let mut bottom_lines: Vec<String> = Vec::new();
+                    // Hash all visible cells and collect bottom lines for Claude status detection.
+                    // Reuse a single String buffer across lines to avoid per-line allocations.
+                    let bottom_start = screen_lines.saturating_sub(8);
+                    let mut bottom_lines: Vec<String> = Vec::with_capacity(8);
+                    let mut line_buf = String::with_capacity(cols);
                     for line_idx in 0..screen_lines {
                         let row = &grid[alacritty_terminal::index::Line(line_idx as i32)];
-                        let mut line_text_full = String::new();
+                        let need_text = line_idx >= bottom_start;
+                        if need_text { line_buf.clear(); }
                         for col_idx in 0..cols {
                             let cell = &row[alacritty_terminal::index::Column(col_idx)];
                             cell.c.hash(&mut hasher);
-                            if cell.c != '\0' {
-                                line_text_full.push(cell.c);
+                            if need_text && cell.c != '\0' {
+                                line_buf.push(cell.c);
                             }
                         }
-                        // Collect bottom lines (with spaces) for Claude status detection
-                        if line_idx >= screen_lines.saturating_sub(8) {
-                            let trimmed = line_text_full.trim();
+                        if need_text {
+                            let trimmed = line_buf.trim();
                             if !trimmed.is_empty() {
                                 bottom_lines.push(trimmed.to_string());
                             }
@@ -323,6 +326,27 @@ impl TerminalModel {
     pub fn mark_claude_as_read(&self) {
         *self.has_unread_response.lock().unwrap() = false;
     }
+
+    /// Estimate the memory used by this terminal's grid (screen + scrollback).
+    /// Returns (total_bytes, total_lines, columns).
+    pub fn estimated_grid_bytes(&self) -> (usize, usize, usize) {
+        use alacritty_terminal::grid::Dimensions;
+        let term = self.term.lock();
+        let total_lines = term.grid().total_lines();
+        let cols = term.grid().columns();
+        // 24 bytes per Cell (asserted by alacritty_terminal)
+        let bytes = total_lines * cols * 24;
+        (bytes, total_lines, cols)
+    }
+}
+
+impl Drop for TerminalModel {
+    fn drop(&mut self) {
+        // Tell the event loop (and its PTY reader thread) to shut down.
+        // Without this, the thread keeps running and holds the Arc<Term>
+        // (with all its scrollback history) alive indefinitely.
+        let _ = self.event_loop_sender.send(Msg::Shutdown);
+    }
 }
 
 fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<DetectedClaudeStatus>>) {
@@ -342,13 +366,6 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
 
         // ── Working indicators ──
 
-        // Claude Code thinking label: "Infusing…", "Tomfoolering…", etc.
-        // Always a single word ending in "ing" + ellipsis.
-        if trimmed.ends_with("ing\u{2026}") || trimmed.ends_with("ing...") {
-            found_working = true;
-            continue;
-        }
-
         // "esc to interrupt" only appears in the status bar during active work
         if trimmed.contains("esc to interrupt") {
             found_working = true;
@@ -356,17 +373,10 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
             continue;
         }
 
-        // Tool call patterns visible on screen
-        if trimmed.contains("Read(")
-            || trimmed.contains("Edit(")
-            || trimmed.contains("Write(")
-            || trimmed.contains("Bash(")
-            || trimmed.contains("Agent(")
-            || trimmed.contains("Grep(")
-            || trimmed.contains("Glob(")
-            || trimmed.contains("Skill(")
-            || trimmed.contains("Cooked for")
-            || trimmed.contains("Compiling")
+        // Claude Code spinner: single word ending in "ing" + ellipsis.
+        // Must be a standalone short token (not a sentence fragment).
+        if (trimmed.ends_with("ing\u{2026}") || trimmed.ends_with("ing..."))
+            && !trimmed.contains(' ')
         {
             found_working = true;
             continue;
@@ -374,10 +384,16 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
 
         // ── Claude running (but idle) indicators ──
 
-        // Status bar mode text — present whenever Claude Code is running
+        // Status bar mode text — present whenever Claude Code is running.
+        // Also matches the input prompt area ("> ", cost display, etc.)
         if trimmed.contains("auto mode on")
             || trimmed.contains("plan mode")
             || trimmed.contains("shift+tab to cycle")
+            || trimmed.contains("voice mode")
+            || trimmed.contains("/help")
+            || trimmed.starts_with('>')
+            || trimmed.contains("Cost:")
+            || trimmed.contains("$ cost")
         {
             found_claude_running = true;
             continue;
@@ -399,8 +415,12 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
         *s = DetectedClaudeStatus::WaitingForInput;
     } else if found_shell_prompt {
         *s = DetectedClaudeStatus::NotRunning;
+    } else if *s == DetectedClaudeStatus::Working {
+        // Nothing matched — Claude likely finished but the idle indicators
+        // scrolled off the bottom 8 lines. Decay to WaitingForInput rather
+        // than staying stuck on Working forever.
+        *s = DetectedClaudeStatus::WaitingForInput;
     }
-    // Otherwise keep current state
 }
 
 // ── Color conversion ──

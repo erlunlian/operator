@@ -1,5 +1,8 @@
 use serde::Deserialize;
-use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const GITHUB_REPO: &str = "erlunlian/operator";
+const CHECK_INTERVAL_SECS: u64 = 3600; // 1 hour
 
 #[derive(Deserialize)]
 struct GitHubRelease {
@@ -19,37 +22,46 @@ pub struct UpdateInfo {
 }
 
 /// Check GitHub releases for a newer version. Runs synchronously (call from background thread).
+/// Skips the network request if the last check was less than an hour ago.
 pub fn check_for_update(current_version: &str) -> Option<UpdateInfo> {
-    let output = Command::new("curl")
-        .args([
-            "-sL",
-            "-H",
-            "Accept: application/vnd.github+json",
-            &format!(
-                "https://api.github.com/repos/erlunlian/operator/releases/latest"
-            ),
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    if !should_check() {
         return None;
     }
 
-    let release: GitHubRelease = serde_json::from_slice(&output.stdout).ok()?;
-    let latest = release.tag_name.trim_start_matches('v');
+    let url = format!(
+        "https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    );
+
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .user_agent("operator-updater")
+        .build()
+        .new_agent();
+
+    let response: GitHubRelease = agent
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .ok()?
+        .body_mut()
+        .read_json()
+        .ok()?;
+
+    record_check();
+
+    let latest = response.tag_name.trim_start_matches('v');
     let current = current_version.trim_start_matches('v');
 
     if version_newer(latest, current) {
-        let dmg_url = release
+        let dmg_url = response
             .assets
             .iter()
             .find(|a| a.name.ends_with(".dmg"))
             .map(|a| a.browser_download_url.clone())
             .unwrap_or_else(|| {
                 format!(
-                    "https://github.com/erlunlian/operator/releases/tag/{}",
-                    release.tag_name
+                    "https://github.com/{GITHUB_REPO}/releases/tag/{}",
+                    response.tag_name
                 )
             });
 
@@ -60,6 +72,34 @@ pub fn check_for_update(current_version: &str) -> Option<UpdateInfo> {
     } else {
         None
     }
+}
+
+/// Returns true if enough time has passed since the last check.
+fn should_check() -> bool {
+    let path = cache_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let last: u64 = contents.trim().parse().unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(last) >= CHECK_INTERVAL_SECS
+}
+
+/// Record the current time as the last check timestamp.
+fn record_check() {
+    let path = cache_path();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(&path, now.to_string());
+}
+
+fn cache_path() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("operator-last-update-check")
 }
 
 /// Simple semver comparison: returns true if `a` is newer than `b`.

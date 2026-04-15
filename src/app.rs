@@ -1315,9 +1315,7 @@ impl Render for OperatorApp {
                     });
                 }),
                 sidebar_width,
-                self.update_info.as_ref().map(|info| {
-                    (info.latest_version.as_str(), info.download_url.as_str())
-                }),
+                self.update_info.as_ref(),
             ))
         } else {
             None

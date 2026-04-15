@@ -131,28 +131,30 @@ impl GitRepo {
             None => return Vec::new(),
         };
 
-        // Resolve base ref: try local branch, remote tracking, then general revparse
-        let base_oid = self
-            .repo
-            .find_branch(base_ref, BranchType::Local)
-            .ok()
-            .and_then(|b| b.get().peel_to_commit().ok())
-            .map(|c| c.id())
-            .or_else(|| {
-                let remote_ref = format!("origin/{base_ref}");
-                self.repo
-                    .find_branch(&remote_ref, BranchType::Remote)
-                    .ok()
-                    .and_then(|b| b.get().peel_to_commit().ok())
-                    .map(|c| c.id())
-            })
-            .or_else(|| {
-                self.repo
-                    .revparse_single(base_ref)
-                    .ok()
-                    .and_then(|obj| obj.peel_to_commit().ok())
-                    .map(|c| c.id())
-            });
+        // Resolve base ref: prefer remote tracking branch (origin/<base>) over local,
+        // since the local branch may be stale while origin reflects the actual GitHub state.
+        let base_oid = {
+            let remote_ref = format!("origin/{base_ref}");
+            self.repo
+                .find_branch(&remote_ref, BranchType::Remote)
+                .ok()
+                .and_then(|b| b.get().peel_to_commit().ok())
+                .map(|c| c.id())
+        }
+        .or_else(|| {
+            self.repo
+                .find_branch(base_ref, BranchType::Local)
+                .ok()
+                .and_then(|b| b.get().peel_to_commit().ok())
+                .map(|c| c.id())
+        })
+        .or_else(|| {
+            self.repo
+                .revparse_single(base_ref)
+                .ok()
+                .and_then(|obj| obj.peel_to_commit().ok())
+                .map(|c| c.id())
+        });
 
         let base_oid = match base_oid {
             Some(oid) => oid,

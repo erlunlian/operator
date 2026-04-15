@@ -1,14 +1,25 @@
 use gpui::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Term, TermMode};
+use regex::Regex;
 use crate::terminal::terminal::{alac_color_to_gpui, JsonListener, TerminalModel};
 use crate::theme::colors;
+
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://[^\s<>"{}|\\^`\[\]]+"#).unwrap()
+});
+
+/// Matches GitHub shorthand like `owner/repo#123` (PRs and issues).
+static GITHUB_REF_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+#\d+").unwrap()
+});
 
 const CELL_HEIGHT_PX: f32 = 16.0;
 const PADDING_PX: f32 = 8.0;
@@ -31,6 +42,14 @@ impl GridPos {
     }
 }
 
+#[derive(Clone, Debug)]
+struct HoveredUrl {
+    url: String,
+    line: usize,
+    start_col: usize,
+    end_col: usize, // exclusive
+}
+
 fn rgba_to_hsla(c: Rgba) -> Hsla {
     Hsla::from(c)
 }
@@ -48,6 +67,8 @@ pub struct TerminalView {
     scroll_px: f32,
     /// Set by prepaint when terminal dimensions change; scroll handler resets scroll_px.
     size_changed: Arc<AtomicBool>,
+    /// URL currently hovered with Cmd held (for underline + click-to-open).
+    hovered_url: Option<HoveredUrl>,
 }
 
 impl TerminalView {
@@ -82,6 +103,7 @@ impl TerminalView {
             has_been_focused: false,
             scroll_px: 0.0,
             size_changed: Arc::new(AtomicBool::new(false)),
+            hovered_url: None,
         }
     }
 
@@ -156,6 +178,88 @@ impl TerminalView {
         result
     }
 
+    /// Convert a regex match span to a HoveredUrl if the cursor is within it.
+    fn match_to_hovered(&self, url: &str, start_byte: usize, end_byte: usize, pos: GridPos, byte_to_col: &[usize]) -> Option<HoveredUrl> {
+        let start_col = byte_to_col.get(start_byte).copied()?;
+        let end_col = if end_byte > 0 {
+            byte_to_col.get(end_byte - 1).map(|c| c + 1)?
+        } else {
+            return None;
+        };
+        if pos.col >= start_col && pos.col < end_col {
+            Some(HoveredUrl {
+                url: url.to_string(),
+                line: pos.line,
+                start_col,
+                end_col,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Detect a URL under the given screen position by regex-matching the terminal line text.
+    fn detect_url_at(&self, pos: GridPos, term: &Arc<FairMutex<Term<JsonListener>>>) -> Option<HoveredUrl> {
+        let term_lock = term.lock();
+        let grid = term_lock.grid();
+        let display_offset = grid.display_offset();
+        let num_cols = grid.columns();
+        let screen_lines = grid.screen_lines();
+
+        if pos.line >= screen_lines {
+            return None;
+        }
+
+        let grid_line = Line(pos.line as i32 - display_offset as i32);
+        let row = &grid[grid_line];
+
+        // Build line text, tracking byte offset → column mapping
+        let mut line_text = String::new();
+        let mut byte_to_col: Vec<usize> = Vec::new();
+
+        for col_idx in 0..num_cols {
+            let cell = &row[Column(col_idx)];
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            let start = line_text.len();
+            line_text.push(ch);
+            for _ in start..line_text.len() {
+                byte_to_col.push(col_idx);
+            }
+        }
+
+        // Check full URLs (https://...)
+        for m in URL_REGEX.find_iter(&line_text) {
+            let mut url = m.as_str();
+            let mut end_byte = m.end();
+            while url.ends_with(|c: char| ".,;:!?)>]".contains(c)) {
+                url = &url[..url.len() - 1];
+                end_byte -= 1;
+            }
+            if url.len() < 10 {
+                continue;
+            }
+            if let Some(hit) = self.match_to_hovered(url, m.start(), end_byte, pos, &byte_to_col) {
+                return Some(hit);
+            }
+        }
+
+        // Check GitHub shorthand (owner/repo#123)
+        for m in GITHUB_REF_REGEX.find_iter(&line_text) {
+            let text = m.as_str();
+            if let Some((owner_repo, num)) = text.rsplit_once('#') {
+                let url = format!("https://github.com/{owner_repo}/issues/{num}");
+                if let Some(hit) = self.match_to_hovered(&url, m.start(), m.end(), pos, &byte_to_col) {
+                    return Some(hit);
+                }
+            }
+        }
+
+        None
+    }
+
 }
 
 impl Render for TerminalView {
@@ -177,6 +281,8 @@ impl Render for TerminalView {
 
         let sel_start = self.selection_start;
         let sel_end = self.selection_end;
+        let hovered_url = self.hovered_url.clone();
+        let show_pointer = self.hovered_url.is_some();
 
         let grid_canvas = canvas(
             // Prepaint: resize detection
@@ -322,7 +428,11 @@ impl Render for TerminalView {
                                 (false, false) => font_normal.clone(),
                             };
 
-                            let underline_style = if rc.underline {
+                            let is_url_hover = hovered_url.as_ref().map_or(false, |hu| {
+                                *screen_row == hu.line && rc.col >= hu.start_col && rc.col < hu.end_col
+                            });
+
+                            let underline_style = if rc.underline || is_url_hover {
                                 Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba_to_hsla(fg)), wavy: rc.undercurl })
                             } else { None };
 
@@ -370,7 +480,7 @@ impl Render for TerminalView {
         )
         .size_full();
 
-        div()
+        let mut container = div()
             .id("terminal-view")
             .relative()
             .flex()
@@ -379,10 +489,25 @@ impl Render for TerminalView {
             .bg(colors::bg())
             .overflow_hidden()
             .track_focus(&self.focus_handle)
-            .child(grid_canvas)
+            .child(grid_canvas);
+        if show_pointer {
+            container = container.cursor(CursorStyle::PointingHand);
+        }
+        container
             // ── Mouse ──
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.focus(window);
+                // Cmd+Click: open URL in browser
+                if event.modifiers.platform {
+                    let term = this.terminal.read(cx).term.clone();
+                    let pos = this.mouse_to_grid(event.position);
+                    if let Some(hit) = this.detect_url_at(pos, &term) {
+                        let _ = std::process::Command::new("open").arg(&hit.url).spawn();
+                        this.hovered_url = None;
+                        cx.notify();
+                        return;
+                    }
+                }
                 let term_model = this.terminal.read(cx);
                 let has_mouse_mode = {
                     let t = term_model.term.lock();
@@ -401,6 +526,18 @@ impl Render for TerminalView {
                 cx.notify();
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                // URL hover detection when no button is pressed
+                if event.pressed_button.is_none() {
+                    if event.modifiers.platform {
+                        let term = this.terminal.read(cx).term.clone();
+                        let pos = this.mouse_to_grid(event.position);
+                        this.hovered_url = this.detect_url_at(pos, &term);
+                        cx.notify();
+                    } else if this.hovered_url.take().is_some() {
+                        cx.notify();
+                    }
+                    return;
+                }
                 if event.pressed_button != Some(MouseButton::Left) {
                     return;
                 }

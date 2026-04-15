@@ -3983,6 +3983,7 @@ dependencies = [
  "portable-pty",
  "pulldown-cmark",
  "raw-window-handle",
+ "regex",
  "serde",
  "serde_json",
  "shlex",

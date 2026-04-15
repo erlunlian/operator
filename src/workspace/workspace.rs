@@ -115,13 +115,6 @@ impl Workspace {
             })
     }
 
-    pub fn short_dir(&self) -> String {
-        match &self.directory {
-            Some(dir) => crate::util::short_path(dir),
-            None => "No directory".to_string(),
-        }
-    }
-
     fn with_layout(
         &self,
         cx: &mut Context<Self>,

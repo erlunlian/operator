@@ -25,7 +25,6 @@ fn start_window_drag_native() {}
 /// Data for rendering a single workspace card in the sidebar
 pub struct WorkspaceCardData {
     pub name: SharedString,
-    pub directory: String,
     pub git_branch: Option<String>,
     /// Per-pane Claude statuses (only non-idle entries).
     pub pane_statuses: Vec<ClaudeStatus>,
@@ -258,7 +257,6 @@ impl WorkspaceSidebar {
 
         let pane_statuses = ws.pane_statuses.clone();
         let git_branch = ws.git_branch.clone();
-        let directory = ws.directory.clone();
 
         let mut card = div()
             .id(ElementId::Name(format!("ws-card-{ix}").into()))
@@ -337,7 +335,11 @@ impl WorkspaceSidebar {
         // Text content
         let mut text_col = div().flex().flex_col().flex_1().overflow_x_hidden();
 
-        // Title (bold, truncated)
+        // Title: use git branch if available, otherwise workspace name
+        let title = git_branch
+            .as_ref()
+            .map(|b| SharedString::from(b.clone()))
+            .unwrap_or_else(|| ws.name.clone());
         text_col = text_col.child(
             div()
                 .text_sm()
@@ -345,7 +347,7 @@ impl WorkspaceSidebar {
                 .text_color(colors::text())
                 .overflow_x_hidden()
                 .text_ellipsis()
-                .child(ws.name.clone()),
+                .child(title),
         );
 
         // Per-pane Claude status rows
@@ -364,27 +366,17 @@ impl WorkspaceSidebar {
             }
         }
 
-        // Branch line
-        if let Some(branch) = git_branch {
+        // Workspace name subtitle (when branch is the title, show name below)
+        if git_branch.is_some() {
             text_col = text_col.child(
                 div()
                     .text_xs()
                     .text_color(colors::text_muted())
                     .overflow_x_hidden()
                     .text_ellipsis()
-                    .child(branch),
+                    .child(ws.name.clone()),
             );
         }
-
-        // Directory line
-        text_col = text_col.child(
-            div()
-                .text_xs()
-                .text_color(colors::text_muted())
-                .overflow_x_hidden()
-                .text_ellipsis()
-                .child(directory),
-        );
 
         card = card.child(text_col);
 

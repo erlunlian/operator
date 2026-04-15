@@ -1422,7 +1422,6 @@ impl Render for OperatorApp {
                 let ws = ws.read(cx);
                 WorkspaceCardData {
                     name: ws.name.clone(),
-                    directory: ws.short_dir(),
                     git_branch: ws.git_branch.clone(),
                     pane_statuses: ws.pane_statuses.clone(),
                 }

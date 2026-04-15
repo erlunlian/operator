@@ -120,7 +120,10 @@ fn main() {
             Menu {
                 name: "Operator".into(),
                 items: vec![
-                    MenuItem::action("About Operator", About),
+                    MenuItem::action(
+                        &format!("About Operator v{}", env!("CARGO_PKG_VERSION")),
+                        About,
+                    ),
                     MenuItem::separator(),
                     MenuItem::action("Check for Updates...", CheckForUpdates),
                     MenuItem::action("Settings...", ToggleSettings),

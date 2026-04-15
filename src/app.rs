@@ -52,6 +52,8 @@ pub struct OperatorApp {
     quit_requested: bool,
     /// Drop indicator index for workspace sidebar drag reorder.
     ws_drop_index: Option<usize>,
+    /// Available update info (checked on startup).
+    pub update_info: Option<crate::updater::UpdateInfo>,
     /// Handle to the current diff file-watcher task. Dropped (cancelled) before
     /// starting a new watcher so old watchers don't accumulate.
     diff_watcher_task: Option<Task<()>>,
@@ -83,7 +85,7 @@ impl OperatorApp {
         let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
-        Self {
+        let mut app = Self {
             workspaces: vec![ws],
             active_workspace_ix: 0,
             sidebar_collapsed: false,
@@ -102,10 +104,13 @@ impl OperatorApp {
             recent_projects: RecentProjects::load(),
             quit_requested: false,
             ws_drop_index: None,
+            update_info: None,
             diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
-        }
+        };
+        app.check_for_updates(cx);
+        app
     }
 
     pub fn from_restored(
@@ -144,7 +149,7 @@ impl OperatorApp {
         let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
-        Self {
+        let mut app = Self {
             workspaces,
             active_workspace_ix,
             sidebar_collapsed,
@@ -163,10 +168,13 @@ impl OperatorApp {
             recent_projects: RecentProjects::load(),
             quit_requested: false,
             ws_drop_index: None,
+            update_info: None,
             diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
-        }
+        };
+        app.check_for_updates(cx);
+        app
     }
 
     fn register_quit_handler(cx: &mut Context<Self>) {
@@ -378,6 +386,25 @@ impl OperatorApp {
             }
         });
         Some(task)
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::updater::check_for_update(&current) })
+                .await;
+            if let Some(info) = result {
+                let _ = cx.update(|cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        app.update_info = Some(info);
+                        cx.notify();
+                    });
+                });
+            }
+        })
+        .detach();
     }
 
     pub fn active_workspace(&self) -> &Entity<Workspace> {
@@ -1500,6 +1527,7 @@ impl Render for OperatorApp {
                     });
                 }),
                 sidebar_width,
+                self.update_info.as_ref(),
             ))
         } else {
             None

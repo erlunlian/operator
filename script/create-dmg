@@ -1,0 +1,50 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_NAME="Operator"
+APP_BUNDLE="target/release/${APP_NAME}.app"
+DMG_OUTPUT="target/release/${APP_NAME}.dmg"
+DMG_VOLUME_NAME="${APP_NAME}"
+DMG_TEMP="target/release/${APP_NAME}-temp.dmg"
+
+if [ ! -d "$APP_BUNDLE" ]; then
+    echo "Error: $APP_BUNDLE not found. Run 'make release' first."
+    exit 1
+fi
+
+# Clean up any previous DMG
+rm -f "$DMG_OUTPUT" "$DMG_TEMP"
+
+# Create a temporary directory for the DMG contents
+STAGING_DIR=$(mktemp -d)
+trap 'rm -rf "$STAGING_DIR"' EXIT
+
+cp -R "$APP_BUNDLE" "$STAGING_DIR/"
+ln -s /Applications "$STAGING_DIR/Applications"
+
+# Calculate size needed (app size + some padding)
+APP_SIZE_KB=$(du -sk "$STAGING_DIR" | cut -f1)
+DMG_SIZE_KB=$((APP_SIZE_KB + 1024))
+
+# Create a temporary read-write DMG
+hdiutil create \
+    -srcfolder "$STAGING_DIR" \
+    -volname "$DMG_VOLUME_NAME" \
+    -fs HFS+ \
+    -fsargs "-c c=64,a=16,e=16" \
+    -format UDRW \
+    -size "${DMG_SIZE_KB}k" \
+    "$DMG_TEMP"
+
+# Convert to compressed read-only DMG
+hdiutil convert "$DMG_TEMP" \
+    -format UDZO \
+    -imagekey zlib-level=9 \
+    -o "$DMG_OUTPUT"
+
+rm -f "$DMG_TEMP"
+
+echo ""
+echo "Done! DMG created at: $DMG_OUTPUT"
+echo ""
+echo "DMG size: $(du -h "$DMG_OUTPUT" | cut -f1)"

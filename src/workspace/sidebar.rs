@@ -88,6 +88,7 @@ impl WorkspaceSidebar {
         on_drop_index_change: Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>,
         on_drag_end: Rc<dyn Fn(&mut Window, &mut App)>,
         width: f32,
+        update_info: Option<&crate::updater::UpdateInfo>,
     ) -> Stateful<Div> {
         let on_drag_end2 = on_drag_end.clone();
 
@@ -187,6 +188,42 @@ impl WorkspaceSidebar {
                     on_new(window, cx);
                 }),
         );
+
+        // Update available indicator
+        if let Some(info) = update_info {
+            let url = info.download_url.clone();
+            let version = info.latest_version.clone();
+            sidebar = sidebar.child(
+                div()
+                    .id("update-indicator")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(colors::border())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(colors::surface_hover()))
+                    .on_click(move |_, _window, cx| {
+                        cx.open_url(&url);
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(colors::accent())
+                            .child("\u{2191}"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .child(format!("v{version} available")),
+                    ),
+            );
+        }
 
         sidebar
     }

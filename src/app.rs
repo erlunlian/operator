@@ -61,6 +61,8 @@ pub struct OperatorApp {
     debug_panel: Entity<DebugPanel>,
     /// Background task that periodically logs metrics to stderr.
     _metrics_log_task: Task<()>,
+    /// Background task that periodically checks for updates.
+    _update_check_task: Task<()>,
 }
 
 impl OperatorApp {
@@ -85,6 +87,7 @@ impl OperatorApp {
         let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
+        let update_check_task = Self::start_periodic_update_check(cx);
         let mut app = Self {
             workspaces: vec![ws],
             active_workspace_ix: 0,
@@ -108,6 +111,7 @@ impl OperatorApp {
             diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
+            _update_check_task: update_check_task,
         };
         app.check_for_updates(cx, false);
         app
@@ -149,6 +153,7 @@ impl OperatorApp {
         let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
 
+        let update_check_task = Self::start_periodic_update_check(cx);
         let mut app = Self {
             workspaces,
             active_workspace_ix,
@@ -172,6 +177,7 @@ impl OperatorApp {
             diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
+            _update_check_task: update_check_task,
         };
         app.check_for_updates(cx, false);
         app
@@ -386,6 +392,22 @@ impl OperatorApp {
             }
         });
         Some(task)
+    }
+
+    /// Spawn a background loop that checks for updates every hour.
+    fn start_periodic_update_check(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3600))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        app.check_for_updates(cx, false);
+                    });
+                });
+            }
+        })
     }
 
     fn check_for_updates_manual(&mut self, _: &CheckForUpdates, _window: &mut Window, cx: &mut Context<Self>) {

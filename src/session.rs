@@ -404,20 +404,20 @@ impl SessionState {
 
         let diff_view_split = self.settings.diff_view_split;
         let right_panel = cx.new(|cx| {
-            let diff_panel = cx.new(|_cx| {
+            let diff_panel = cx.new(|cx| {
                 let mut panel = if let Some(dir) = &active_ws_dir {
-                    crate::git::GitDiffPanel::new(dir.clone())
+                    crate::git::GitDiffPanel::new(dir.clone(), cx)
                 } else {
-                    crate::git::GitDiffPanel::empty()
+                    crate::git::GitDiffPanel::empty(cx)
                 };
                 panel.set_split_view(diff_view_split);
                 panel
             });
-            let pr_diff_panel = cx.new(|_cx| {
+            let pr_diff_panel = cx.new(|cx| {
                 let mut panel = if let Some(dir) = &active_ws_dir {
-                    crate::git::PrDiffPanel::new(dir.clone())
+                    crate::git::PrDiffPanel::new(dir.clone(), cx)
                 } else {
-                    crate::git::PrDiffPanel::empty()
+                    crate::git::PrDiffPanel::empty(cx)
                 };
                 panel.set_split_view(diff_view_split);
                 panel

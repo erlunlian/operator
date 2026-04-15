@@ -68,8 +68,8 @@ impl OperatorApp {
         let ws = cx.new(|cx| Workspace::new_empty(cx));
         cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
 
-        let diff_panel = cx.new(|_cx| GitDiffPanel::empty());
-        let pr_diff_panel = cx.new(|_cx| PrDiffPanel::empty());
+        let diff_panel = cx.new(|cx| GitDiffPanel::empty(cx));
+        let pr_diff_panel = cx.new(|cx| PrDiffPanel::empty(cx));
         let right_panel = cx.new(|_cx| RightPanel::new(diff_panel, pr_diff_panel));
 
         let settings_panel = cx.new(|cx| SettingsPanel::new(cx));
@@ -431,13 +431,13 @@ impl OperatorApp {
             self.right_panel.update(cx, |rp, cx| {
                 rp.diff_panel.update(cx, |panel, cx| {
                     let split = panel.is_split_view();
-                    *panel = GitDiffPanel::empty();
+                    *panel = GitDiffPanel::empty(cx);
                     panel.set_split_view(split);
                     cx.notify();
                 });
                 rp.pr_diff_panel.update(cx, |panel, cx| {
                     let split = panel.is_split_view();
-                    *panel = PrDiffPanel::empty();
+                    *panel = PrDiffPanel::empty(cx);
                     panel.set_split_view(split);
                     cx.notify();
                 });
@@ -1061,13 +1061,13 @@ impl OperatorApp {
             self.right_panel.update(cx, |rp, cx| {
                 rp.diff_panel.update(cx, |panel, cx| {
                     let split = panel.is_split_view();
-                    *panel = GitDiffPanel::empty();
+                    *panel = GitDiffPanel::empty(cx);
                     panel.set_split_view(split);
                     cx.notify();
                 });
                 rp.pr_diff_panel.update(cx, |panel, cx| {
                     let split = panel.is_split_view();
-                    *panel = PrDiffPanel::empty();
+                    *panel = PrDiffPanel::empty(cx);
                     panel.set_split_view(split);
                     cx.notify();
                 });
@@ -1095,7 +1095,7 @@ impl OperatorApp {
             rp.diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
                 let split = panel.is_split_view();
-                *panel = GitDiffPanel::new(dir.clone());
+                *panel = GitDiffPanel::new(dir.clone(), cx);
                 panel.width = w;
                 panel.set_split_view(split);
                 cx.notify();
@@ -1103,7 +1103,7 @@ impl OperatorApp {
             rp.pr_diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
                 let split = panel.is_split_view();
-                *panel = PrDiffPanel::new(dir.clone());
+                *panel = PrDiffPanel::new(dir.clone(), cx);
                 panel.width = w;
                 panel.set_split_view(split);
                 cx.notify();

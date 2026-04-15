@@ -4,9 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::diff_model::*;
 use super::git_repo::GitRepo;
+use crate::actions::FindInFile;
 use crate::theme::colors;
 use crate::util;
 
@@ -43,6 +45,68 @@ fn collapse_bar_bg() -> Rgba {
 }
 fn file_header_bg() -> Rgba {
     rgb(0x1c1c30)
+}
+
+/// Merge potentially-overlapping highlight ranges into a sorted, non-overlapping list.
+/// GPUI's `StyledText::with_highlights` requires sorted non-overlapping ranges.
+/// Later entries in the input take precedence for overlapping byte positions.
+fn merge_highlights(
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    if highlights.len() <= 1 {
+        return highlights;
+    }
+
+    // Collect all boundary points
+    let mut boundaries = std::collections::BTreeSet::new();
+    for (range, _) in &highlights {
+        boundaries.insert(range.start);
+        boundaries.insert(range.end);
+    }
+    let pts: Vec<usize> = boundaries.into_iter().collect();
+    if pts.len() < 2 {
+        return highlights;
+    }
+
+    let mut result = Vec::new();
+    for w in pts.windows(2) {
+        let seg_start = w[0];
+        let seg_end = w[1];
+        if seg_start == seg_end {
+            continue;
+        }
+        // Merge all highlights that cover this segment (later ones override per-field)
+        let mut merged = HighlightStyle::default();
+        let mut any = false;
+        for (range, style) in &highlights {
+            if range.start <= seg_start && range.end >= seg_end {
+                if let Some(c) = style.color { merged.color = Some(c); }
+                if let Some(bg) = style.background_color { merged.background_color = Some(bg); }
+                if let Some(w) = style.font_weight { merged.font_weight = Some(w); }
+                if let Some(s) = style.font_style { merged.font_style = Some(s); }
+                if let Some(u) = style.underline { merged.underline = Some(u); }
+                if let Some(s) = style.strikethrough { merged.strikethrough = Some(s); }
+                if let Some(f) = style.fade_out { merged.fade_out = Some(f); }
+                any = true;
+            }
+        }
+        if any {
+            result.push((seg_start..seg_end, merged));
+        }
+    }
+
+    // Coalesce adjacent segments with identical styles
+    let mut coalesced: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+    for (range, style) in result {
+        if let Some(last) = coalesced.last_mut() {
+            if last.0.end == range.start && last.1 == style {
+                last.0.end = range.end;
+                continue;
+            }
+        }
+        coalesced.push((range, style));
+    }
+    coalesced
 }
 
 // ── View mode ──
@@ -124,6 +188,15 @@ pub struct GitDiffPanel {
     flat_cache_dirty: bool,
     /// Unified (interleaved) vs Split (side-by-side) diff view.
     view_mode: DiffViewMode,
+
+    // In-panel search (Cmd+F)
+    focus_handle: FocusHandle,
+    search_active: bool,
+    search_query: String,
+    search_input: Option<Entity<crate::text_input::TextInput>>,
+    /// Matches: (global_line_idx, start_byte, end_byte).
+    search_matches: Vec<(usize, usize, usize)>,
+    search_match_ix: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -139,7 +212,7 @@ impl std::hash::Hash for DiffSection {
 }
 
 impl GitDiffPanel {
-    pub fn empty() -> Self {
+    pub fn empty(cx: &mut Context<Self>) -> Self {
         Self {
             repo: None,
             branch: String::new(),
@@ -173,10 +246,16 @@ impl GitDiffPanel {
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
             view_mode: DiffViewMode::Unified,
+            focus_handle: cx.focus_handle(),
+            search_active: false,
+            search_query: String::new(),
+            search_input: None,
+            search_matches: Vec::new(),
+            search_match_ix: 0,
         }
     }
 
-    pub fn new(work_dir: PathBuf) -> Self {
+    pub fn new(work_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let repo = GitRepo::open(&work_dir);
         let branch = repo
             .as_ref()
@@ -231,6 +310,12 @@ impl GitDiffPanel {
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
             view_mode: DiffViewMode::Unified,
+            focus_handle: cx.focus_handle(),
+            search_active: false,
+            search_query: String::new(),
+            search_input: None,
+            search_matches: Vec::new(),
+            search_match_ix: 0,
         }
     }
 
@@ -1006,6 +1091,10 @@ impl GitDiffPanel {
         self.list_state.splice(0..old_count, self.flat_rows.len());
         self.list_state.scroll_to(scroll_pos);
         self.flat_cache_dirty = false;
+
+        if self.search_active {
+            self.find_search_matches();
+        }
     }
 
     /// Render a single flat row. Called from the list callback.
@@ -1337,9 +1426,53 @@ impl GitDiffPanel {
         };
         let line_num_str = line_num.map(|n| format!("{n}")).unwrap_or_default();
         let content = line.content.trim_end();
+        let search_hl = self.search_highlights_for_gli(global_line_idx);
 
-        let content_el: AnyElement = if let Some(highlights) = line.highlights.as_ref() {
-            if highlights.is_empty() {
+        let content_el: AnyElement = {
+            let mut hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+
+            // Syntax highlights
+            if let Some(highlights) = line.highlights.as_ref() {
+                for s in highlights {
+                    if s.byte_range.end <= content.len()
+                        && content.is_char_boundary(s.byte_range.start)
+                        && content.is_char_boundary(s.byte_range.end)
+                    {
+                        hl.push((
+                            s.byte_range.clone(),
+                            HighlightStyle {
+                                color: Some(Hsla::from(s.color)),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // Search match highlights (background color)
+            for &(start, end, is_active) in &search_hl {
+                if end <= content.len()
+                    && content.is_char_boundary(start)
+                    && content.is_char_boundary(end)
+                {
+                    let bg = if is_active {
+                        rgba(0xf9e2af88)
+                    } else {
+                        rgba(0xf9e2af44)
+                    };
+                    hl.push((
+                        start..end,
+                        HighlightStyle {
+                            background_color: Some(Hsla::from(bg)),
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+
+            let hl = merge_highlights(hl);
+
+            if hl.is_empty() {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
@@ -1348,23 +1481,6 @@ impl GitDiffPanel {
                     .child(content.to_string())
                     .into_any_element()
             } else {
-                let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
-                    .iter()
-                    .filter(|s| {
-                        s.byte_range.end <= content.len()
-                            && content.is_char_boundary(s.byte_range.start)
-                            && content.is_char_boundary(s.byte_range.end)
-                    })
-                    .map(|s| {
-                        (
-                            s.byte_range.clone(),
-                            HighlightStyle {
-                                color: Some(Hsla::from(s.color)),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect();
                 let text = SharedString::from(content.to_string());
                 let styled = StyledText::new(text).with_highlights(hl);
                 div()
@@ -1375,14 +1491,6 @@ impl GitDiffPanel {
                     .child(styled)
                     .into_any_element()
             }
-        } else {
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .text_color(text_col)
-                .pl(px(4.0))
-                .child(content.to_string())
-                .into_any_element()
         };
 
         let line_selected = self.is_line_selected(global_line_idx);
@@ -1448,6 +1556,7 @@ impl GitDiffPanel {
     fn render_split_half(
         line: Option<&DiffLine>,
         is_left: bool,
+        search_hl: &[(usize, usize, bool)],
     ) -> Div {
         let (row_bg, gutter_bg_color, text_col, prefix, line_num_str, content) = match line {
             Some(l) => {
@@ -1456,7 +1565,6 @@ impl GitDiffPanel {
                     DiffLineKind::Removed => (removed_line_bg(), removed_gutter_bg(), colors::diff_removed(), "-"),
                     DiffLineKind::Context => (rgba(0x00000000), gutter_bg(), colors::text_muted(), " "),
                 };
-                // Left side shows old line numbers, right side shows new
                 let ln = if is_left {
                     l.old_lineno
                 } else {
@@ -1466,57 +1574,66 @@ impl GitDiffPanel {
                 (bg, gbg, tc, pfx, ln_str, Some(l))
             }
             None => {
-                // Empty half — filler
                 (rgba(0x00000000), gutter_bg(), colors::text_muted(), " ", String::new(), None)
             }
         };
 
         let content_el: AnyElement = if let Some(l) = content {
             let trimmed = l.content.trim_end();
+            let mut hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+
             if let Some(highlights) = l.highlights.as_ref() {
-                if highlights.is_empty() {
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_color(text_col)
-                        .pl(px(4.0))
-                        .child(trimmed.to_string())
-                        .into_any_element()
-                } else {
-                    let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
-                        .iter()
-                        .filter(|s| {
-                            s.byte_range.end <= trimmed.len()
-                                && trimmed.is_char_boundary(s.byte_range.start)
-                                && trimmed.is_char_boundary(s.byte_range.end)
-                        })
-                        .map(|s| {
-                            (
-                                s.byte_range.clone(),
-                                HighlightStyle {
-                                    color: Some(Hsla::from(s.color)),
-                                    ..Default::default()
-                                },
-                            )
-                        })
-                        .collect();
-                    let text = SharedString::from(trimmed.to_string());
-                    let styled = StyledText::new(text).with_highlights(hl);
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_color(text_col)
-                        .pl(px(4.0))
-                        .child(styled)
-                        .into_any_element()
+                for s in highlights {
+                    if s.byte_range.end <= trimmed.len()
+                        && trimmed.is_char_boundary(s.byte_range.start)
+                        && trimmed.is_char_boundary(s.byte_range.end)
+                    {
+                        hl.push((
+                            s.byte_range.clone(),
+                            HighlightStyle {
+                                color: Some(Hsla::from(s.color)),
+                                ..Default::default()
+                            },
+                        ));
+                    }
                 }
-            } else {
+            }
+
+            for &(start, end, is_active) in search_hl {
+                if end <= trimmed.len()
+                    && trimmed.is_char_boundary(start)
+                    && trimmed.is_char_boundary(end)
+                {
+                    let bg = if is_active { rgba(0xf9e2af88) } else { rgba(0xf9e2af44) };
+                    hl.push((
+                        start..end,
+                        HighlightStyle {
+                            background_color: Some(Hsla::from(bg)),
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+
+            let hl = merge_highlights(hl);
+
+            if hl.is_empty() {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .text_color(text_col)
                     .pl(px(4.0))
                     .child(trimmed.to_string())
+                    .into_any_element()
+            } else {
+                let text = SharedString::from(trimmed.to_string());
+                let styled = StyledText::new(text).with_highlights(hl);
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(styled)
                     .into_any_element()
             }
         } else {
@@ -1564,8 +1681,9 @@ impl GitDiffPanel {
         is_last_in_file: bool,
         entity: &Entity<Self>,
     ) -> AnyElement {
-        let left_half = Self::render_split_half(left, true);
-        let right_half = Self::render_split_half(right, false);
+        let search_hl = self.search_highlights_for_gli(global_line_idx);
+        let left_half = Self::render_split_half(left, true, &search_hl);
+        let right_half = Self::render_split_half(right, false, &search_hl);
 
         let line_selected = self.is_line_selected(global_line_idx);
         let sel_bg = if line_selected { rgba(0x89b4fa30) } else { rgba(0x00000000) };
@@ -2010,6 +2128,150 @@ fn insert_into_tree(
     }
 }
 
+// ── Search ──
+
+impl GitDiffPanel {
+    fn find_search_matches(&mut self) {
+        self.search_matches.clear();
+        if self.search_query.is_empty() {
+            return;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        for (gli, text) in self.copy_line_contents.iter().enumerate() {
+            let text_lower = text.to_lowercase();
+            let mut from = 0;
+            while let Some(pos) = text_lower[from..].find(&query_lower) {
+                let start = from + pos;
+                let end = start + query_lower.len();
+                self.search_matches.push((gli, start, end));
+                from = start + 1;
+            }
+        }
+        if !self.search_matches.is_empty() {
+            self.search_match_ix = self.search_match_ix.min(self.search_matches.len() - 1);
+        } else {
+            self.search_match_ix = 0;
+        }
+    }
+
+    fn search_next(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_ix = (self.search_match_ix + 1) % self.search_matches.len();
+        self.scroll_to_active_match();
+    }
+
+    fn scroll_to_active_match(&mut self) {
+        let Some(&(gli, _, _)) = self.search_matches.get(self.search_match_ix) else {
+            return;
+        };
+        // Find the flat row that corresponds to this global_line_idx
+        for (row_idx, row) in self.flat_rows.iter().enumerate() {
+            let row_gli = match row {
+                FlatRow::Line { global_line_idx, .. } => Some(*global_line_idx),
+                FlatRow::SplitLine { global_line_idx, .. } => Some(*global_line_idx),
+                _ => None,
+            };
+            if row_gli == Some(gli) {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: row_idx,
+                    offset_in_item: px(0.0),
+                });
+                return;
+            }
+        }
+    }
+
+    /// Find nearest match at or after current active match position.
+    fn search_find_nearest(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_ix = 0;
+        self.scroll_to_active_match();
+    }
+
+    /// Get search highlight ranges for a given global_line_idx.
+    /// Returns (start_byte, end_byte, is_active) tuples.
+    fn search_highlights_for_gli(&self, gli: usize) -> Vec<(usize, usize, bool)> {
+        if !self.search_active || self.search_query.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (ix, &(m_gli, start, end)) in self.search_matches.iter().enumerate() {
+            if m_gli == gli {
+                out.push((start, end, ix == self.search_match_ix));
+            }
+        }
+        out
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_active = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_match_ix = 0;
+
+        let entity = cx.entity().clone();
+        let entity_cancel = cx.entity().clone();
+
+        let input = cx.new(|cx| {
+            let mut inp = crate::text_input::TextInput::new(cx);
+            inp.set_placeholder("Search diff...");
+
+            inp.set_on_submit(Rc::new(move |_text, _window, cx| {
+                entity.update(cx, |panel, cx| {
+                    panel.search_next();
+                    cx.notify();
+                });
+            }));
+
+            inp.set_on_cancel(Rc::new(move |window, cx| {
+                entity_cancel.update(cx, |panel, cx| {
+                    panel.close_search(window);
+                    cx.notify();
+                });
+            }));
+
+            inp
+        });
+
+        cx.observe(&input, |panel, input, cx| {
+            let new_text = input.read(cx).text.clone();
+            if panel.search_query != new_text {
+                panel.search_query = new_text;
+                panel.find_search_matches();
+                panel.search_find_nearest();
+                cx.notify();
+            }
+        })
+        .detach();
+
+        self.search_input = Some(input.clone());
+        input.read(cx).focus(window);
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_input = None;
+        self.search_matches.clear();
+        self.search_match_ix = 0;
+        self.focus_handle.focus(window);
+    }
+
+    fn handle_find(&mut self, _: &FindInFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_active {
+            self.close_search(window);
+        } else {
+            self.open_search(window, cx);
+        }
+        cx.notify();
+    }
+}
+
 // ── Render ──
 
 impl Render for GitDiffPanel {
@@ -2035,6 +2297,9 @@ impl Render for GitDiffPanel {
             .flex_1()
             .overflow_hidden()
             .bg(colors::surface())
+            .track_focus(&self.focus_handle)
+            .key_context("GitDiffPanel")
+            .on_action(cx.listener(Self::handle_find))
             // Handle tree resize drag across the whole panel
             .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_move.update(cx, |panel, cx| {
@@ -2203,6 +2468,48 @@ impl Render for GitDiffPanel {
                         ),
                 ),
         );
+
+        // ── Search bar (Cmd+F) ──
+        if self.search_active {
+            if let Some(search_input) = &self.search_input {
+                let match_count = self.search_matches.len();
+                let match_info = if self.search_query.is_empty() {
+                    String::new()
+                } else if match_count == 0 {
+                    "No matches".to_string()
+                } else {
+                    format!("{}/{}", self.search_match_ix + 1, match_count)
+                };
+
+                panel = panel.child(
+                    div()
+                        .id("diff-search-bar")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .bg(colors::surface())
+                        .border_b_1()
+                        .border_color(colors::border())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(colors::text_muted())
+                                .child("Find:"),
+                        )
+                        .child(div().flex_1().child(search_input.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(colors::text_muted())
+                                .pr_2()
+                                .child(match_info),
+                        ),
+                );
+            }
+        }
 
         if total_file_count == 0 {
             panel = panel.child(

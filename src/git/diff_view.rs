@@ -1,6 +1,8 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use super::diff_model::*;
@@ -69,8 +71,11 @@ pub struct GitDiffPanel {
     /// Which section's diffs are shown in the content area.
     active_section: DiffSection,
     /// Files whose diff body is collapsed (header still shown).
-    /// Key is (section, index-within-section).
-    collapsed_files: HashSet<(DiffSection, usize)>,
+    /// Key is (section, file_path) so collapse state survives index shifts on refresh.
+    collapsed_files: HashSet<(DiffSection, String)>,
+    /// Content hash per file at the time it was last viewed/collapsed.
+    /// When a file's diff changes, its hash changes and we auto-expand it.
+    file_content_hashes: HashMap<(DiffSection, String), u64>,
     /// Collapsed directory nodes in the file tree.
     collapsed_dirs: HashSet<String>,
     /// Whether the staged / unstaged tree sections are collapsed.
@@ -92,7 +97,7 @@ pub struct GitDiffPanel {
     tree_drag_start_width: f32,
     list_state: ListState,
     /// Which file just had its path copied (shows checkmark briefly).
-    copied_file_key: Option<(DiffSection, usize)>,
+    copied_file_key: Option<(DiffSection, String)>,
     /// Timer handle to clear the copied indicator.
     _copied_timer: Option<Task<()>>,
     /// Index to scroll to after next render.
@@ -142,6 +147,7 @@ impl GitDiffPanel {
             unstaged_files: Vec::new(),
             active_section: DiffSection::Unstaged,
             collapsed_files: HashSet::new(),
+            file_content_hashes: HashMap::new(),
             collapsed_dirs: HashSet::new(),
             staged_tree_collapsed: false,
             unstaged_tree_collapsed: false,
@@ -199,6 +205,7 @@ impl GitDiffPanel {
             unstaged_files,
             active_section,
             collapsed_files: HashSet::new(),
+            file_content_hashes: HashMap::new(),
             collapsed_dirs: HashSet::new(),
             staged_tree_collapsed: false,
             unstaged_tree_collapsed: false,
@@ -224,6 +231,20 @@ impl GitDiffPanel {
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
             view_mode: DiffViewMode::Unified,
+        }
+    }
+
+    /// Whether the panel is in split (side-by-side) view mode.
+    pub fn is_split_view(&self) -> bool {
+        self.view_mode == DiffViewMode::Split
+    }
+
+    /// Set the view mode. When `split` is true, uses side-by-side; otherwise unified.
+    pub fn set_split_view(&mut self, split: bool) {
+        let mode = if split { DiffViewMode::Split } else { DiffViewMode::Unified };
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            self.flat_cache_dirty = true;
         }
     }
 
@@ -272,14 +293,44 @@ impl GitDiffPanel {
         }
     }
 
+    /// Compute a content hash for a diff file based on its hunks.
+    fn diff_content_hash(file: &DiffFile) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for hunk in &file.hunks {
+            for line in &hunk.lines {
+                line.content.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     pub fn refresh(&mut self) {
         if let Some(repo) = &self.repo {
             self.branch = repo.current_branch();
             self.staged_files = repo.staged_diff();
             self.unstaged_files = repo.unstaged_diff();
-            // Keep expanded_context — expand state should persist across refreshes.
-            // It only resets on structural changes (stage/unstage/revert) via
-            // reset_expanded_context().
+
+            // Auto-expand files whose diff content changed since last viewed.
+            for (section, files) in [
+                (DiffSection::Staged, &self.staged_files),
+                (DiffSection::Unstaged, &self.unstaged_files),
+            ] {
+                for file in files {
+                    let key = (section, file.path.clone());
+                    let new_hash = Self::diff_content_hash(file);
+                    if let Some(&old_hash) = self.file_content_hashes.get(&key) {
+                        if new_hash != old_hash {
+                            // Content changed — re-expand and update hash
+                            self.collapsed_files.remove(&key);
+                            self.file_content_hashes.insert(key, new_hash);
+                        }
+                    } else {
+                        // First time seeing this file — record hash
+                        self.file_content_hashes.insert(key, new_hash);
+                    }
+                }
+            }
+
             self.flat_cache_dirty = true;
         }
     }
@@ -625,6 +676,13 @@ impl GitDiffPanel {
                     _status: _,
                 } => {
                     let idx = *file_idx;
+                    let file_path_str = {
+                        let files = match section {
+                            DiffSection::Staged => &self.staged_files,
+                            DiffSection::Unstaged => &self.unstaged_files,
+                        };
+                        files.get(idx).map(|f| f.path.clone()).unwrap_or_default()
+                    };
                     let entity = cx.entity().clone();
                     let is_active_section = self.active_section == section;
                     let sec_prefix = match section {
@@ -699,21 +757,24 @@ impl GitDiffPanel {
                             .when(!is_active_section, |d: Stateful<Div>| {
                                 d.text_color(colors::text_muted())
                             })
-                            .on_click(move |_, _window, cx| {
-                                entity.update(cx, |panel, cx| {
-                                    if panel.active_section != section {
-                                        panel.active_section = section;
-                                        panel.expanded_context.clear();
-                                    }
-                                    panel.collapsed_files.remove(&(section, idx));
-                                    // Ensure the file is within the rendered batch
-                                    if idx >= panel.rendered_file_limit {
-                                        panel.rendered_file_limit = idx + 1;
-                                    }
-                                    panel.scroll_to_file = Some(idx);
-                                    panel.flat_cache_dirty = true;
-                                    cx.notify();
-                                });
+                            .on_click({
+                                let file_path_key = file_path_str.clone();
+                                move |_, _window, cx| {
+                                    entity.update(cx, |panel, cx| {
+                                        if panel.active_section != section {
+                                            panel.active_section = section;
+                                            panel.expanded_context.clear();
+                                        }
+                                        panel.collapsed_files.remove(&(section, file_path_key.clone()));
+                                        // Ensure the file is within the rendered batch
+                                        if idx >= panel.rendered_file_limit {
+                                            panel.rendered_file_limit = idx + 1;
+                                        }
+                                        panel.scroll_to_file = Some(idx);
+                                        panel.flat_cache_dirty = true;
+                                        cx.notify();
+                                    });
+                                }
                             })
                             .child({
                                 let file_icon = util::icon_for_file(name);
@@ -764,7 +825,7 @@ impl GitDiffPanel {
         // Phase 1: flatten segments for each file
         let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(render_limit);
         for file_idx in 0..render_limit {
-            let file_key = (section, file_idx);
+            let file_key = (section, files[file_idx].path.clone());
             if self.collapsed_files.contains(&file_key) || files[file_idx].hunks.is_empty() {
                 all_segments.push(Vec::new());
             } else {
@@ -785,8 +846,8 @@ impl GitDiffPanel {
             self.flat_file_starts.push(self.flat_rows.len());
             self.flat_rows.push(FlatRow::FileHeader { file_idx });
 
-            let file_key = (section, file_idx);
-            if self.collapsed_files.contains(&file_key) {
+            let file_path_key = (section, self.active_files()[file_idx].path.clone());
+            if self.collapsed_files.contains(&file_path_key) {
                 continue;
             }
 
@@ -1024,10 +1085,10 @@ impl GitDiffPanel {
         let file = &files[file_idx];
         let adds = file.additions();
         let dels = file.deletions();
-        let file_key = (self.active_section, file_idx);
-        let is_collapsed = self.collapsed_files.contains(&file_key);
         let file_path = file.path.clone();
         let section = self.active_section;
+        let file_key = (section, file_path.clone());
+        let is_collapsed = self.collapsed_files.contains(&file_key);
 
         let status_color = match file.status {
             FileStatus::Added => colors::diff_added(),
@@ -1037,7 +1098,7 @@ impl GitDiffPanel {
         };
 
         let entity_hdr = entity.clone();
-        let just_copied = self.copied_file_key == Some(file_key);
+        let just_copied = self.copied_file_key.as_ref() == Some(&file_key);
         let (icon, icon_color) = if just_copied {
             ("\u{f00c}", colors::diff_added()) // nf-fa-check
         } else {
@@ -1062,16 +1123,19 @@ impl GitDiffPanel {
             .when(!is_collapsed, |d: Stateful<Div>| d.rounded_t_md())
             .cursor_pointer()
             .hover(|s| s.bg(colors::surface_hover()))
-            .on_click(move |_, _window, cx| {
-                entity_hdr.update(cx, |panel, cx| {
-                    if panel.collapsed_files.contains(&file_key) {
-                        panel.collapsed_files.remove(&file_key);
-                    } else {
-                        panel.collapsed_files.insert(file_key);
-                    }
-                    panel.flat_cache_dirty = true;
-                    cx.notify();
-                });
+            .on_click({
+                let fk = file_key.clone();
+                move |_, _window, cx| {
+                    entity_hdr.update(cx, |panel, cx| {
+                        if panel.collapsed_files.contains(&fk) {
+                            panel.collapsed_files.remove(&fk);
+                        } else {
+                            panel.collapsed_files.insert(fk.clone());
+                        }
+                        panel.flat_cache_dirty = true;
+                        cx.notify();
+                    });
+                }
             })
             // Status dot
             .child(
@@ -1097,14 +1161,17 @@ impl GitDiffPanel {
                     .border_b_1()
                     .border_color(gpui::rgba(0x00000000))
                     .hover(|s| s.border_color(colors::accent()))
-                    .on_click(move |_, _window, cx| {
+                    .on_click({
+                        let fk_copy = file_key.clone();
+                        let fk_timer = file_key;
+                        move |_, _window, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(path_for_copy.clone()));
                         let entity = entity_copy.clone();
                         entity_copy.update(cx, |panel, cx| {
-                            panel.copied_file_key = Some(file_key);
+                            panel.copied_file_key = Some(fk_copy.clone());
                             cx.notify();
                         });
-                        let fk = file_key;
+                        let fk = fk_timer.clone();
                         cx.defer(move |cx| {
                             entity.update(cx, |panel, cx| {
                                 panel._copied_timer = Some(cx.spawn(async move |this, cx| {
@@ -1123,7 +1190,7 @@ impl GitDiffPanel {
                             });
                         });
                         cx.stop_propagation();
-                    })
+                    }})
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)

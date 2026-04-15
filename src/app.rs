@@ -430,11 +430,15 @@ impl OperatorApp {
             self.active_workspace_ix = 0;
             self.right_panel.update(cx, |rp, cx| {
                 rp.diff_panel.update(cx, |panel, cx| {
+                    let split = panel.is_split_view();
                     *panel = GitDiffPanel::empty();
+                    panel.set_split_view(split);
                     cx.notify();
                 });
                 rp.pr_diff_panel.update(cx, |panel, cx| {
+                    let split = panel.is_split_view();
                     *panel = PrDiffPanel::empty();
+                    panel.set_split_view(split);
                     cx.notify();
                 });
                 rp.editor = None;
@@ -1056,11 +1060,15 @@ impl OperatorApp {
         } else {
             self.right_panel.update(cx, |rp, cx| {
                 rp.diff_panel.update(cx, |panel, cx| {
+                    let split = panel.is_split_view();
                     *panel = GitDiffPanel::empty();
+                    panel.set_split_view(split);
                     cx.notify();
                 });
                 rp.pr_diff_panel.update(cx, |panel, cx| {
+                    let split = panel.is_split_view();
                     *panel = PrDiffPanel::empty();
+                    panel.set_split_view(split);
                     cx.notify();
                 });
                 rp.editor = None;
@@ -1086,14 +1094,18 @@ impl OperatorApp {
         self.right_panel.update(cx, |rp, cx| {
             rp.diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
+                let split = panel.is_split_view();
                 *panel = GitDiffPanel::new(dir.clone());
                 panel.width = w;
+                panel.set_split_view(split);
                 cx.notify();
             });
             rp.pr_diff_panel.update(cx, |panel, cx| {
                 let w = panel.width;
+                let split = panel.is_split_view();
                 *panel = PrDiffPanel::new(dir.clone());
                 panel.width = w;
+                panel.set_split_view(split);
                 cx.notify();
             });
             rp.set_directory(dir, cx);
@@ -1601,6 +1613,7 @@ impl Render for OperatorApp {
                         let new_width = (window_width - x).clamp(MIN_RIGHT_PANEL_WIDTH, max_right);
                         app.right_panel.update(cx, |rp, cx| {
                             rp.width = new_width;
+                            rp.notify_active_viewer(cx);
                             cx.notify();
                         });
                         cx.notify();

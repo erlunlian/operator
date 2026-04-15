@@ -174,12 +174,11 @@ impl FileTree {
                 .id(ElementId::Name(format!("file-tree-{ix}").into()))
                 .flex()
                 .flex_row()
-                .items_start()
+                .items_center()
                 .gap_1()
                 .pl(px(indent))
                 .pr_2()
-                .py(px(3.0))
-                .min_h(px(24.0))
+                .h(px(24.0))
                 .w_full()
                 .cursor_pointer()
                 .text_color(colors::text())
@@ -203,7 +202,6 @@ impl FileTree {
                             .text_color(colors::text_muted())
                             .text_size(px(8.0))
                             .w(px(10.0))
-                            .flex_shrink_0()
                             .child(chevron),
                     )
                     .child(
@@ -211,16 +209,10 @@ impl FileTree {
                             .font_family(util::ICON_FONT)
                             .text_size(px(14.0))
                             .text_color(colors::text_muted())
-                            .flex_shrink_0()
                             .mr(px(4.0))
                             .child(dir_icon),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_x_hidden()
-                            .child(entry.name.clone()),
-                    );
+                    .child(entry.name.clone());
 
                 let path = entry.path.clone();
                 let on_dir_toggle = on_dir_toggle.clone();
@@ -231,7 +223,7 @@ impl FileTree {
                 let icon = util::icon_for_file(&entry.name);
                 let icon_color = util::file_icon_color(&entry.name);
                 row = row
-                    .child(div().w(px(12.0)).flex_shrink_0())
+                    .child(div().w(px(12.0)))
                     .child(
                         div()
                             .font_family(util::ICON_FONT)
@@ -242,12 +234,7 @@ impl FileTree {
                             .mr(px(4.0))
                             .child(icon),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_x_hidden()
-                            .child(entry.name.clone()),
-                    );
+                    .child(entry.name.clone());
 
                 let path = entry.path.clone();
                 let on_file_click = on_file_click.clone();

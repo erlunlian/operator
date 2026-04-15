@@ -37,6 +37,9 @@ pub struct SettingsState {
     pub window_y: Option<f32>,
     pub window_width: Option<f32>,
     pub window_height: Option<f32>,
+    /// Whether the diff viewer uses split (side-by-side) mode instead of unified.
+    #[serde(default)]
+    pub diff_view_split: bool,
     /// Editor state for the right panel
     #[serde(default)]
     pub editor_open_files: Vec<PathBuf>,
@@ -133,6 +136,8 @@ impl SessionState {
             RightPanelTab::Pr => "pr",
         };
 
+        let diff_view_split = rp.diff_panel.read(cx).is_split_view();
+
         // Get live editor files for the active workspace
         let live_editor_files: Vec<PathBuf> = rp.editor.as_ref()
             .map(|editor| editor.read(cx).all_open_files(cx))
@@ -201,6 +206,7 @@ impl SessionState {
                 window_y: app.window_bounds.map(|b| b.1),
                 window_width: app.window_bounds.map(|b| b.2),
                 window_height: app.window_bounds.map(|b| b.3),
+                diff_view_split,
                 // Legacy: keep for backwards compat, populated from active workspace
                 editor_open_files: live_editor_files,
                 editor_active_file_ix: 0,
@@ -396,20 +402,25 @@ impl SessionState {
             .and_then(|(_, _, _, rc)| *rc)
             .unwrap_or(right_panel_collapsed);
 
+        let diff_view_split = self.settings.diff_view_split;
         let right_panel = cx.new(|cx| {
             let diff_panel = cx.new(|_cx| {
-                if let Some(dir) = &active_ws_dir {
+                let mut panel = if let Some(dir) = &active_ws_dir {
                     crate::git::GitDiffPanel::new(dir.clone())
                 } else {
                     crate::git::GitDiffPanel::empty()
-                }
+                };
+                panel.set_split_view(diff_view_split);
+                panel
             });
             let pr_diff_panel = cx.new(|_cx| {
-                if let Some(dir) = &active_ws_dir {
+                let mut panel = if let Some(dir) = &active_ws_dir {
                     crate::git::PrDiffPanel::new(dir.clone())
                 } else {
                     crate::git::PrDiffPanel::empty()
-                }
+                };
+                panel.set_split_view(diff_view_split);
+                panel
             });
             let mut rp = RightPanel::new(diff_panel, pr_diff_panel);
             rp.width = effective_rp_width;

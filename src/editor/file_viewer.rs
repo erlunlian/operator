@@ -21,11 +21,17 @@ struct LineHighlight {
 struct RenderedLine {
     text: SharedString,
     highlights: Vec<LineHighlight>,
+    /// The buffer row this visual line belongs to.
+    buffer_row: usize,
+    /// Byte offset within the buffer line where this visual line starts.
+    byte_offset: usize,
 }
 
 // ── Default character width for monospace cursor positioning ──
 // Menlo at text_sm (14px) on macOS. Overridden dynamically if measured.
 const DEFAULT_CHAR_WIDTH: f32 = 8.4;
+/// Soft-wrap width in characters for markdown files.
+const MARKDOWN_WRAP_CHARS: usize = 100;
 
 // ── Vim mode ──
 
@@ -208,6 +214,10 @@ pub struct FileViewer {
     content_area_top: Rc<Cell<f32>>,
     /// Measured monospace character width, captured during paint.
     char_width: Rc<Cell<f32>>,
+    /// Width of the code content area in pixels, captured during paint.
+    code_area_width: Rc<Cell<f32>>,
+    /// Current wrap width in characters used for markdown soft-wrapping.
+    current_wrap_chars: usize,
 }
 
 impl FileViewer {
@@ -226,8 +236,9 @@ impl FileViewer {
         // Ensure at least one line
         let buffer = if buffer.is_empty() { vec![String::new()] } else { buffer };
 
-        let rendered_lines = Self::precompute_lines(&content, &highlights);
-        let gutter_width = format!("{}", rendered_lines.len()).len().max(3) as f32 * 8.4 + 16.0;
+        let is_markdown = language.as_deref() == Some("markdown");
+        let rendered_lines = Self::precompute_lines(&content, &highlights, is_markdown, MARKDOWN_WRAP_CHARS);
+        let gutter_width = format!("{}", buffer.len()).len().max(3) as f32 * 8.4 + 16.0;
 
         Self {
             path,
@@ -263,6 +274,8 @@ impl FileViewer {
             code_area_left: Rc::new(Cell::new(0.0)),
             content_area_top: Rc::new(Cell::new(0.0)),
             char_width: Rc::new(Cell::new(DEFAULT_CHAR_WIDTH)),
+            code_area_width: Rc::new(Cell::new(0.0)),
+            current_wrap_chars: MARKDOWN_WRAP_CHARS,
         }
     }
 
@@ -276,6 +289,8 @@ impl FileViewer {
             rendered_lines: Rc::new(vec![RenderedLine {
                 text: SharedString::from(" ".to_string()),
                 highlights: vec![],
+                buffer_row: 0,
+                byte_offset: 0,
             }]),
             cursor_row: 0,
             cursor_col: 0,
@@ -304,14 +319,22 @@ impl FileViewer {
             code_area_left: Rc::new(Cell::new(0.0)),
             content_area_top: Rc::new(Cell::new(0.0)),
             char_width: Rc::new(Cell::new(DEFAULT_CHAR_WIDTH)),
+            code_area_width: Rc::new(Cell::new(0.0)),
+            current_wrap_chars: MARKDOWN_WRAP_CHARS,
         }
     }
 
     // ── Highlight precomputation ──
 
-    fn precompute_lines(content: &str, highlights: &[HighlightSpan]) -> Vec<RenderedLine> {
+    fn precompute_lines(
+        content: &str,
+        highlights: &[HighlightSpan],
+        wrap: bool,
+        wrap_chars: usize,
+    ) -> Vec<RenderedLine> {
         let mut result = Vec::new();
         let mut line_start = 0;
+        let mut buffer_row: usize = 0;
 
         for line_text in content.split('\n') {
             let line_text = line_text.strip_suffix('\r').unwrap_or(line_text);
@@ -342,17 +365,50 @@ impl FileViewer {
                 })
                 .collect();
 
-            let text = if line_text.is_empty() {
-                SharedString::from(" ".to_string())
+            if wrap && line_text.chars().count() > wrap_chars {
+                // Soft-wrap this line into visual sub-lines at word boundaries
+                let chunks = Self::soft_wrap_line(line_text, wrap_chars);
+                for (chunk_text, byte_offset) in chunks {
+                    let chunk_end = byte_offset + chunk_text.len();
+                    // Slice highlights that overlap this chunk, rebasing offsets
+                    let chunk_hl: Vec<LineHighlight> = line_highlights
+                        .iter()
+                        .filter(|h| h.range.start < chunk_end && h.range.end > byte_offset)
+                        .map(|h| LineHighlight {
+                            range: h.range.start.saturating_sub(byte_offset)
+                                ..h.range.end.min(chunk_end) - byte_offset,
+                            color: h.color,
+                        })
+                        .collect();
+
+                    let text = if chunk_text.is_empty() {
+                        SharedString::from(" ".to_string())
+                    } else {
+                        SharedString::from(chunk_text.to_string())
+                    };
+                    result.push(RenderedLine {
+                        text,
+                        highlights: chunk_hl,
+                        buffer_row,
+                        byte_offset,
+                    });
+                }
             } else {
-                SharedString::from(line_text.to_string())
-            };
+                let text = if line_text.is_empty() {
+                    SharedString::from(" ".to_string())
+                } else {
+                    SharedString::from(line_text.to_string())
+                };
 
-            result.push(RenderedLine {
-                text,
-                highlights: line_highlights,
-            });
+                result.push(RenderedLine {
+                    text,
+                    highlights: line_highlights,
+                    buffer_row,
+                    byte_offset: 0,
+                });
+            }
 
+            buffer_row += 1;
             line_start = line_byte_end;
             if content.as_bytes().get(line_start) == Some(&b'\r') {
                 line_start += 1;
@@ -365,25 +421,75 @@ impl FileViewer {
         result
     }
 
+    /// Split a line into chunks at word boundaries, each at most `max_chars` characters.
+    /// Returns (chunk_text, byte_offset_in_line) pairs.
+    fn soft_wrap_line(line: &str, max_chars: usize) -> Vec<(&str, usize)> {
+        let mut chunks = Vec::new();
+        let mut remaining = line;
+        let mut byte_offset: usize = 0;
+
+        while remaining.chars().count() > max_chars {
+            // Find the last space within the limit
+            let char_end: usize = remaining
+                .char_indices()
+                .nth(max_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(remaining.len());
+
+            let break_at = remaining[..char_end]
+                .rfind(' ')
+                .map(|i| i + 1) // include the space in the first chunk
+                .unwrap_or(char_end); // no space found, hard break at max_chars
+
+            chunks.push((&remaining[..break_at], byte_offset));
+            byte_offset += break_at;
+            remaining = &remaining[break_at..];
+        }
+
+        if !remaining.is_empty() || chunks.is_empty() {
+            chunks.push((remaining, byte_offset));
+        }
+
+        chunks
+    }
+
     fn recompute_highlights(&mut self) {
         // Rebuild rendered_lines from buffer without full syntax re-highlight
         // to keep typing responsive. Full highlight runs on save/undo/redo.
-        let rendered: Vec<RenderedLine> = self
-            .buffer
-            .iter()
-            .map(|line_text| {
+        let is_markdown = self.language.as_deref() == Some("markdown");
+        let wrap_chars = self.current_wrap_chars;
+        let mut rendered: Vec<RenderedLine> = Vec::new();
+        for (buffer_row, line_text) in self.buffer.iter().enumerate() {
+            if is_markdown && line_text.chars().count() > wrap_chars {
+                let chunks = Self::soft_wrap_line(line_text, wrap_chars);
+                for (chunk, byte_offset) in chunks {
+                    let text = if chunk.is_empty() {
+                        SharedString::from(" ".to_string())
+                    } else {
+                        SharedString::from(chunk.to_string())
+                    };
+                    rendered.push(RenderedLine {
+                        text,
+                        highlights: vec![],
+                        buffer_row,
+                        byte_offset,
+                    });
+                }
+            } else {
                 let text = if line_text.is_empty() {
                     SharedString::from(" ".to_string())
                 } else {
                     SharedString::from(line_text.clone())
                 };
-                RenderedLine {
+                rendered.push(RenderedLine {
                     text,
                     highlights: vec![],
-                }
-            })
-            .collect();
-        self.gutter_width = format!("{}", rendered.len()).len().max(3) as f32 * 8.4 + 16.0;
+                    buffer_row,
+                    byte_offset: 0,
+                });
+            }
+        }
+        self.gutter_width = format!("{}", self.buffer.len()).len().max(3) as f32 * self.char_width.get() + 16.0;
         self.rendered_lines = Rc::new(rendered);
     }
 
@@ -394,8 +500,9 @@ impl FileViewer {
         } else {
             vec![]
         };
-        let rendered = Self::precompute_lines(&content, &highlights);
-        self.gutter_width = format!("{}", rendered.len()).len().max(3) as f32 * 8.4 + 16.0;
+        let is_markdown = self.language.as_deref() == Some("markdown");
+        let rendered = Self::precompute_lines(&content, &highlights, is_markdown, self.current_wrap_chars);
+        self.gutter_width = format!("{}", self.buffer.len()).len().max(3) as f32 * self.char_width.get() + 16.0;
         self.rendered_lines = Rc::new(rendered);
     }
 
@@ -1195,10 +1302,29 @@ impl FileViewer {
         self.recompute_highlights_full();
     }
 
+    // ── Visual ↔ Buffer line mapping ──
+
+    /// Find the first visual line index for a given buffer row.
+    fn buffer_row_to_visual(&self, buffer_row: usize) -> usize {
+        self.rendered_lines
+            .iter()
+            .position(|rl| rl.buffer_row == buffer_row)
+            .unwrap_or(buffer_row)
+    }
+
+    /// Convert a visual line index to (buffer_row, byte_offset_in_line).
+    fn visual_to_buffer(&self, visual_ix: usize) -> (usize, usize) {
+        self.rendered_lines
+            .get(visual_ix)
+            .map(|rl| (rl.buffer_row, rl.byte_offset))
+            .unwrap_or((visual_ix, 0))
+    }
+
     // ── Scroll ──
 
     fn ensure_cursor_visible(&self) {
-        self.scroll_handle.scroll_to_item(self.cursor_row, ScrollStrategy::Top);
+        let visual_row = self.buffer_row_to_visual(self.cursor_row);
+        self.scroll_handle.scroll_to_item(visual_row, ScrollStrategy::Top);
     }
 
     // ── Mouse position helpers ──
@@ -1220,25 +1346,30 @@ impl FileViewer {
 
         // y position relative to the top of the content area, accounting for scroll
         let y_in_content = f32::from(position.y) - content_top - scroll_offset_y;
-        let row = (y_in_content / line_height).max(0.0) as usize;
-        let row = row.min(self.buffer.len().saturating_sub(1));
+        let visual_row = (y_in_content / line_height).max(0.0) as usize;
+        let visual_row = visual_row.min(self.rendered_lines.len().saturating_sub(1));
+
+        // Map visual row to buffer row + byte offset for wrapped lines
+        let (row, byte_offset) = self.visual_to_buffer(visual_row);
 
         // x position relative to code area
         let x_in_code = f32::from(position.x) - code_left;
         let cw = self.char_width.get();
         let col_chars = (x_in_code / cw).max(0.0) as usize;
 
-        // Convert character count to byte offset
+        // Convert character count to byte offset within the visual chunk,
+        // then add byte_offset to get position in the full buffer line
         let line = &self.buffer[row];
+        let chunk = &line[byte_offset..];
         let mut byte_col = 0;
-        for (i, (byte_idx, ch)) in line.char_indices().enumerate() {
+        for (i, (byte_idx, ch)) in chunk.char_indices().enumerate() {
             if i >= col_chars {
                 byte_col = byte_idx;
                 break;
             }
             byte_col = byte_idx + ch.len_utf8();
         }
-        let col = byte_col.min(line.len());
+        let col = (byte_offset + byte_col).min(line.len());
 
         (row, col)
     }
@@ -2214,6 +2345,12 @@ impl FileViewer {
         let mut line_el = div().flex().flex_row().h(px(18.0));
 
         // Gutter
+        // Gutter: show line number for first visual line of buffer row, blank for continuations
+        let gutter_text = if line_num > 0 {
+            format!("{}", line_num)
+        } else {
+            String::new()
+        };
         line_el = line_el.child(
             div()
                 .w(px(gutter_width))
@@ -2222,7 +2359,7 @@ impl FileViewer {
                 .flex_shrink_0()
                 .pr_2()
                 .text_right()
-                .child(format!("{}", line_num)),
+                .child(gutter_text),
         );
 
         // Code content area — render text as one unbroken element,
@@ -2377,7 +2514,49 @@ impl FileViewer {
 }
 
 impl Render for FileViewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measure actual monospace character width from the font system
+        {
+            let font = Font {
+                family: "Menlo".into(),
+                features: FontFeatures::default(),
+                fallbacks: None,
+                weight: FontWeight::default(),
+                style: FontStyle::Normal,
+            };
+            let run = TextRun {
+                len: 1,
+                font,
+                color: Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window.text_system().shape_line(
+                "m".into(),
+                px(14.0), // text_sm = 0.875rem = 14px at default 16px base
+                &[run],
+                None,
+            );
+            let measured = f32::from(shaped.width);
+            if measured > 0.0 {
+                self.char_width.set(measured);
+            }
+        }
+
+        // Dynamic wrap: recompute if the measured container width changed
+        if self.language.as_deref() == Some("markdown") {
+            let width = self.code_area_width.get();
+            if width > 0.0 {
+                let cw = self.char_width.get().max(1.0);
+                let new_wrap = ((width - self.gutter_width) / cw).max(40.0) as usize;
+                if new_wrap != self.current_wrap_chars {
+                    self.current_wrap_chars = new_wrap;
+                    self.recompute_highlights_full();
+                }
+            }
+        }
+
         let line_count = self.rendered_lines.len();
         let gutter_width = self.gutter_width;
         let lines = self.rendered_lines.clone();
@@ -2522,10 +2701,34 @@ impl Render for FileViewer {
                 let code_left = self.code_area_left.clone();
                 let content_top = self.content_area_top.clone();
                 let char_width = self.char_width.clone();
+                let code_width = self.code_area_width.clone();
+                let entity_for_resize = cx.entity().clone();
                 let editor_container = div()
                     .relative()
                     .flex_1()
                     .size_full()
+                    .overflow_hidden()
+                    // Canvas to capture width + trigger re-render on resize
+                    .child(
+                        canvas({
+                            let code_width = code_width.clone();
+                            move |bounds, _window, cx| {
+                                let new_w = f32::from(bounds.size.width);
+                                let old_w = code_width.get();
+                                code_width.set(new_w);
+                                // If width changed significantly, trigger re-render for wrap recompute
+                                if (new_w - old_w).abs() > 5.0 {
+                                    entity_for_resize.update(cx, |_view, cx| {
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        },
+                            |_, _, _, _| {},
+                        )
+                        .w_full()
+                        .h_0(),
+                    )
                     // Canvas to capture the top of the uniform list content area
                     .child(
                         canvas(
@@ -2540,47 +2743,92 @@ impl Render for FileViewer {
                         uniform_list("file-lines", line_count, move |range, _window, _cx| {
                             range
                                 .map(|ix| {
-                                    let cursor_on_line = if ix == cursor_row {
-                                        Some(cursor_col)
+                                    let rl = &lines[ix];
+                                    let buf_row = rl.buffer_row;
+                                    let byte_off = rl.byte_offset;
+                                    let is_first_visual = byte_off == 0;
+
+                                    // Cursor: show on this visual line only if the
+                                    // buffer cursor_row matches AND cursor_col falls
+                                    // within this chunk's byte range.
+                                    let cursor_on_line = if buf_row == cursor_row {
+                                        let chunk_len = rl.text.len();
+                                        if cursor_col >= byte_off
+                                            && cursor_col <= byte_off + chunk_len
+                                        {
+                                            Some(cursor_col - byte_off)
+                                        } else {
+                                            None
+                                        }
                                     } else {
                                         None
                                     };
 
-                                    // Compute selection highlight for this line
+                                    // Selection: use buffer row for range check,
+                                    // then adjust col range for this chunk's offset.
                                     let sel_cols = selection.as_ref().and_then(|sel| {
-                                        let line_len = buffer_line_lens.get(ix).copied().unwrap_or(0);
-                                        sel.col_range_for_row(ix, line_len)
+                                        let line_len = buffer_line_lens.get(buf_row).copied().unwrap_or(0);
+                                        sel.col_range_for_row(buf_row, line_len)
+                                    }).and_then(|(s, e)| {
+                                        let chunk_end = byte_off + rl.text.len();
+                                        if e <= byte_off || s >= chunk_end {
+                                            None // selection doesn't overlap this chunk
+                                        } else {
+                                            Some((s.saturating_sub(byte_off), (e - byte_off).min(rl.text.len())))
+                                        }
                                     });
 
-                                    let line_text = buffer_lines.get(ix).map(|s| s.as_str()).unwrap_or("");
+                                    // Buffer line text for this chunk (for char width calculation)
+                                    let full_line = buffer_lines.get(buf_row).map(|s| s.as_str()).unwrap_or("");
+                                    let chunk_end = (byte_off + rl.text.len()).min(full_line.len());
+                                    let line_text = &full_line[byte_off..chunk_end];
 
-                                    // Gather word occurrence highlights for this line
+                                    // Word highlights: filter to buffer row, then adjust for chunk offset
                                     let wh: Vec<(usize, usize)> = word_occs
                                         .iter()
-                                        .filter(|&&(r, _, _)| r == ix)
-                                        .map(|&(_, s, e)| (s, e))
+                                        .filter(|&&(r, _, _)| r == buf_row)
+                                        .filter_map(|&(_, s, e)| {
+                                            let chunk_end_b = byte_off + rl.text.len();
+                                            if e <= byte_off || s >= chunk_end_b { return None; }
+                                            Some((s.saturating_sub(byte_off), (e - byte_off).min(rl.text.len())))
+                                        })
                                         .collect();
 
-                                    // Gather search match highlights for this line
+                                    // Search match highlights: same adjustment
                                     let sh: Vec<(usize, usize, bool)> = if search_active {
                                         search_matches
                                             .iter()
                                             .enumerate()
-                                            .filter(|&(_, &(r, _, _))| r == ix)
-                                            .map(|(mi, &(_, s, e))| (s, e, mi == active_search_ix))
+                                            .filter(|&(_, &(r, _, _))| r == buf_row)
+                                            .filter_map(|(mi, &(_, s, e))| {
+                                                let chunk_end_b = byte_off + rl.text.len();
+                                                if e <= byte_off || s >= chunk_end_b { return None; }
+                                                Some((s.saturating_sub(byte_off), (e - byte_off).min(rl.text.len()), mi == active_search_ix))
+                                            })
                                             .collect()
                                     } else {
                                         vec![]
                                     };
 
-                                    // Navigation highlight for this line
+                                    // Navigation highlight: same adjustment
                                     let nh = nav_highlight.and_then(|(r, s, e)| {
-                                        if r == ix { Some((s, e)) } else { None }
+                                        if r != buf_row { return None; }
+                                        let chunk_end_b = byte_off + rl.text.len();
+                                        if e <= byte_off || s >= chunk_end_b { return None; }
+                                        Some((s.saturating_sub(byte_off), (e - byte_off).min(rl.text.len())))
                                     });
+
+                                    // Line number: show buffer line number only on the
+                                    // first visual line of each buffer row.
+                                    let display_line_num = if is_first_visual {
+                                        buf_row + 1
+                                    } else {
+                                        0 // render_line will show blank for 0
+                                    };
 
                                     let line_div = Self::render_line(
                                         &lines[ix],
-                                        ix + 1,
+                                        display_line_num,
                                         gutter_width,
                                         cursor_on_line,
                                         block_cursor,

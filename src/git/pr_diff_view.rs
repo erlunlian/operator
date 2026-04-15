@@ -297,6 +297,20 @@ impl PrDiffPanel {
         }
     }
 
+    /// Whether the panel is in split (side-by-side) view mode.
+    pub fn is_split_view(&self) -> bool {
+        self.view_mode == DiffViewMode::Split
+    }
+
+    /// Set the view mode. When `split` is true, uses side-by-side; otherwise unified.
+    pub fn set_split_view(&mut self, split: bool) {
+        let mode = if split { DiffViewMode::Split } else { DiffViewMode::Unified };
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            self.flat_cache_dirty = true;
+        }
+    }
+
     /// Estimate total heap bytes for all cached diff data.
     pub fn estimated_bytes(&self) -> usize {
         self.diff_files.iter().map(|f| f.estimated_bytes()).sum()

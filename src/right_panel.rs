@@ -71,6 +71,16 @@ impl RightPanel {
         cx.notify();
     }
 
+    /// Notify the active file viewer that it needs to re-measure its width (e.g. after panel resize).
+    pub fn notify_active_viewer(&self, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.editor {
+            let editor = editor.read(cx);
+            if let Some(viewer) = editor.pane_group.read(cx).active_viewer(cx) {
+                viewer.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
     pub fn set_directory(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         // Reset editor for new directory
         let editor = cx.new(|cx| EditorView::new(dir, cx));

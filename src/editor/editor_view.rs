@@ -106,6 +106,10 @@ impl Render for EditorView {
                         let origin_x = view_origin_for_resize.get();
                         let new_width = f32::from(event.position.x) - origin_x;
                         view.tree_width = new_width.clamp(100.0, 600.0);
+                        // Also notify the active FileViewer so it re-renders and re-measures width
+                        if let Some(viewer) = view.pane_group.read(cx).active_viewer(cx) {
+                            viewer.update(cx, |_, cx| cx.notify());
+                        }
                         cx.notify();
                     }
                 });

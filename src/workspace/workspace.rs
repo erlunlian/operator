@@ -141,6 +141,10 @@ impl Workspace {
             let layout = layout.read(cx);
             self.pane_statuses = layout.collect_pane_statuses(is_active_workspace, cx);
         }
+        // Keep git branch fresh (detects checkout/switch in terminal)
+        if let Some(dir) = &self.directory {
+            self.git_branch = Self::detect_git_branch(dir);
+        }
     }
 
     pub fn add_tab(&mut self, cx: &mut Context<Self>) {

@@ -366,13 +366,6 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
 
         // ── Working indicators ──
 
-        // Claude Code thinking label: "Infusing…", "Tomfoolering…", etc.
-        // Always a single word ending in "ing" + ellipsis.
-        if trimmed.ends_with("ing\u{2026}") || trimmed.ends_with("ing...") {
-            found_working = true;
-            continue;
-        }
-
         // "esc to interrupt" only appears in the status bar during active work
         if trimmed.contains("esc to interrupt") {
             found_working = true;
@@ -380,17 +373,10 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
             continue;
         }
 
-        // Tool call patterns visible on screen
-        if trimmed.contains("Read(")
-            || trimmed.contains("Edit(")
-            || trimmed.contains("Write(")
-            || trimmed.contains("Bash(")
-            || trimmed.contains("Agent(")
-            || trimmed.contains("Grep(")
-            || trimmed.contains("Glob(")
-            || trimmed.contains("Skill(")
-            || trimmed.contains("Cooked for")
-            || trimmed.contains("Compiling")
+        // Claude Code spinner: single word ending in "ing" + ellipsis.
+        // Must be a standalone short token (not a sentence fragment).
+        if (trimmed.ends_with("ing\u{2026}") || trimmed.ends_with("ing..."))
+            && !trimmed.contains(' ')
         {
             found_working = true;
             continue;
@@ -398,10 +384,16 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
 
         // ── Claude running (but idle) indicators ──
 
-        // Status bar mode text — present whenever Claude Code is running
+        // Status bar mode text — present whenever Claude Code is running.
+        // Also matches the input prompt area ("> ", cost display, etc.)
         if trimmed.contains("auto mode on")
             || trimmed.contains("plan mode")
             || trimmed.contains("shift+tab to cycle")
+            || trimmed.contains("voice mode")
+            || trimmed.contains("/help")
+            || trimmed.starts_with('>')
+            || trimmed.contains("Cost:")
+            || trimmed.contains("$ cost")
         {
             found_claude_running = true;
             continue;
@@ -423,8 +415,12 @@ fn detect_claude_state(bottom_lines: &[String], status: &Arc<std::sync::Mutex<De
         *s = DetectedClaudeStatus::WaitingForInput;
     } else if found_shell_prompt {
         *s = DetectedClaudeStatus::NotRunning;
+    } else if *s == DetectedClaudeStatus::Working {
+        // Nothing matched — Claude likely finished but the idle indicators
+        // scrolled off the bottom 8 lines. Decay to WaitingForInput rather
+        // than staying stuck on Working forever.
+        *s = DetectedClaudeStatus::WaitingForInput;
     }
-    // Otherwise keep current state
 }
 
 // ── Color conversion ──

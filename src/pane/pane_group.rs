@@ -373,6 +373,20 @@ impl PaneGroup {
         if let Some((group_id, tab_ix)) = find_file_tab(&self.root, &path, cx) {
             self.focused_group_id = Some(group_id);
             set_active_tab_in_group(&mut self.root, group_id, tab_ix);
+            // Ensure workspace_root is set on existing viewers
+            if let Some(group) = find_group(&self.root, group_id) {
+                if let Some(tab) = group.tabs.get(tab_ix) {
+                    let viewer = tab.read(cx).file_viewer().cloned();
+                    if let Some(viewer) = viewer {
+                        let work_dir = self.work_dir.clone();
+                        viewer.update(cx, |fv, _| {
+                            if fv.workspace_root.is_none() {
+                                fv.workspace_root = work_dir;
+                            }
+                        });
+                    }
+                }
+            }
             return;
         }
 
@@ -381,15 +395,25 @@ impl PaneGroup {
             .or_else(|| first_group_id(&self.root));
         if let Some(gid) = group_id {
             if let Some(group) = find_group_mut(&mut self.root, gid) {
-                let tab = cx.new(|cx| Tab::new_file(path, cx));
+                let work_dir = self.work_dir.clone();
+                let tab = cx.new(|cx| {
+                    let t = Tab::new_file(path, cx);
+                    // Set workspace root on the viewer for cross-file search
+                    if let Some(viewer) = t.file_viewer() {
+                        viewer.update(cx, |fv, _| {
+                            fv.workspace_root = work_dir;
+                        });
+                    }
+                    t
+                });
                 group.tabs.push(tab);
                 group.active_tab_ix = group.tabs.len() - 1;
             }
         }
     }
 
-    /// Navigate the active file viewer to a specific line.
-    pub fn navigate_to_line(&self, line: usize, cx: &mut App) {
+    /// Navigate the active file viewer to a specific line, optionally highlighting a column range.
+    pub fn navigate_to_line(&self, line: usize, col_range: Option<(usize, usize)>, cx: &mut App) {
         let group_id = self.focused_group_id
             .or_else(|| first_group_id(&self.root));
         if let Some(gid) = group_id {
@@ -398,12 +422,26 @@ impl PaneGroup {
                     let viewer = tab.read(cx).file_viewer().cloned();
                     if let Some(viewer) = viewer {
                         viewer.update(cx, |fv, _cx| {
-                            fv.navigate_to_line(line);
+                            fv.navigate_to_line(line, col_range);
                         });
                     }
                 }
             }
         }
+    }
+
+    /// Get the active file viewer entity (if any).
+    pub fn active_viewer(&self, cx: &App) -> Option<Entity<crate::editor::FileViewer>> {
+        let group_id = self.focused_group_id
+            .or_else(|| first_group_id(&self.root));
+        if let Some(gid) = group_id {
+            if let Some(group) = find_group(&self.root, gid) {
+                if let Some(tab) = group.tabs.get(group.active_tab_ix) {
+                    return tab.read(cx).file_viewer().cloned();
+                }
+            }
+        }
+        None
     }
 
     /// Collect all open file paths across all groups.

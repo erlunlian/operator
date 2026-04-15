@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::editor::file_tree::FileTree;
+use crate::editor::file_viewer::FileViewerEvent;
 use crate::pane::PaneGroup;
 use crate::theme::colors;
 
@@ -16,6 +17,8 @@ pub struct EditorView {
     resizing_tree: bool,
     view_origin_x: Rc<Cell<f32>>,
     focus_handle: FocusHandle,
+    /// Subscription to active viewer's FileViewerEvent (replaced on each open_file).
+    _viewer_sub: Option<Subscription>,
 }
 
 impl EditorView {
@@ -31,6 +34,7 @@ impl EditorView {
             resizing_tree: false,
             view_origin_x: Rc::new(Cell::new(0.0)),
             focus_handle: cx.focus_handle(),
+            _viewer_sub: None,
         }
     }
 
@@ -39,12 +43,27 @@ impl EditorView {
         self.pane_group.update(cx, |pg, cx| {
             pg.open_file(path, cx);
         });
+        // Subscribe to FileViewerEvent from the active viewer.
+        // Storing in _viewer_sub drops the previous subscription, preventing accumulation.
+        let viewer = self.pane_group.read(cx).active_viewer(cx);
+        self._viewer_sub = viewer.map(|v| {
+            cx.subscribe(&v, |this, _viewer, event: &FileViewerEvent, cx| {
+                match event {
+                    FileViewerEvent::OpenFile { path, line, col_start, col_end } => {
+                        let line = *line;
+                        let col_range = Some((*col_start, *col_end));
+                        this.open_file(path.clone(), cx);
+                        this.navigate_to_line(line, col_range, cx);
+                    }
+                }
+            })
+        });
         cx.notify();
     }
 
-    pub fn navigate_to_line(&mut self, line: usize, cx: &mut Context<Self>) {
+    pub fn navigate_to_line(&mut self, line: usize, col_range: Option<(usize, usize)>, cx: &mut Context<Self>) {
         self.pane_group.update(cx, |pg, cx| {
-            pg.navigate_to_line(line, cx);
+            pg.navigate_to_line(line, col_range, cx);
         });
     }
 

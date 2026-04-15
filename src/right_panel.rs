@@ -63,7 +63,7 @@ impl RightPanel {
             editor.update(cx, |view, cx| {
                 view.open_file(path, cx);
                 if let Some(line) = line_num {
-                    view.navigate_to_line(line, cx);
+                    view.navigate_to_line(line, None, cx);
                 }
             });
         }

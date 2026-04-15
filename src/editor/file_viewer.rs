@@ -1,4 +1,5 @@
 use gpui::*;
+use ignore::WalkBuilder;
 use std::cell::Cell;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -111,9 +112,43 @@ struct UndoEntry {
     cursor_col: usize,
 }
 
+/// A single reference to a symbol, possibly in another file.
+#[derive(Clone, Debug)]
+struct FileReference {
+    path: PathBuf,
+    row: usize,       // 0-based line index
+    col_start: usize,  // byte offset
+    col_end: usize,    // byte offset (exclusive)
+    line_text: String,  // the full line content (for display)
+}
+
+/// An inline "Find All References" panel shown when Cmd+clicking a definition.
+#[derive(Clone)]
+struct ReferencesPanel {
+    /// The word being referenced.
+    word: String,
+    /// The row the panel is anchored to (the definition line).
+    anchor_row: usize,
+    /// All references grouped by file path (sorted: current file first, then alphabetical).
+    groups: Vec<(PathBuf, Vec<FileReference>)>,
+    /// Flat index into all references for keyboard navigation.
+    selected_ix: usize,
+    /// Total number of references.
+    total_refs: usize,
+}
+
+/// Event emitted by FileViewer when it wants to navigate to a different file.
+pub enum FileViewerEvent {
+    OpenFile { path: PathBuf, line: usize, col_start: usize, col_end: usize },
+}
+
+impl EventEmitter<FileViewerEvent> for FileViewer {}
+
 pub struct FileViewer {
     pub path: PathBuf,
     pub language: Option<String>,
+    /// Workspace root for cross-file search. Set by the parent after construction.
+    pub workspace_root: Option<PathBuf>,
     pub dirty: bool,
 
     // Editable text buffer (source of truth)
@@ -147,6 +182,13 @@ pub struct FileViewer {
     highlighted_word: Option<String>,
     /// Positions of all occurrences: (row, start_col, end_col) in byte offsets.
     highlighted_occurrences: Vec<(usize, usize, usize)>,
+
+    // Inline references panel (Cmd+Click on definition)
+    references_panel: Option<ReferencesPanel>,
+
+    // Navigation highlight: flash the target word when jumping to a reference.
+    // (row, col_start_byte, col_end_byte)
+    nav_highlight: Option<(usize, usize, usize)>,
 
     // In-file search (Cmd+F)
     pub search_active: bool,
@@ -190,6 +232,7 @@ impl FileViewer {
         Self {
             path,
             language,
+            workspace_root: None,
             dirty: false,
             buffer,
             rendered_lines: Rc::new(rendered_lines),
@@ -207,6 +250,8 @@ impl FileViewer {
             selection: None,
             highlighted_word: None,
             highlighted_occurrences: Vec::new(),
+            references_panel: None,
+            nav_highlight: None,
             search_active: false,
             search_query: String::new(),
             search_input: None,
@@ -225,6 +270,7 @@ impl FileViewer {
         Self {
             path,
             language: None,
+            workspace_root: None,
             dirty: true,
             buffer: vec![String::new()],
             rendered_lines: Rc::new(vec![RenderedLine {
@@ -245,6 +291,8 @@ impl FileViewer {
             selection: None,
             highlighted_word: None,
             highlighted_occurrences: Vec::new(),
+            references_panel: None,
+            nav_highlight: None,
             search_active: false,
             search_query: String::new(),
             search_input: None,
@@ -1257,6 +1305,120 @@ impl FileViewer {
         results
     }
 
+    /// Search for whole-word occurrences of `word` across the workspace.
+    /// Returns references grouped by file (current file first, then alphabetical).
+    fn find_cross_file_references(&self, word: &str) -> Vec<(PathBuf, Vec<FileReference>)> {
+        let is_word_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+        // Helper: find all whole-word matches in a given text, returning FileReferences
+        let search_in_content = |path: &PathBuf, content: &str| -> Vec<FileReference> {
+            let mut refs = Vec::new();
+            for (row, line) in content.lines().enumerate() {
+                let mut search_from = 0;
+                while let Some(pos) = line[search_from..].find(word) {
+                    let start = search_from + pos;
+                    let end = start + word.len();
+                    let before_ok = start == 0 || !is_word_char(line.as_bytes()[start - 1]);
+                    let after_ok = end >= line.len() || !is_word_char(line.as_bytes()[end]);
+                    if before_ok && after_ok {
+                        refs.push(FileReference {
+                            path: path.clone(),
+                            row,
+                            col_start: start,
+                            col_end: end,
+                            line_text: line.to_string(),
+                        });
+                    }
+                    search_from = start + 1;
+                }
+            }
+            refs
+        };
+
+        // Current file references (from buffer, which may have unsaved changes)
+        let current_refs: Vec<FileReference> = self.buffer.iter().enumerate().flat_map(|(row, line)| {
+            let mut refs = Vec::new();
+            let mut search_from = 0;
+            while let Some(pos) = line[search_from..].find(word) {
+                let start = search_from + pos;
+                let end = start + word.len();
+                let before_ok = start == 0 || !is_word_char(line.as_bytes()[start - 1]);
+                let after_ok = end >= line.len() || !is_word_char(line.as_bytes()[end]);
+                if before_ok && after_ok {
+                    refs.push(FileReference {
+                        path: self.path.clone(),
+                        row,
+                        col_start: start,
+                        col_end: end,
+                        line_text: line.clone(),
+                    });
+                }
+                search_from = start + 1;
+            }
+            refs
+        }).collect();
+
+        let mut groups: Vec<(PathBuf, Vec<FileReference>)> = Vec::new();
+        if !current_refs.is_empty() {
+            groups.push((self.path.clone(), current_refs));
+        }
+
+        // Cross-file search
+        if let Some(root) = &self.workspace_root {
+            let walker = WalkBuilder::new(root)
+                .hidden(true)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .follow_links(false)
+                .build();
+
+            for entry in walker {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    continue;
+                }
+                let file_path = entry.into_path();
+                // Skip current file (already searched from buffer)
+                if file_path == self.path {
+                    continue;
+                }
+                // Only search text-like files
+                let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let is_code = matches!(ext,
+                    "rs" | "py" | "js" | "jsx" | "ts" | "tsx" | "go" | "java" | "c" | "cpp" | "h" | "hpp" |
+                    "rb" | "swift" | "kt" | "scala" | "toml" | "yaml" | "yml" | "json" | "md" | "txt" |
+                    "css" | "scss" | "html" | "xml" | "sh" | "bash" | "zsh" | "sql" | "lua" | "zig" |
+                    "ex" | "exs" | "erl" | "hrl" | "clj" | "cljs" | "vim" | "el" | "ml" | "mli" |
+                    "hs" | "cabal" | "nix" | "dart" | "svelte" | "vue" | "proto" | "tf" | "graphql"
+                );
+                if !is_code {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&file_path) {
+                    // Quick check: does the file even contain the word?
+                    if !content.contains(word) {
+                        continue;
+                    }
+                    let refs = search_in_content(&file_path, &content);
+                    if !refs.is_empty() {
+                        groups.push((file_path, refs));
+                    }
+                }
+            }
+        }
+
+        // Sort non-current files alphabetically
+        if groups.len() > 1 {
+            groups[1..].sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        groups
+    }
+
     /// Highlight all occurrences of the word at cursor position.
     fn highlight_word_at_cursor(&mut self) {
         if let Some((start, end)) = self.word_at(self.cursor_row, self.cursor_col) {
@@ -1278,6 +1440,7 @@ impl FileViewer {
     fn clear_highlights(&mut self) {
         self.highlighted_word = None;
         self.highlighted_occurrences.clear();
+        self.references_panel = None;
     }
 
     // ── Search helpers ──
@@ -1397,11 +1560,14 @@ impl FileViewer {
         self.focus_handle.focus(window);
     }
 
-    /// Navigate to a specific line (1-indexed).
-    pub fn navigate_to_line(&mut self, line: usize) {
+    /// Navigate to a specific line (1-indexed), optionally highlighting a column range.
+    pub fn navigate_to_line(&mut self, line: usize, col_range: Option<(usize, usize)>) {
         let row = line.saturating_sub(1).min(self.buffer.len().saturating_sub(1));
         self.cursor_row = row;
-        self.cursor_col = 0;
+        self.cursor_col = col_range.map(|(s, _)| s).unwrap_or(0);
+        if let Some((col_start, col_end)) = col_range {
+            self.nav_highlight = Some((row, col_start, col_end));
+        }
         self.ensure_cursor_visible();
     }
 
@@ -1414,6 +1580,7 @@ impl FileViewer {
         cx: &mut Context<Self>,
     ) {
         let ks = &event.keystroke;
+        self.nav_highlight = None;
 
         // If search is active, Escape closes it; all other keys go to search input
         if self.search_active {
@@ -1422,6 +1589,49 @@ impl FileViewer {
                 cx.notify();
             }
             return;
+        }
+
+        // If references panel is open, handle navigation keys
+        if self.references_panel.is_some() {
+            match ks.key.as_str() {
+                "escape" => {
+                    self.references_panel = None;
+                    cx.notify();
+                    return;
+                }
+                "up" => {
+                    if let Some(panel) = &mut self.references_panel {
+                        if panel.selected_ix > 0 {
+                            panel.selected_ix -= 1;
+                        } else {
+                            panel.selected_ix = panel.total_refs.saturating_sub(1);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    if let Some(panel) = &mut self.references_panel {
+                        panel.selected_ix = (panel.selected_ix + 1) % panel.total_refs.max(1);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    if let Some(panel) = self.references_panel.take() {
+                        if let Some(file_ref) = Self::flat_ref_at(&panel.groups, panel.selected_ix) {
+                            self.goto_reference(&file_ref, cx);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    // Any other key closes the panel and falls through to normal handling
+                    self.references_panel = None;
+                    cx.notify();
+                }
+            }
         }
 
         // Handle Cmd+key combos we care about before passing to action system
@@ -1696,6 +1906,29 @@ impl FileViewer {
     ) {
         self.focus_handle.focus(window);
         self.last_edit_kind = None; // break undo coalescing on click
+        self.nav_highlight = None;
+
+        // If the references panel is open and the click is within its bounds, skip
+        // normal click handling (the panel has its own on_click handlers).
+        if let Some(panel) = &self.references_panel {
+            let content_top = self.content_area_top.get();
+            let scroll_offset_y = {
+                let state = self.scroll_handle.0.borrow();
+                f32::from(state.base_handle.offset().y)
+            };
+            let panel_top = content_top + (panel.anchor_row as f32 + 1.0) * 18.0 + scroll_offset_y;
+            let panel_height: f32 = 320.0; // max_panel_h
+            // code_area_left (window-space) is where the code text starts (after gutter).
+            // The panel is rendered at `left(gutter_width + 8)` inside the relative container,
+            // which puts it ~8px right of the code start in window space.
+            let panel_left = self.code_area_left.get();
+            let panel_right = panel_left + 500.0;
+            let mx = f32::from(event.position.x);
+            let my = f32::from(event.position.y);
+            if mx >= panel_left && mx <= panel_right && my >= panel_top && my <= panel_top + panel_height {
+                return; // click is inside the panel, let panel's on_click handle it
+            }
+        }
 
         let (row, col) = self.position_to_row_col(event.position);
 
@@ -1742,81 +1975,159 @@ impl FileViewer {
         cx.notify();
     }
 
-    /// Handle Cmd+click: find the definition of the word under cursor.
-    /// Simple heuristic: find occurrences of the word; navigate to the first
-    /// "definition-like" occurrence (fn, struct, let, const, type, impl, enum, trait, mod, pub).
-    /// If already at a definition, jump to the next usage instead.
-    fn handle_cmd_click(&mut self, _cx: &mut Context<Self>) {
-        if let Some((start, end)) = self.word_at(self.cursor_row, self.cursor_col) {
-            let word = self.buffer[self.cursor_row][start..end].to_string();
-            if word.is_empty() {
+    /// Check whether a line prefix before `col_start` ends with a definition keyword.
+    fn line_is_definition(line: &str, col_start: usize) -> bool {
+        const DEF_KEYWORDS: &[&str] = &[
+            "fn", "struct", "enum", "trait", "type", "const", "static",
+            "let", "let mut", "mod", "pub fn", "pub struct", "pub enum",
+            "pub trait", "pub type", "pub const", "pub static", "pub mod",
+            "pub(crate) fn", "pub(crate) struct", "pub(crate) enum",
+            "pub(crate) trait", "pub(crate) type", "pub(crate) const",
+            "class", "def", "function", "var", "interface",
+            "export function", "export class", "export const", "export default",
+        ];
+        let prefix = &line[..col_start];
+        let trimmed = prefix.trim_end();
+        DEF_KEYWORDS.iter().any(|kw| trimmed.ends_with(kw))
+    }
+
+    /// Handle Cmd+click: "Go to Definition" or "Find All References".
+    ///
+    /// - Cmd+click on a **usage** → jump to the definition (same file) or emit OpenFile event.
+    /// - Cmd+click on a **definition** → open an inline references panel listing all usages
+    ///   across the workspace, grouped by file.
+    /// - If no definition is found, show references for all occurrences.
+    fn handle_cmd_click(&mut self, cx: &mut Context<Self>) {
+        // Close any open references panel first
+        self.references_panel = None;
+
+        let Some((start, end)) = self.word_at(self.cursor_row, self.cursor_col) else {
+            return;
+        };
+        let word = self.buffer[self.cursor_row][start..end].to_string();
+        if word.is_empty() {
+            return;
+        }
+
+        // Cross-file search
+        let groups = self.find_cross_file_references(&word);
+        if groups.is_empty() {
+            return;
+        }
+
+        // Flat list of all references for navigation
+        let all_refs: Vec<FileReference> = groups.iter()
+            .flat_map(|(_, refs)| refs.iter().cloned())
+            .collect();
+
+        // Also keep local occurrences for highlighting in this file
+        let local_occurrences = self.find_all_occurrences(&word);
+
+        // Find the definition site (first definition-like occurrence across all files)
+        let def_ref = all_refs.iter().find(|r| Self::line_is_definition(&r.line_text, r.col_start));
+
+        // Is the cursor currently on the definition?
+        let on_definition = def_ref.map_or(false, |dr| {
+            dr.path == self.path && dr.row == self.cursor_row && dr.col_start == start
+        });
+
+        if on_definition {
+            // On a definition → show references panel (excluding the definition itself)
+            let filtered_groups: Vec<(PathBuf, Vec<FileReference>)> = groups.into_iter()
+                .map(|(path, refs)| {
+                    let filtered: Vec<FileReference> = refs.into_iter()
+                        .filter(|r| !Self::line_is_definition(&r.line_text, r.col_start))
+                        .collect();
+                    (path, filtered)
+                })
+                .filter(|(_, refs)| !refs.is_empty())
+                .collect();
+
+            let total: usize = filtered_groups.iter().map(|(_, r)| r.len()).sum();
+            if total == 0 {
                 return;
             }
-            let occurrences = self.find_all_occurrences(&word);
-            if occurrences.is_empty() {
-                return;
-            }
 
-            // Find definition-like patterns
-            let def_keywords = [
-                "fn ", "struct ", "enum ", "trait ", "type ", "const ", "static ",
-                "let ", "let mut ", "mod ", "pub fn ", "pub struct ", "pub enum ",
-                "pub trait ", "pub type ", "pub const ", "pub static ", "pub mod ",
-                "class ", "def ", "function ", "var ", "const ", "interface ",
-            ];
-
-            // Check if any occurrence is preceded by a definition keyword
-            let mut def_ix: Option<usize> = None;
-            for (ix, &(row, col_start, _col_end)) in occurrences.iter().enumerate() {
-                let line = &self.buffer[row];
-                let prefix = &line[..col_start];
-                let trimmed = prefix.trim_end();
-                for kw in &def_keywords {
-                    if trimmed.ends_with(kw.trim()) {
-                        def_ix = Some(ix);
-                        break;
-                    }
-                }
-                if def_ix.is_some() {
-                    break;
-                }
-            }
-
-            // If we're on the definition, jump to first usage; otherwise jump to definition
-            let current_ix = occurrences
-                .iter()
-                .position(|&(r, s, _)| r == self.cursor_row && s == start);
-
-            let target = if let Some(di) = def_ix {
-                if current_ix == Some(di) {
-                    // On definition — jump to first usage (next occurrence)
-                    let next = (di + 1) % occurrences.len();
-                    occurrences[next]
-                } else {
-                    // Jump to definition
-                    occurrences[di]
-                }
-            } else {
-                // No definition found — jump to first occurrence that isn't current
-                if let Some(ci) = current_ix {
-                    let next = (ci + 1) % occurrences.len();
-                    occurrences[next]
-                } else {
-                    occurrences[0]
-                }
-            };
-
-            self.cursor_row = target.0;
-            self.cursor_col = target.1;
-            self.selection = Some(Selection {
-                start_row: target.0,
-                start_col: target.1,
-                end_row: target.0,
-                end_col: target.2,
+            self.highlighted_word = Some(word.clone());
+            self.highlighted_occurrences = local_occurrences;
+            self.references_panel = Some(ReferencesPanel {
+                word,
+                anchor_row: self.cursor_row,
+                groups: filtered_groups,
+                selected_ix: 0,
+                total_refs: total,
             });
-            self.highlighted_word = Some(word);
-            self.highlighted_occurrences = occurrences;
+        } else if let Some(dr) = def_ref {
+            // On a usage → jump to definition
+            if dr.path == self.path {
+                // Same file: just move cursor and highlight target
+                self.cursor_row = dr.row;
+                self.cursor_col = dr.col_start;
+                self.nav_highlight = Some((dr.row, dr.col_start, dr.col_end));
+                self.selection = Some(Selection {
+                    start_row: dr.row,
+                    start_col: dr.col_start,
+                    end_row: dr.row,
+                    end_col: dr.col_end,
+                });
+                self.highlighted_word = Some(word);
+                self.highlighted_occurrences = local_occurrences;
+                self.ensure_cursor_visible();
+            } else {
+                // Different file: emit event for parent to open
+                cx.emit(FileViewerEvent::OpenFile {
+                    path: dr.path.clone(),
+                    line: dr.row + 1, // 1-based
+                    col_start: dr.col_start,
+                    col_end: dr.col_end,
+                });
+            }
+        } else {
+            // No definition found → show references panel for all occurrences
+            let total: usize = groups.iter().map(|(_, r)| r.len()).sum();
+            self.highlighted_word = Some(word.clone());
+            self.highlighted_occurrences = local_occurrences;
+            self.references_panel = Some(ReferencesPanel {
+                word,
+                anchor_row: self.cursor_row,
+                groups,
+                selected_ix: 0,
+                total_refs: total,
+            });
+        }
+    }
+
+    /// Get the nth reference from a flat index across all groups.
+    fn flat_ref_at(groups: &[(PathBuf, Vec<FileReference>)], flat_ix: usize) -> Option<FileReference> {
+        let mut ix = flat_ix;
+        for (_, refs) in groups {
+            if ix < refs.len() {
+                return Some(refs[ix].clone());
+            }
+            ix -= refs.len();
+        }
+        None
+    }
+
+    /// Navigate to a reference from the references panel and close it.
+    fn goto_reference(&mut self, file_ref: &FileReference, cx: &mut Context<Self>) {
+        if file_ref.path == self.path {
+            // Same file: move cursor and highlight target
+            self.cursor_row = file_ref.row;
+            self.cursor_col = file_ref.col_start;
+            self.nav_highlight = Some((file_ref.row, file_ref.col_start, file_ref.col_end));
+            self.references_panel = None;
+            self.selection = None;
             self.ensure_cursor_visible();
+        } else {
+            // Different file: emit event with column info for highlight
+            self.references_panel = None;
+            cx.emit(FileViewerEvent::OpenFile {
+                path: file_ref.path.clone(),
+                line: file_ref.row + 1,
+                col_start: file_ref.col_start,
+                col_end: file_ref.col_end,
+            });
         }
     }
 
@@ -1896,6 +2207,8 @@ impl FileViewer {
         word_highlights: &[(usize, usize)],
         // Search match highlights for this line: (start_col, end_col, is_active) tuples
         search_highlights: &[(usize, usize, bool)],
+        // Navigation highlight for this line: (start_col, end_col) if this line has a nav target
+        nav_highlight: Option<(usize, usize)>,
     ) -> Div {
         let cw = char_width.get();
         let mut line_el = div().flex().flex_row().h(px(18.0));
@@ -2012,6 +2325,24 @@ impl FileViewer {
             );
         }
 
+        // Navigation highlight overlay (bright flash to show jump target)
+        if let Some((nh_start, nh_end)) = nav_highlight {
+            let start_char = Self::byte_col_to_char_count(line_text, nh_start) as f32;
+            let end_char = Self::byte_col_to_char_count(line_text, nh_end) as f32;
+            let w = (end_char - start_char).max(0.5);
+            code_wrapper = code_wrapper.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(start_char * cw))
+                    .w(px(w * cw))
+                    .h(px(18.0))
+                    .bg(gpui::rgba(0xf9e2af55)) // warm yellow highlight
+                    .border_1()
+                    .border_color(gpui::rgba(0xf9e2afaa)),
+            );
+        }
+
         // Cursor overlay (painted on top of everything)
         if let Some(cursor_byte) = cursor_col {
             let cursor_char = Self::byte_col_to_char_count(line_text, cursor_byte) as f32;
@@ -2096,6 +2427,7 @@ impl Render for FileViewer {
             Rc::new(self.search_matches.clone());
         let active_search_ix = self.search_match_ix;
         let search_active = self.search_active;
+        let nav_highlight = self.nav_highlight;
 
         // Title with dirty indicator
         let path_display = if self.dirty {
@@ -2181,12 +2513,16 @@ impl Render for FileViewer {
             }
         }
 
+        // References panel data for the closure
+        let refs_panel = self.references_panel.clone();
+        let entity_handle = cx.entity().clone();
+
         // Virtual scrolling editor lines with click-to-position
         root = root.child({
                 let code_left = self.code_area_left.clone();
                 let content_top = self.content_area_top.clone();
                 let char_width = self.char_width.clone();
-                div()
+                let editor_container = div()
                     .relative()
                     .flex_1()
                     .size_full()
@@ -2237,6 +2573,11 @@ impl Render for FileViewer {
                                         vec![]
                                     };
 
+                                    // Navigation highlight for this line
+                                    let nh = nav_highlight.and_then(|(r, s, e)| {
+                                        if r == ix { Some((s, e)) } else { None }
+                                    });
+
                                     let line_div = Self::render_line(
                                         &lines[ix],
                                         ix + 1,
@@ -2249,6 +2590,7 @@ impl Render for FileViewer {
                                         line_text,
                                         &wh,
                                         &sh,
+                                        nh,
                                     );
 
                                     div()
@@ -2262,8 +2604,247 @@ impl Render for FileViewer {
                         .flex_1()
                         .size_full()
                         .track_scroll(self.scroll_handle.clone())
-                    )
+                    );
+
+                editor_container
             });
+
+        // ── Inline References Panel (deferred overlay, outside scroll container) ──
+        if let Some(panel) = &refs_panel {
+            let scroll_offset_y = {
+                let state = self.scroll_handle.0.borrow();
+                f32::from(state.base_handle.offset().y)
+            };
+            // Compute window-space position for the panel
+            let panel_y = self.content_area_top.get()
+                + (panel.anchor_row as f32 + 1.0) * 18.0
+                + scroll_offset_y;
+            let panel_x = self.code_area_left.get();
+
+            let item_height: f32 = 22.0;
+            let header_height: f32 = 28.0;
+            let group_header_height: f32 = 22.0;
+            let max_panel_h: f32 = 320.0;
+            let ref_count = panel.total_refs;
+            let selected = panel.selected_ix;
+            let workspace_root = self.workspace_root.clone();
+
+            let mut panel_el = div()
+                .id("references-panel")
+                .occlude()
+                .w(px(500.0))
+                .max_h(px(max_panel_h))
+                .bg(colors::bg())
+                .border_1()
+                .border_color(colors::accent())
+                .rounded_md()
+                .shadow_lg()
+                .overflow_hidden()
+                .font_family("Menlo")
+                .text_sm()
+                // Header
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .h(px(header_height))
+                        .px_3()
+                        .bg(colors::surface())
+                        .border_b_1()
+                        .border_color(colors::border())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(colors::text())
+                                        .child(format!("\"{}\"", panel.word)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(colors::text_muted())
+                                        .child(format!(
+                                            "{} reference{} in {} file{}",
+                                            ref_count,
+                                            if ref_count == 1 { "" } else { "s" },
+                                            panel.groups.len(),
+                                            if panel.groups.len() == 1 { "" } else { "s" },
+                                        )),
+                                ),
+                        )
+                        .child({
+                            let entity_close = entity_handle.clone();
+                            div()
+                                .id("refs-close-btn")
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(colors::text_muted())
+                                .hover(|s| s.text_color(colors::text()))
+                                .px_1()
+                                .child("✕")
+                                .on_click(move |_, _, cx| {
+                                    entity_close.update(cx, |fv: &mut FileViewer, cx| {
+                                        fv.references_panel = None;
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                );
+
+            // Scrollable body with grouped references
+            let mut body = div()
+                .id("references-body")
+                .flex()
+                .flex_col()
+                .max_h(px(max_panel_h - header_height))
+                .overflow_y_scroll();
+
+            let mut flat_ix: usize = 0;
+            for (group_path, refs) in &panel.groups {
+                let display_path = if let Some(root) = &workspace_root {
+                    group_path.strip_prefix(root)
+                        .unwrap_or(group_path)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    group_path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                };
+
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(group_header_height))
+                        .px_3()
+                        .bg(colors::surface())
+                        .border_b_1()
+                        .border_color(colors::border())
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors::text_muted())
+                                .child(display_path),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(gpui::rgba(0x585b70ff))
+                                .pl_2()
+                                .child(format!("({})", refs.len())),
+                        ),
+                );
+
+                for file_ref in refs {
+                    let is_selected = flat_ix == selected;
+                    let entity_nav = entity_handle.clone();
+                    let nav_ref = file_ref.clone();
+                    let line_num = file_ref.row + 1;
+
+                    let trimmed = file_ref.line_text.trim().to_string();
+                    let display_text = if trimmed.chars().count() > 55 {
+                        let truncated: String = trimmed.chars().take(55).collect();
+                        format!("{truncated}…")
+                    } else {
+                        trimmed
+                    };
+
+                    // Build styled text with the matched word bolded
+                    let word = &panel.word;
+                    let text_el: AnyElement = {
+                        let mut bold_ranges: Vec<Range<usize>> = Vec::new();
+                        let lower_display = display_text.to_lowercase();
+                        let lower_word = word.to_lowercase();
+                        let mut search_from = 0;
+                        while let Some(pos) = lower_display[search_from..].find(&lower_word) {
+                            let start = search_from + pos;
+                            let end = start + lower_word.len();
+                            bold_ranges.push(start..end);
+                            search_from = end;
+                        }
+                        if bold_ranges.is_empty() {
+                            div()
+                                .text_xs()
+                                .text_color(colors::text_muted())
+                                .flex_1()
+                                .overflow_x_hidden()
+                                .child(display_text.clone())
+                                .into_any_element()
+                        } else {
+                            let highlights: Vec<(Range<usize>, HighlightStyle)> = bold_ranges
+                                .into_iter()
+                                .map(|r| (r, HighlightStyle {
+                                    color: Some(colors::text().into()),
+                                    font_weight: Some(FontWeight::BOLD),
+                                    ..Default::default()
+                                }))
+                                .collect();
+                            let styled = StyledText::new(SharedString::from(display_text.clone()))
+                                .with_highlights(highlights);
+                            div()
+                                .text_xs()
+                                .text_color(colors::text_muted())
+                                .flex_1()
+                                .overflow_x_hidden()
+                                .child(styled)
+                                .into_any_element()
+                        }
+                    };
+
+                    body = body.child(
+                        div()
+                            .id(ElementId::Name(format!("ref-item-{flat_ix}").into()))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(item_height))
+                            .px_3()
+                            .pl(px(20.0))
+                            .gap_2()
+                            .cursor_pointer()
+                            .bg(if is_selected { gpui::rgba(0x89b4fa20) } else { gpui::rgba(0x00000000) })
+                            .hover(|s| s.bg(gpui::rgba(0x89b4fa28)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors::accent())
+                                    .min_w(px(36.0))
+                                    .child(format!("{}", line_num)),
+                            )
+                            .child(text_el)
+                            .on_click(move |_, _, cx| {
+                                entity_nav.update(cx, |fv: &mut FileViewer, cx| {
+                                    fv.goto_reference(&nav_ref, cx);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+
+                    flat_ix += 1;
+                }
+            }
+
+            panel_el = panel_el.child(body);
+
+            root = root.child(
+                deferred(
+                    anchored()
+                        .position(point(px(panel_x), px(panel_y)))
+                        .child(panel_el)
+                ).with_priority(1)
+            );
+        }
 
         // Vim status bar at the bottom
         if vim_enabled {

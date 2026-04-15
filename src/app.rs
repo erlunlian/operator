@@ -1581,6 +1581,8 @@ impl Render for OperatorApp {
             .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace7, window, cx| this.activate_workspace(6, window, cx)))
             .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace8, window, cx| this.activate_workspace(7, window, cx)))
             .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace9, window, cx| this.activate_workspace(8, window, cx)))
+            .on_action(cx.listener(|_: &mut Self, _: &Minimize, window, _cx| window.minimize_window()))
+            .on_action(cx.listener(|_: &mut Self, _: &Zoom, window, _cx| window.zoom_window()))
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 app_resize_move.update(cx, |app, cx| {
                     let x = f32::from(event.position.x);

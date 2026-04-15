@@ -50,8 +50,12 @@ release-tag:
 	echo "Released v$$next"
 
 # Copy to /Applications
-install: release
-	cp -r target/release/Operator.app /Applications/
+install:
+	@MAKE_INSTALL=1 ./script/build-release
+	@cp -r target/release/Operator.app /Applications/
+	@echo ""
+	@echo "Installed to /Applications/Operator.app"
+	@echo "To run:  open -n /Applications/Operator.app"
 
 # Open the installed app (-n forces new instance even if already running)
 open:

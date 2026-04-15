@@ -43,6 +43,14 @@ fn file_header_bg() -> Rgba {
     rgb(0x1c1c30)
 }
 
+// ── View mode ──
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffViewMode {
+    Unified,
+    Split,
+}
+
 // ── Section enum ──
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +82,8 @@ pub struct GitDiffPanel {
     pub width: f32,
     /// File tree width in px.
     tree_width: f32,
+    /// Whether the file tree sidebar is collapsed.
+    tree_collapsed: bool,
     /// Whether we're currently dragging the tree resize handle.
     resizing_tree: bool,
     /// Mouse X at drag start (window coords).
@@ -107,6 +117,8 @@ pub struct GitDiffPanel {
     flat_file_starts: Vec<usize>,
     /// Whether the flat cache needs rebuilding before next render.
     flat_cache_dirty: bool,
+    /// Unified (interleaved) vs Split (side-by-side) diff view.
+    view_mode: DiffViewMode,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +148,7 @@ impl GitDiffPanel {
             expanded_context: HashMap::new(),
             width: 360.0,
             tree_width: 200.0,
+            tree_collapsed: false,
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
@@ -153,6 +166,7 @@ impl GitDiffPanel {
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
+            view_mode: DiffViewMode::Unified,
         }
     }
 
@@ -191,6 +205,7 @@ impl GitDiffPanel {
             expanded_context: HashMap::new(),
             width: 360.0,
             tree_width: 200.0,
+            tree_collapsed: false,
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
@@ -208,6 +223,7 @@ impl GitDiffPanel {
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
             flat_cache_dirty: true,
+            view_mode: DiffViewMode::Unified,
         }
     }
 
@@ -763,6 +779,7 @@ impl GitDiffPanel {
         let mut copy_texts: Vec<String> = Vec::new();
         let mut global_line_idx = 0usize;
         let files_len = self.active_files().len();
+        let split_mode = self.view_mode == DiffViewMode::Split;
 
         for file_idx in 0..render_limit {
             self.flat_file_starts.push(self.flat_rows.len());
@@ -781,33 +798,136 @@ impl GitDiffPanel {
             let segments = &all_segments[file_idx];
             let num_segs = segments.len();
 
-            for (seg_idx, seg) in segments.iter().enumerate() {
-                let is_last = seg_idx == num_segs - 1;
-                match seg {
-                    LineSegment::Line(line) => {
-                        copy_texts.push(line.content.trim_end().to_string());
-                        self.flat_rows.push(FlatRow::Line {
-                            file_idx,
-                            seg_idx,
-                            global_line_idx,
-                            is_last_in_file: is_last,
-                        });
-                        global_line_idx += 1;
+            if split_mode {
+                // Split mode: pair removed/added lines side-by-side
+                let mut i = 0;
+                while i < num_segs {
+                    let seg = &segments[i];
+                    match seg {
+                        LineSegment::CollapsedContext { count, hunk_idx, direction, .. } => {
+                            self.flat_rows.push(FlatRow::CollapsedContext {
+                                file_idx,
+                                seg_idx: i,
+                                count: *count,
+                                hunk_idx: *hunk_idx,
+                                direction: *direction,
+                                is_last_in_file: i == num_segs - 1,
+                            });
+                            i += 1;
+                        }
+                        LineSegment::Line(line) => {
+                            match line.kind {
+                                DiffLineKind::Context => {
+                                    // Context lines appear on both sides
+                                    copy_texts.push(line.content.trim_end().to_string());
+                                    self.flat_rows.push(FlatRow::SplitLine {
+                                        file_idx,
+                                        left_seg: Some(i),
+                                        right_seg: Some(i),
+                                        global_line_idx,
+                                        is_last_in_file: i == num_segs - 1,
+                                    });
+                                    global_line_idx += 1;
+                                    i += 1;
+                                }
+                                DiffLineKind::Removed => {
+                                    // Collect consecutive removes
+                                    let mut removes = Vec::new();
+                                    while i < num_segs {
+                                        if let LineSegment::Line(l) = &segments[i] {
+                                            if matches!(l.kind, DiffLineKind::Removed) {
+                                                removes.push(i);
+                                                i += 1;
+                                                continue;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    // Collect consecutive adds that follow
+                                    let mut adds = Vec::new();
+                                    while i < num_segs {
+                                        if let LineSegment::Line(l) = &segments[i] {
+                                            if matches!(l.kind, DiffLineKind::Added) {
+                                                adds.push(i);
+                                                i += 1;
+                                                continue;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    // Pair them up
+                                    let max_len = removes.len().max(adds.len());
+                                    for j in 0..max_len {
+                                        let left = removes.get(j).copied();
+                                        let right = adds.get(j).copied();
+                                        if let Some(li) = left {
+                                            if let LineSegment::Line(l) = &segments[li] {
+                                                copy_texts.push(l.content.trim_end().to_string());
+                                            }
+                                        }
+                                        if let Some(ri) = right {
+                                            if let LineSegment::Line(l) = &segments[ri] {
+                                                copy_texts.push(l.content.trim_end().to_string());
+                                            }
+                                        }
+                                        let remaining_in_file = i >= num_segs && j == max_len - 1;
+                                        self.flat_rows.push(FlatRow::SplitLine {
+                                            file_idx,
+                                            left_seg: left,
+                                            right_seg: right,
+                                            global_line_idx,
+                                            is_last_in_file: remaining_in_file,
+                                        });
+                                        global_line_idx += 1;
+                                    }
+                                }
+                                DiffLineKind::Added => {
+                                    // Orphan add (no preceding remove)
+                                    copy_texts.push(line.content.trim_end().to_string());
+                                    self.flat_rows.push(FlatRow::SplitLine {
+                                        file_idx,
+                                        left_seg: None,
+                                        right_seg: Some(i),
+                                        global_line_idx,
+                                        is_last_in_file: i == num_segs - 1,
+                                    });
+                                    global_line_idx += 1;
+                                    i += 1;
+                                }
+                            }
+                        }
                     }
-                    LineSegment::CollapsedContext {
-                        count,
-                        hunk_idx,
-                        direction,
-                        ..
-                    } => {
-                        self.flat_rows.push(FlatRow::CollapsedContext {
-                            file_idx,
-                            seg_idx,
-                            count: *count,
-                            hunk_idx: *hunk_idx,
-                            direction: *direction,
-                            is_last_in_file: is_last,
-                        });
+                }
+            } else {
+                // Unified mode (original)
+                for (seg_idx, seg) in segments.iter().enumerate() {
+                    let is_last = seg_idx == num_segs - 1;
+                    match seg {
+                        LineSegment::Line(line) => {
+                            copy_texts.push(line.content.trim_end().to_string());
+                            self.flat_rows.push(FlatRow::Line {
+                                file_idx,
+                                seg_idx,
+                                global_line_idx,
+                                is_last_in_file: is_last,
+                            });
+                            global_line_idx += 1;
+                        }
+                        LineSegment::CollapsedContext {
+                            count,
+                            hunk_idx,
+                            direction,
+                            ..
+                        } => {
+                            self.flat_rows.push(FlatRow::CollapsedContext {
+                                file_idx,
+                                seg_idx,
+                                count: *count,
+                                hunk_idx: *hunk_idx,
+                                direction: *direction,
+                                is_last_in_file: is_last,
+                            });
+                        }
                     }
                 }
             }
@@ -861,6 +981,29 @@ impl GitDiffPanel {
                 row_idx,
                 entity,
             ),
+            FlatRow::SplitLine {
+                file_idx,
+                left_seg,
+                right_seg,
+                global_line_idx,
+                is_last_in_file,
+            } => {
+                let left_line = left_seg.and_then(|si| {
+                    if let LineSegment::Line(l) = &self.cached_file_segments[*file_idx][si] {
+                        Some(l)
+                    } else {
+                        None
+                    }
+                });
+                let right_line = right_seg.and_then(|si| {
+                    if let LineSegment::Line(l) = &self.cached_file_segments[*file_idx][si] {
+                        Some(l)
+                    } else {
+                        None
+                    }
+                });
+                self.render_split_line_row(left_line, right_line, *global_line_idx, *is_last_in_file, entity)
+            }
             FlatRow::LoadMore { remaining } => div()
                 .w_full()
                 .py_2()
@@ -1233,6 +1376,177 @@ impl GitDiffPanel {
             .into_any_element()
     }
 
+    /// Render one side of a split diff row (gutter + prefix + content).
+    /// `is_left` determines which line number to show for context lines.
+    fn render_split_half(
+        line: Option<&DiffLine>,
+        is_left: bool,
+    ) -> Div {
+        let (row_bg, gutter_bg_color, text_col, prefix, line_num_str, content) = match line {
+            Some(l) => {
+                let (bg, gbg, tc, pfx) = match l.kind {
+                    DiffLineKind::Added => (added_line_bg(), added_gutter_bg(), colors::diff_added(), "+"),
+                    DiffLineKind::Removed => (removed_line_bg(), removed_gutter_bg(), colors::diff_removed(), "-"),
+                    DiffLineKind::Context => (rgba(0x00000000), gutter_bg(), colors::text_muted(), " "),
+                };
+                // Left side shows old line numbers, right side shows new
+                let ln = if is_left {
+                    l.old_lineno
+                } else {
+                    l.new_lineno
+                };
+                let ln_str = ln.map(|n| format!("{n}")).unwrap_or_default();
+                (bg, gbg, tc, pfx, ln_str, Some(l))
+            }
+            None => {
+                // Empty half — filler
+                (rgba(0x00000000), gutter_bg(), colors::text_muted(), " ", String::new(), None)
+            }
+        };
+
+        let content_el: AnyElement = if let Some(l) = content {
+            let trimmed = l.content.trim_end();
+            if let Some(highlights) = l.highlights.as_ref() {
+                if highlights.is_empty() {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(text_col)
+                        .pl(px(4.0))
+                        .child(trimmed.to_string())
+                        .into_any_element()
+                } else {
+                    let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
+                        .iter()
+                        .filter(|s| {
+                            s.byte_range.end <= trimmed.len()
+                                && trimmed.is_char_boundary(s.byte_range.start)
+                                && trimmed.is_char_boundary(s.byte_range.end)
+                        })
+                        .map(|s| {
+                            (
+                                s.byte_range.clone(),
+                                HighlightStyle {
+                                    color: Some(Hsla::from(s.color)),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect();
+                    let text = SharedString::from(trimmed.to_string());
+                    let styled = StyledText::new(text).with_highlights(hl);
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(text_col)
+                        .pl(px(4.0))
+                        .child(styled)
+                        .into_any_element()
+                }
+            } else {
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(trimmed.to_string())
+                    .into_any_element()
+            }
+        } else {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .bg(row_bg)
+            .child(
+                div()
+                    .w(px(44.0))
+                    .flex_shrink_0()
+                    .text_right()
+                    .pr(px(8.0))
+                    .pl(px(4.0))
+                    .bg(gutter_bg_color)
+                    .text_color(colors::text_muted())
+                    .child(line_num_str),
+            )
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_shrink_0()
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(prefix.to_string()),
+            )
+            .child(content_el)
+    }
+
+    /// Render a side-by-side diff row with left (old) and right (new) halves.
+    fn render_split_line_row(
+        &self,
+        left: Option<&DiffLine>,
+        right: Option<&DiffLine>,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+        entity: &Entity<Self>,
+    ) -> AnyElement {
+        let left_half = Self::render_split_half(left, true);
+        let right_half = Self::render_split_half(right, false);
+
+        let line_selected = self.is_line_selected(global_line_idx);
+        let sel_bg = if line_selected { rgba(0x89b4fa30) } else { rgba(0x00000000) };
+
+        let entity_sel_down = entity.clone();
+        let entity_sel_move = entity.clone();
+        let gli = global_line_idx;
+
+        div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .min_h(px(20.0))
+            .bg(sel_bg)
+            .font_family("Menlo")
+            .text_xs()
+            .border_l_1()
+            .border_r_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                entity_sel_down.update(cx, |panel, cx| {
+                    panel.copy_anchor_line = Some(gli);
+                    panel.copy_end_line = Some(gli);
+                    panel.copy_selecting = true;
+                    cx.notify();
+                });
+            })
+            .on_mouse_move(move |_, _window, cx| {
+                entity_sel_move.update(cx, |panel, cx| {
+                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
+                        panel.copy_end_line = Some(gli);
+                        cx.notify();
+                    }
+                });
+            })
+            .child(left_half)
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .bg(colors::border()),
+            )
+            .child(right_half)
+            .into_any_element()
+    }
+
     fn render_collapsed_row(
         &self,
         file_idx: usize,
@@ -1546,6 +1860,14 @@ enum FlatRow {
         direction: ExpandDirection,
         is_last_in_file: bool,
     },
+    /// Side-by-side row: left (old) and right (new) line indices into cached_file_segments.
+    SplitLine {
+        file_idx: usize,
+        left_seg: Option<usize>,
+        right_seg: Option<usize>,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+    },
     LoadMore { remaining: usize },
 }
 
@@ -1684,6 +2006,8 @@ impl Render for GitDiffPanel {
             DiffSection::Unstaged => "Unstaged",
         };
         let active_count = self.active_files().len();
+        let is_split = self.view_mode == DiffViewMode::Split;
+        let entity_toggle = cx.entity().clone();
         panel = panel.child(
             div()
                 .flex()
@@ -1740,7 +2064,77 @@ impl Render for GitDiffPanel {
                                 )
                             }),
                     )
-                }),
+                })
+                // Spacer
+                .child(div().flex_1())
+                // Unified / Split toggle
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(1.0))
+                        .rounded(px(6.0))
+                        .bg(colors::surface())
+                        .p(px(2.0))
+                        .child(
+                            div()
+                                .id("diff-mode-unified")
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(!is_split, |d: Stateful<Div>| {
+                                    d.bg(colors::surface_hover())
+                                        .text_color(colors::text())
+                                })
+                                .when(is_split, |d: Stateful<Div>| {
+                                    d.text_color(colors::text_muted())
+                                        .hover(|s| s.text_color(colors::text()))
+                                })
+                                .child("Unified")
+                                .on_click({
+                                    let entity = entity_toggle.clone();
+                                    move |_, _window, cx| {
+                                        entity.update(cx, |panel, cx| {
+                                            if panel.view_mode != DiffViewMode::Unified {
+                                                panel.view_mode = DiffViewMode::Unified;
+                                                panel.flat_cache_dirty = true;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("diff-mode-split")
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(is_split, |d: Stateful<Div>| {
+                                    d.bg(colors::surface_hover())
+                                        .text_color(colors::text())
+                                })
+                                .when(!is_split, |d: Stateful<Div>| {
+                                    d.text_color(colors::text_muted())
+                                        .hover(|s| s.text_color(colors::text()))
+                                })
+                                .child("Split")
+                                .on_click(move |_, _window, cx| {
+                                    entity_toggle.update(cx, |panel, cx| {
+                                        if panel.view_mode != DiffViewMode::Split {
+                                            panel.view_mode = DiffViewMode::Split;
+                                            panel.flat_cache_dirty = true;
+                                            cx.notify();
+                                        }
+                                    });
+                                }),
+                        ),
+                ),
         );
 
         if total_file_count == 0 {
@@ -1759,6 +2153,7 @@ impl Render for GitDiffPanel {
 
         // ── Body: file tree | resize handle | diffs ──
         let tree_width = self.tree_width;
+        let tree_collapsed = self.tree_collapsed;
         let entity_down = cx.entity().clone();
 
         let mut body = div()
@@ -1770,40 +2165,85 @@ impl Render for GitDiffPanel {
             .min_w(px(0.0))
             .overflow_hidden();
 
-        // File tree sidebar
-        let tree_panel = div()
-            .id("diff-file-tree")
-            .flex()
-            .flex_col()
-            .w(px(tree_width))
-            .flex_shrink_0()
-            .h_full()
-            .border_r_1()
-            .border_color(colors::border())
-            .overflow_y_scroll()
-            .child(self.render_file_tree(cx));
-
-        body = body.child(tree_panel);
-
-        // Resize handle between tree and diff content
-        body = body.child(
-            div()
-                .id("tree-resize-handle")
-                .w(px(8.0))
-                .mx(px(-3.0))
-                .h_full()
-                .flex_shrink_0()
-                .cursor_col_resize()
-                .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
-                    entity_down.update(cx, |panel, cx| {
-                        panel.resizing_tree = true;
-                        panel.tree_drag_start_x = f32::from(event.position.x);
-                        panel.tree_drag_start_width = panel.tree_width;
+        // File tree toggle + sidebar
+        {
+            let entity_toggle = cx.entity().clone();
+            let toggle_icon = if tree_collapsed { "\u{25B6}" } else { "\u{25C0}" };
+            let toggle_btn = div()
+                .id("diff-tree-toggle")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .py(px(4.0))
+                .border_b_1()
+                .border_color(colors::border())
+                .cursor_pointer()
+                .text_xs()
+                .text_color(colors::text_muted())
+                .hover(|s| s.text_color(colors::text()).bg(colors::surface_hover()))
+                .on_click(move |_, _window, cx| {
+                    entity_toggle.update(cx, |panel, cx| {
+                        panel.tree_collapsed = !panel.tree_collapsed;
                         cx.notify();
                     });
-                    cx.stop_propagation();
-                }),
-        );
+                })
+                .child(toggle_icon);
+
+            if tree_collapsed {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .h_full()
+                        .w(px(24.0))
+                        .border_r_1()
+                        .border_color(colors::border())
+                        .child(toggle_btn),
+                );
+            } else {
+                let tree_panel = div()
+                    .id("diff-file-tree")
+                    .flex()
+                    .flex_col()
+                    .w(px(tree_width))
+                    .flex_shrink_0()
+                    .h_full()
+                    .border_r_1()
+                    .border_color(colors::border())
+                    .child(toggle_btn)
+                    .child(
+                        div()
+                            .id("diff-tree-scroll")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .child(self.render_file_tree(cx)),
+                    );
+
+                body = body.child(tree_panel);
+
+                // Resize handle between tree and diff content
+                body = body.child(
+                    div()
+                        .id("tree-resize-handle")
+                        .w(px(8.0))
+                        .mx(px(-3.0))
+                        .h_full()
+                        .flex_shrink_0()
+                        .cursor_col_resize()
+                        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
+                            entity_down.update(cx, |panel, cx| {
+                                panel.resizing_tree = true;
+                                panel.tree_drag_start_x = f32::from(event.position.x);
+                                panel.tree_drag_start_width = panel.tree_width;
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        }),
+                );
+            }
+        }
 
         // Diff content — virtualized with list (supports variable row heights)
         let entity_list = cx.entity().clone();

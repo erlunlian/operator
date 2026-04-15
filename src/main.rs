@@ -36,7 +36,7 @@ fn set_dock_icon() {
     use objc::runtime::Object;
 
     unsafe {
-        let icon_data: &[u8] = include_bytes!("../resources/app_icon_dock.png");
+        let icon_data: &[u8] = include_bytes!("../resources/operator_icon.png");
         let ns_data: *mut Object =
             NSData::dataWithBytes_length_(nil, icon_data.as_ptr() as *const _, icon_data.len() as u64);
         let ns_image: *mut Object = NSImage::initWithData_(NSImage::alloc(nil), ns_data);
@@ -114,6 +114,83 @@ fn main() {
             KeyBinding::new("cmd-9", ActivateWorkspace9, None),
         ]);
 
+        cx.set_menus(vec![
+            Menu {
+                name: "Operator".into(),
+                items: vec![
+                    MenuItem::action("About Operator", About),
+                    MenuItem::separator(),
+                    MenuItem::action("Settings...", ToggleSettings),
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Hide Operator", Hide),
+                    MenuItem::action("Hide Others", HideOthers),
+                    MenuItem::action("Show All", ShowAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Operator", Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Window", NewWorkspace),
+                    MenuItem::action("New Tab", NewTab),
+                    MenuItem::separator(),
+                    MenuItem::action("Open Directory...", OpenDirectory),
+                    MenuItem::separator(),
+                    MenuItem::action("Save", SaveFile),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Tab", CloseTab),
+                ],
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::os_action("Undo", Undo, OsAction::Undo),
+                    MenuItem::os_action("Redo", Redo, OsAction::Redo),
+                    MenuItem::separator(),
+                    MenuItem::os_action("Cut", Cut, OsAction::Cut),
+                    MenuItem::os_action("Copy", Copy, OsAction::Copy),
+                    MenuItem::os_action("Paste", Paste, OsAction::Paste),
+                    MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Find in File", FindInFile),
+                    MenuItem::action("Find File...", FindFile),
+                    MenuItem::action("Search Workspace...", SearchWorkspace),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Files Panel", ToggleFilesPanel),
+                    MenuItem::action("Git Diff Panel", ToggleDiffPanel),
+                    MenuItem::action("Pull Request Panel", TogglePrPanel),
+                    MenuItem::separator(),
+                    MenuItem::action("Split Pane Right", SplitPane),
+                    MenuItem::action("Split Pane Down", SplitPaneVertical),
+                    MenuItem::separator(),
+                    MenuItem::action("Command Center", ToggleCommandCenter),
+                    MenuItem::action("Debug Panel", ToggleDebugPanel),
+                ],
+            },
+            Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("Minimize", Minimize),
+                    MenuItem::action("Zoom", Zoom),
+                    MenuItem::separator(),
+                    MenuItem::action("Next Tab", NextTab),
+                    MenuItem::action("Previous Tab", PrevTab),
+                ],
+            },
+        ]);
+
+        // Wire up macOS app-level menu actions
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
 
         let saved = crate::session::load_session();
 

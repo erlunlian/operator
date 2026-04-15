@@ -25,6 +25,10 @@ xattr -cr "$BUNDLE"
 
 echo ""
 echo "Done! App bundle at: $BUNDLE"
-echo ""
-echo "To run:  open $BUNDLE"
-echo "To install:  cp -r $BUNDLE /Applications/"
+
+# Only print usage hints when run directly (not from make install)
+if [ -z "${MAKE_INSTALL:-}" ]; then
+    echo ""
+    echo "To run:  open $BUNDLE"
+    echo "To install:  cp -r $BUNDLE /Applications/"
+fi

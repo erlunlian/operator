@@ -53,6 +53,14 @@ fn comment_border() -> Rgba {
     rgba(0x89b4fa40)
 }
 
+// ── View mode ──
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffViewMode {
+    Unified,
+    Split,
+}
+
 // ── Comment side ──
 
 #[derive(Clone, Copy, PartialEq)]
@@ -108,6 +116,7 @@ pub struct PrDiffPanel {
     expanded_context: HashMap<(usize, usize), (usize, usize)>,
     pub width: f32,
     tree_width: f32,
+    tree_collapsed: bool,
     resizing_tree: bool,
     tree_drag_start_x: f32,
     tree_drag_start_width: f32,
@@ -158,6 +167,8 @@ pub struct PrDiffPanel {
     expanded_resolved: HashSet<u64>,
     /// Comment threads the user has manually collapsed.
     collapsed_comments: HashSet<u64>,
+    /// Unified (interleaved) vs Split (side-by-side) diff view.
+    view_mode: DiffViewMode,
 }
 
 impl PrDiffPanel {
@@ -185,6 +196,7 @@ impl PrDiffPanel {
             expanded_context: HashMap::new(),
             width: 360.0,
             tree_width: 200.0,
+            tree_collapsed: false,
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
@@ -211,6 +223,7 @@ impl PrDiffPanel {
             thread_node_ids: HashMap::new(),
             expanded_resolved: HashSet::new(),
             collapsed_comments: HashSet::new(),
+            view_mode: DiffViewMode::Unified,
         }
     }
 
@@ -253,6 +266,7 @@ impl PrDiffPanel {
             expanded_context: HashMap::new(),
             width: 360.0,
             tree_width: 200.0,
+            tree_collapsed: false,
             resizing_tree: false,
             tree_drag_start_x: 0.0,
             tree_drag_start_width: 0.0,
@@ -279,6 +293,7 @@ impl PrDiffPanel {
             thread_node_ids: HashMap::new(),
             expanded_resolved: HashSet::new(),
             collapsed_comments: HashSet::new(),
+            view_mode: DiffViewMode::Unified,
         }
     }
 
@@ -327,6 +342,8 @@ impl PrDiffPanel {
     }
 
     /// Refresh the branch diff and reload PR data asynchronously.
+    /// Phase 1 delivers gh status + PR info quickly so the title renders fast.
+    /// Phase 2 fetches comments, thread info, and the remote base ref.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         // Synchronous: update branch name immediately
         if let Some(repo) = &self.repo {
@@ -337,59 +354,92 @@ impl PrDiffPanel {
             return;
         };
 
-        let current_base = self.base_ref.clone();
-
         self.loading = true;
         cx.notify();
 
+        // Phase 1: gh status + PR detection (fast)
+        let work_dir_p1 = work_dir.clone();
         cx.spawn(async move |entity, cx| {
-            let result = cx
+            let (gh_status, pr_info) = cx
                 .background_executor()
                 .spawn(async move {
-                    let gh_status = github::check_gh();
-                    let (pr_info, comments, thread_info) = if gh_status == GhStatus::Available {
-                        let pr = github::detect_pr(&work_dir);
-                        let comments = pr
-                            .as_ref()
-                            .map(|p| github::fetch_pr_comments(&work_dir, p.number))
-                            .unwrap_or_default();
-                        let thread_info = pr
-                            .as_ref()
-                            .and_then(|p| {
-                                github::repo_owner_name(&work_dir)
-                                    .map(|(owner, repo)| github::fetch_thread_info(&work_dir, &owner, &repo, p.number))
-                            });
-                        // Fetch the base ref so our local merge-base is up to date.
-                        // This ensures the diff matches what GitHub shows.
-                        let fetch_ref = pr
-                            .as_ref()
-                            .map(|p| p.base_ref_name.as_str())
-                            .unwrap_or(&current_base);
-                        let _ = std::process::Command::new("git")
-                            .args(["fetch", "origin", fetch_ref])
-                            .current_dir(&work_dir)
-                            .output();
-                        (pr, comments, thread_info)
+                    let status = github::check_gh();
+                    let pr = if status == GhStatus::Available {
+                        github::detect_pr(&work_dir_p1)
                     } else {
-                        (None, Vec::new(), None)
+                        None
                     };
-                    (gh_status, pr_info, comments, thread_info)
+                    (status, pr)
                 })
                 .await;
 
-            let _ = cx.update(|cx| {
-                let _ = entity.update(cx, |panel, cx| {
-                    let (gh_status, pr_info, comments, thread_info) = result;
-                    panel.gh_status = gh_status;
-
-                    // Update base ref from PR info if needed
+            // Apply PR info immediately so the title renders
+            let phase2_needed = cx.update(|cx| {
+                entity.update(cx, |panel, cx| {
+                    panel.gh_status = gh_status.clone();
                     if let Some(ref pr) = pr_info {
                         if pr.base_ref_name != panel.base_ref {
                             panel.base_ref = pr.base_ref_name.clone();
                         }
                     }
+                    panel.pr_info = pr_info.clone();
+                    cx.notify();
 
-                    // Recompute diff with (now up-to-date) base ref
+                    (panel.work_dir.clone(), panel.base_ref.clone(), pr_info, gh_status)
+                })
+            });
+
+            let Ok(Ok((Some(work_dir), base_ref, pr_info, gh_status))) = phase2_needed else {
+                let _ = cx.update(|cx| {
+                    let _ = entity.update(cx, |panel, cx| {
+                        if let Some(repo) = &panel.repo {
+                            panel.diff_files = repo.branch_diff(&panel.base_ref);
+                        }
+                        panel.expanded_context.clear();
+                        panel.rendered_file_limit = FILE_RENDER_BATCH;
+                        panel.flat_cache_dirty = true;
+                        panel.loading = false;
+                        cx.notify();
+                    });
+                });
+                return;
+            };
+
+            // Phase 2: comments, thread info, git fetch
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut comments = Vec::new();
+                    let mut thread_info = None;
+                    if gh_status == GhStatus::Available {
+                        comments = pr_info
+                            .as_ref()
+                            .map(|p| github::fetch_pr_comments(&work_dir, p.number))
+                            .unwrap_or_default();
+                        thread_info = pr_info.as_ref().and_then(|p| {
+                            github::repo_owner_name(&work_dir)
+                                .map(|(owner, repo)| {
+                                    github::fetch_thread_info(&work_dir, &owner, &repo, p.number)
+                                })
+                        });
+                        let fetch_ref = pr_info
+                            .as_ref()
+                            .map(|p| p.base_ref_name.as_str())
+                            .unwrap_or(&base_ref);
+                        let _ = std::process::Command::new("git")
+                            .args(["fetch", "origin", fetch_ref])
+                            .current_dir(&work_dir)
+                            .output();
+                    }
+                    (comments, thread_info)
+                })
+                .await;
+
+            let _ = cx.update(|cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    let (comments, thread_info) = result;
+
+                    // Recompute diff now that remote base is fetched
                     if let Some(repo) = &panel.repo {
                         panel.diff_files = repo.branch_diff(&panel.base_ref);
                     }
@@ -397,7 +447,6 @@ impl PrDiffPanel {
                     panel.rendered_file_limit = FILE_RENDER_BATCH;
                     panel.flat_cache_dirty = true;
 
-                    panel.pr_info = pr_info;
                     panel.pr_comments = comments;
                     if let Some(info) = thread_info {
                         panel.resolved_thread_ids = info.resolved_ids;
@@ -894,6 +943,7 @@ impl PrDiffPanel {
         self.flat_file_starts.clear();
         let mut copy_texts: Vec<String> = Vec::new();
         let mut global_line_idx = 0usize;
+        let split_mode = self.view_mode == DiffViewMode::Split;
 
         for file_idx in 0..render_limit {
             self.flat_file_starts.push(self.flat_rows.len());
@@ -911,32 +961,130 @@ impl PrDiffPanel {
             let segments = &all_segments[file_idx];
             let num_segs = segments.len();
 
-            for (seg_idx, seg) in segments.iter().enumerate() {
-                let is_last = seg_idx == num_segs - 1;
-                match seg {
-                    LineSegment::Line(line) => {
-                        copy_texts.push(line.content.trim_end().to_string());
-                        self.flat_rows.push(FlatRow::Line {
-                            file_idx,
-                            seg_idx,
-                            global_line_idx,
-                            is_last_in_file: is_last,
-                        });
-                        global_line_idx += 1;
+            if split_mode {
+                // Split mode: pair removed/added lines side-by-side
+                let mut i = 0;
+                while i < num_segs {
+                    let seg = &segments[i];
+                    match seg {
+                        LineSegment::CollapsedContext { count, hunk_idx, direction } => {
+                            self.flat_rows.push(FlatRow::CollapsedContext {
+                                file_idx,
+                                seg_idx: i,
+                                count: *count,
+                                hunk_idx: *hunk_idx,
+                                direction: *direction,
+                                is_last_in_file: i == num_segs - 1,
+                            });
+                            i += 1;
+                        }
+                        LineSegment::Line(line) => {
+                            match line.kind {
+                                DiffLineKind::Context => {
+                                    copy_texts.push(line.content.trim_end().to_string());
+                                    self.flat_rows.push(FlatRow::SplitLine {
+                                        file_idx,
+                                        left_seg: Some(i),
+                                        right_seg: Some(i),
+                                        global_line_idx,
+                                        is_last_in_file: i == num_segs - 1,
+                                    });
+                                    global_line_idx += 1;
+                                    i += 1;
+                                }
+                                DiffLineKind::Removed => {
+                                    let mut removes = Vec::new();
+                                    while i < num_segs {
+                                        if let LineSegment::Line(l) = &segments[i] {
+                                            if matches!(l.kind, DiffLineKind::Removed) {
+                                                removes.push(i);
+                                                i += 1;
+                                                continue;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    let mut adds = Vec::new();
+                                    while i < num_segs {
+                                        if let LineSegment::Line(l) = &segments[i] {
+                                            if matches!(l.kind, DiffLineKind::Added) {
+                                                adds.push(i);
+                                                i += 1;
+                                                continue;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    let max_len = removes.len().max(adds.len());
+                                    for j in 0..max_len {
+                                        let left = removes.get(j).copied();
+                                        let right = adds.get(j).copied();
+                                        if let Some(li) = left {
+                                            if let LineSegment::Line(l) = &segments[li] {
+                                                copy_texts.push(l.content.trim_end().to_string());
+                                            }
+                                        }
+                                        if let Some(ri) = right {
+                                            if let LineSegment::Line(l) = &segments[ri] {
+                                                copy_texts.push(l.content.trim_end().to_string());
+                                            }
+                                        }
+                                        let remaining_in_file = i >= num_segs && j == max_len - 1;
+                                        self.flat_rows.push(FlatRow::SplitLine {
+                                            file_idx,
+                                            left_seg: left,
+                                            right_seg: right,
+                                            global_line_idx,
+                                            is_last_in_file: remaining_in_file,
+                                        });
+                                        global_line_idx += 1;
+                                    }
+                                }
+                                DiffLineKind::Added => {
+                                    copy_texts.push(line.content.trim_end().to_string());
+                                    self.flat_rows.push(FlatRow::SplitLine {
+                                        file_idx,
+                                        left_seg: None,
+                                        right_seg: Some(i),
+                                        global_line_idx,
+                                        is_last_in_file: i == num_segs - 1,
+                                    });
+                                    global_line_idx += 1;
+                                    i += 1;
+                                }
+                            }
+                        }
                     }
-                    LineSegment::CollapsedContext {
-                        count,
-                        hunk_idx,
-                        direction,
-                    } => {
-                        self.flat_rows.push(FlatRow::CollapsedContext {
-                            file_idx,
-                            seg_idx,
-                            count: *count,
-                            hunk_idx: *hunk_idx,
-                            direction: *direction,
-                            is_last_in_file: is_last,
-                        });
+                }
+            } else {
+                // Unified mode (original)
+                for (seg_idx, seg) in segments.iter().enumerate() {
+                    let is_last = seg_idx == num_segs - 1;
+                    match seg {
+                        LineSegment::Line(line) => {
+                            copy_texts.push(line.content.trim_end().to_string());
+                            self.flat_rows.push(FlatRow::Line {
+                                file_idx,
+                                seg_idx,
+                                global_line_idx,
+                                is_last_in_file: is_last,
+                            });
+                            global_line_idx += 1;
+                        }
+                        LineSegment::CollapsedContext {
+                            count,
+                            hunk_idx,
+                            direction,
+                        } => {
+                            self.flat_rows.push(FlatRow::CollapsedContext {
+                                file_idx,
+                                seg_idx,
+                                count: *count,
+                                hunk_idx: *hunk_idx,
+                                direction: *direction,
+                                is_last_in_file: is_last,
+                            });
+                        }
                     }
                 }
             }
@@ -1001,6 +1149,29 @@ impl PrDiffPanel {
                     row_idx,
                     entity,
                 )
+            }
+            FlatRow::SplitLine {
+                file_idx,
+                left_seg,
+                right_seg,
+                global_line_idx,
+                is_last_in_file,
+            } => {
+                let left_line = left_seg.and_then(|si| {
+                    if let LineSegment::Line(l) = &self.cached_file_segments[*file_idx][si] {
+                        Some(l)
+                    } else {
+                        None
+                    }
+                });
+                let right_line = right_seg.and_then(|si| {
+                    if let LineSegment::Line(l) = &self.cached_file_segments[*file_idx][si] {
+                        Some(l)
+                    } else {
+                        None
+                    }
+                });
+                self.render_split_line_row(left_line, right_line, *global_line_idx, *is_last_in_file, entity)
             }
             FlatRow::LoadMore { remaining } => {
                 div()
@@ -1544,6 +1715,176 @@ impl PrDiffPanel {
         }
 
         wrapper.into_any_element()
+    }
+
+    /// Render one side of a split diff row (gutter + prefix + content).
+    /// `is_left` determines which line number to show for context lines.
+    fn render_split_half(
+        line: Option<&DiffLine>,
+        is_left: bool,
+    ) -> Div {
+        let (row_bg, gutter_bg_color, text_col, prefix, line_num_str, content) = match line {
+            Some(l) => {
+                let (bg, gbg, tc, pfx) = match l.kind {
+                    DiffLineKind::Added => (added_line_bg(), added_gutter_bg(), colors::diff_added(), "+"),
+                    DiffLineKind::Removed => (removed_line_bg(), removed_gutter_bg(), colors::diff_removed(), "-"),
+                    DiffLineKind::Context => (rgba(0x00000000), gutter_bg(), colors::text_muted(), " "),
+                };
+                // Left side shows old line numbers, right side shows new
+                let ln = if is_left {
+                    l.old_lineno
+                } else {
+                    l.new_lineno
+                };
+                let ln_str = ln.map(|n| format!("{n}")).unwrap_or_default();
+                (bg, gbg, tc, pfx, ln_str, Some(l))
+            }
+            None => {
+                (rgba(0x00000000), gutter_bg(), colors::text_muted(), " ", String::new(), None)
+            }
+        };
+
+        let content_el: AnyElement = if let Some(l) = content {
+            let trimmed = l.content.trim_end();
+            if let Some(highlights) = l.highlights.as_ref() {
+                if highlights.is_empty() {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(text_col)
+                        .pl(px(4.0))
+                        .child(trimmed.to_string())
+                        .into_any_element()
+                } else {
+                    let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = highlights
+                        .iter()
+                        .filter(|s| {
+                            s.byte_range.end <= trimmed.len()
+                                && trimmed.is_char_boundary(s.byte_range.start)
+                                && trimmed.is_char_boundary(s.byte_range.end)
+                        })
+                        .map(|s| {
+                            (
+                                s.byte_range.clone(),
+                                HighlightStyle {
+                                    color: Some(Hsla::from(s.color)),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect();
+                    let text = SharedString::from(trimmed.to_string());
+                    let styled = StyledText::new(text).with_highlights(hl);
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(text_col)
+                        .pl(px(4.0))
+                        .child(styled)
+                        .into_any_element()
+                }
+            } else {
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(trimmed.to_string())
+                    .into_any_element()
+            }
+        } else {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .bg(row_bg)
+            .child(
+                div()
+                    .w(px(44.0))
+                    .flex_shrink_0()
+                    .text_right()
+                    .pr(px(8.0))
+                    .pl(px(4.0))
+                    .bg(gutter_bg_color)
+                    .text_color(colors::text_muted())
+                    .child(line_num_str),
+            )
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_shrink_0()
+                    .text_color(text_col)
+                    .pl(px(4.0))
+                    .child(prefix.to_string()),
+            )
+            .child(content_el)
+    }
+
+    /// Render a side-by-side diff row with left (old) and right (new) halves.
+    fn render_split_line_row(
+        &self,
+        left: Option<&DiffLine>,
+        right: Option<&DiffLine>,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+        entity: &Entity<Self>,
+    ) -> AnyElement {
+        let left_half = Self::render_split_half(left, true);
+        let right_half = Self::render_split_half(right, false);
+
+        let line_selected = self.is_line_selected(global_line_idx);
+        let sel_bg = if line_selected { rgba(0x89b4fa30) } else { rgba(0x00000000) };
+
+        let entity_sel_down = entity.clone();
+        let entity_sel_move = entity.clone();
+        let gli = global_line_idx;
+
+        div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .min_h(px(20.0))
+            .bg(sel_bg)
+            .font_family("Menlo")
+            .text_xs()
+            .border_l_1()
+            .border_r_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                entity_sel_down.update(cx, |panel, cx| {
+                    panel.copy_anchor_line = Some(gli);
+                    panel.copy_end_line = Some(gli);
+                    panel.copy_selecting = true;
+                    cx.notify();
+                });
+            })
+            .on_mouse_move(move |_, _window, cx| {
+                entity_sel_move.update(cx, |panel, cx| {
+                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
+                        panel.copy_end_line = Some(gli);
+                        cx.notify();
+                    }
+                });
+            })
+            .child(left_half)
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .bg(colors::border()),
+            )
+            .child(right_half)
+            .into_any_element()
     }
 
     fn render_collapsed_row(
@@ -2511,6 +2852,14 @@ enum FlatRow {
         direction: ExpandDirection,
         is_last_in_file: bool,
     },
+    /// Side-by-side row: left (old) and right (new) line indices into cached_file_segments.
+    SplitLine {
+        file_idx: usize,
+        left_seg: Option<usize>,
+        right_seg: Option<usize>,
+        global_line_idx: usize,
+        is_last_in_file: bool,
+    },
     LoadMore { remaining: usize },
 }
 
@@ -2763,6 +3112,79 @@ impl Render for PrDiffPanel {
             );
         }
 
+        // Spacer + Unified / Split toggle
+        let is_split = self.view_mode == DiffViewMode::Split;
+        let entity_toggle = cx.entity().clone();
+        header = header
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(1.0))
+                    .rounded(px(6.0))
+                    .bg(colors::surface())
+                    .p(px(2.0))
+                    .child(
+                        div()
+                            .id("pr-diff-mode-unified")
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(!is_split, |d: Stateful<Div>| {
+                                d.bg(colors::surface_hover())
+                                    .text_color(colors::text())
+                            })
+                            .when(is_split, |d: Stateful<Div>| {
+                                d.text_color(colors::text_muted())
+                                    .hover(|s| s.text_color(colors::text()))
+                            })
+                            .child("Unified")
+                            .on_click({
+                                let entity = entity_toggle.clone();
+                                move |_, _window, cx| {
+                                    entity.update(cx, |panel, cx| {
+                                        if panel.view_mode != DiffViewMode::Unified {
+                                            panel.view_mode = DiffViewMode::Unified;
+                                            panel.flat_cache_dirty = true;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("pr-diff-mode-split")
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(is_split, |d: Stateful<Div>| {
+                                d.bg(colors::surface_hover())
+                                    .text_color(colors::text())
+                            })
+                            .when(!is_split, |d: Stateful<Div>| {
+                                d.text_color(colors::text_muted())
+                                    .hover(|s| s.text_color(colors::text()))
+                            })
+                            .child("Split")
+                            .on_click(move |_, _window, cx| {
+                                entity_toggle.update(cx, |panel, cx| {
+                                    if panel.view_mode != DiffViewMode::Split {
+                                        panel.view_mode = DiffViewMode::Split;
+                                        panel.flat_cache_dirty = true;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    ),
+            );
+
         // Refresh button
         let entity_refresh = cx.entity().clone();
         header = header.child(
@@ -2910,6 +3332,7 @@ impl Render for PrDiffPanel {
 
         // ── Body: file tree | resize handle | diffs ──
         let tree_width = self.tree_width;
+        let tree_collapsed = self.tree_collapsed;
         let entity_down = cx.entity().clone();
 
         let mut body = div()
@@ -2921,43 +3344,90 @@ impl Render for PrDiffPanel {
             .min_w(px(0.0))
             .overflow_hidden();
 
-        // File tree sidebar
-        let tree_panel = div()
-            .id("pr-diff-file-tree")
-            .flex()
-            .flex_col()
-            .w(px(tree_width))
-            .flex_shrink_0()
-            .h_full()
-            .border_r_1()
-            .border_color(colors::border())
-            .overflow_y_scroll()
-            .child(self.render_file_tree(cx));
+        // File tree toggle + sidebar
+        {
+            let entity_toggle = cx.entity().clone();
+            // nf-cod-layout_sidebar_left (same icon as workspace sidebar toggle)
+            let toggle_icon = "\u{F06FD}";
+            let toggle_btn = div()
+                .id("pr-tree-toggle")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .py(px(4.0))
+                .border_b_1()
+                .border_color(colors::border())
+                .cursor_pointer()
+                .font_family(util::ICON_FONT)
+                .text_size(px(14.0))
+                .text_color(if tree_collapsed { colors::text_muted() } else { colors::accent() })
+                .hover(|s| s.text_color(colors::text()).bg(colors::surface_hover()))
+                .on_click(move |_, _window, cx| {
+                    entity_toggle.update(cx, |panel, cx| {
+                        panel.tree_collapsed = !panel.tree_collapsed;
+                        cx.notify();
+                    });
+                })
+                .child(toggle_icon);
 
-        body = body.child(tree_panel);
+            if tree_collapsed {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .h_full()
+                        .w(px(24.0))
+                        .border_r_1()
+                        .border_color(colors::border())
+                        .child(toggle_btn),
+                );
+            } else {
+                let tree_panel = div()
+                    .id("pr-diff-file-tree")
+                    .flex()
+                    .flex_col()
+                    .w(px(tree_width))
+                    .flex_shrink_0()
+                    .h_full()
+                    .border_r_1()
+                    .border_color(colors::border())
+                    .child(toggle_btn)
+                    .child(
+                        div()
+                            .id("pr-tree-scroll")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .child(self.render_file_tree(cx)),
+                    );
 
-        // Resize handle
-        body = body.child(
-            div()
-                .id("pr-tree-resize-handle")
-                .w(px(8.0))
-                .mx(px(-3.0))
-                .h_full()
-                .flex_shrink_0()
-                .cursor_col_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    move |event: &MouseDownEvent, _window, cx| {
-                        entity_down.update(cx, |panel, cx| {
-                            panel.resizing_tree = true;
-                            panel.tree_drag_start_x = f32::from(event.position.x);
-                            panel.tree_drag_start_width = panel.tree_width;
-                            cx.notify();
-                        });
-                        cx.stop_propagation();
-                    },
-                ),
-        );
+                body = body.child(tree_panel);
+
+                // Resize handle
+                body = body.child(
+                    div()
+                        .id("pr-tree-resize-handle")
+                        .w(px(8.0))
+                        .mx(px(-3.0))
+                        .h_full()
+                        .flex_shrink_0()
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |event: &MouseDownEvent, _window, cx| {
+                                entity_down.update(cx, |panel, cx| {
+                                    panel.resizing_tree = true;
+                                    panel.tree_drag_start_x = f32::from(event.position.x);
+                                    panel.tree_drag_start_width = panel.tree_width;
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            },
+                        ),
+                );
+            }
+        }
 
         // Diff content — virtualized with list (supports variable row heights for comments)
         let entity_list = cx.entity().clone();

@@ -32,5 +32,19 @@ actions!(
         ActivateWorkspace7,
         ActivateWorkspace8,
         ActivateWorkspace9,
+        // Menu-only actions (handled by macOS via OsAction)
+        Undo,
+        Redo,
+        Cut,
+        Copy,
+        Paste,
+        SelectAll,
+        // App menu actions
+        About,
+        Hide,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        Zoom,
     ]
 );

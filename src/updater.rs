@@ -22,9 +22,9 @@ pub struct UpdateInfo {
 }
 
 /// Check GitHub releases for a newer version. Runs synchronously (call from background thread).
-/// Skips the network request if the last check was less than an hour ago.
-pub fn check_for_update(current_version: &str) -> Option<UpdateInfo> {
-    if !should_check() {
+/// Skips the network request if the last check was less than an hour ago, unless `force` is true.
+pub fn check_for_update(current_version: &str, force: bool) -> Option<UpdateInfo> {
+    if !force && !should_check() {
         return None;
     }
 

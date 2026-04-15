@@ -41,6 +41,7 @@ actions!(
         SelectAll,
         // App menu actions
         About,
+        CheckForUpdates,
         Hide,
         HideOthers,
         ShowAll,

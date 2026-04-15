@@ -109,7 +109,7 @@ impl OperatorApp {
             debug_panel,
             _metrics_log_task: metrics_log_task,
         };
-        app.check_for_updates(cx);
+        app.check_for_updates(cx, false);
         app
     }
 
@@ -173,7 +173,7 @@ impl OperatorApp {
             debug_panel,
             _metrics_log_task: metrics_log_task,
         };
-        app.check_for_updates(cx);
+        app.check_for_updates(cx, false);
         app
     }
 
@@ -388,12 +388,16 @@ impl OperatorApp {
         Some(task)
     }
 
-    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+    fn check_for_updates_manual(&mut self, _: &CheckForUpdates, _window: &mut Window, cx: &mut Context<Self>) {
+        self.check_for_updates(cx, true);
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>, force: bool) {
         let current = env!("CARGO_PKG_VERSION").to_string();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::updater::check_for_update(&current) })
+                .spawn(async move { crate::updater::check_for_update(&current, force) })
                 .await;
             if let Some(info) = result {
                 let _ = cx.update(|cx| {
@@ -1571,6 +1575,7 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::search_workspace))
             .on_action(cx.listener(Self::toggle_debug_panel))
             .on_action(cx.listener(Self::request_quit))
+            .on_action(cx.listener(Self::check_for_updates_manual))
             .on_action(cx.listener(Self::open_directory_in_new_workspace))
             .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace1, window, cx| this.activate_workspace(0, window, cx)))
             .on_action(cx.listener(|this: &mut Self, _: &ActivateWorkspace2, window, cx| this.activate_workspace(1, window, cx)))

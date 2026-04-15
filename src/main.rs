@@ -120,6 +120,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("About Operator", About),
                     MenuItem::separator(),
+                    MenuItem::action("Check for Updates...", CheckForUpdates),
                     MenuItem::action("Settings...", ToggleSettings),
                     MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),

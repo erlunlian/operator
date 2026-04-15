@@ -2277,15 +2277,18 @@ impl PrDiffPanel {
     /// Build a prompt for a single comment (main or reply).
     fn build_single_comment_prompt(&self, comment: &PrReviewComment, body: &str, author: &str) -> String {
         let header = self.build_prompt_header(comment);
-        format!("{header}\n@{author}: {body}")
+        let plain = markdown::markdown_to_plain_text(body);
+        format!("{header}\n@{author}: {plain}")
     }
 
     /// Build a prompt for the full thread (main comment + all replies).
     fn build_thread_prompt(&self, comment: &PrReviewComment, replies: &[&PrReviewComment]) -> String {
         let header = self.build_prompt_header(comment);
-        let mut thread = format!("@{}: {}", comment.user.login, comment.body);
+        let body = markdown::markdown_to_plain_text(&comment.body);
+        let mut thread = format!("@{}: {}", comment.user.login, body);
         for reply in replies {
-            thread.push_str(&format!("\n  @{}: {}", reply.user.login, reply.body));
+            let reply_body = markdown::markdown_to_plain_text(&reply.body);
+            thread.push_str(&format!("\n  @{}: {}", reply.user.login, reply_body));
         }
         format!("{header}\n{thread}")
     }

@@ -5,6 +5,102 @@ use std::ops::Range;
 use crate::editor::syntax;
 use crate::theme::colors;
 
+/// Convert a markdown string to plain text, stripping all formatting, HTML,
+/// images, and link URLs while preserving the readable content.
+pub fn markdown_to_plain_text(source: &str) -> String {
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
+    let parser = Parser::new_ext(source, opts);
+
+    let mut out = String::new();
+    let mut list_counters: Vec<Option<u64>> = Vec::new();
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                if !out.ends_with('\n') && !out.is_empty() {
+                    out.push('\n');
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::Start(Tag::Paragraph) => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::Start(Tag::Heading { .. }) => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::Start(Tag::List(start)) => {
+                list_counters.push(start);
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_counters.pop();
+            }
+            Event::Start(Tag::Item) => {
+                if !out.ends_with('\n') && !out.is_empty() {
+                    out.push('\n');
+                }
+                let indent = "  ".repeat(list_counters.len().saturating_sub(1));
+                if let Some(Some(n)) = list_counters.last_mut() {
+                    out.push_str(&format!("{indent}{n}. "));
+                    *n += 1;
+                } else {
+                    out.push_str(&format!("{indent}• "));
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                if !out.ends_with('\n') && !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str("> ");
+            }
+            // Skip images entirely (Cursor badges, etc.)
+            Event::Start(Tag::Image { .. }) => {}
+            Event::End(TagEnd::Image) => {}
+            // For links, just include the link text, not the URL
+            Event::Start(Tag::Link { .. }) => {}
+            Event::End(TagEnd::Link) => {}
+            Event::Text(text) => {
+                out.push_str(&text);
+            }
+            Event::Code(code) => {
+                out.push('`');
+                out.push_str(&code);
+                out.push('`');
+            }
+            Event::SoftBreak => out.push(' '),
+            Event::HardBreak => out.push('\n'),
+            Event::Rule => {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("---\n");
+            }
+            // Skip raw HTML tags entirely
+            Event::Html(_) | Event::InlineHtml(_) => {}
+            _ => {}
+        }
+    }
+
+    out.trim().to_string()
+}
+
 /// Render a markdown string into a list of GPUI elements.
 ///
 /// Handles: paragraphs, bold/italic/code spans, code blocks (with syntax

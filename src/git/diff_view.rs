@@ -17,8 +17,6 @@ use crate::util;
 const DEFAULT_CONTEXT: usize = 3;
 /// How many extra context lines to reveal per click.
 const EXPAND_STEP: usize = 20;
-/// How many files to render initially before showing "Load more".
-const FILE_RENDER_BATCH: usize = 20;
 /// Minimum file-tree sidebar width in pixels.
 const MIN_TREE_WIDTH: f32 = 40.0;
 /// Maximum file-tree sidebar width in pixels.
@@ -169,8 +167,6 @@ pub struct GitDiffPanel {
     scroll_to_file: Option<usize>,
     /// When set, shows a confirmation dialog before reverting.
     pending_revert: Option<RevertTarget>,
-    /// Max number of files to render (grows when user clicks "Load more").
-    rendered_file_limit: usize,
 
     // Line selection for copy
     copy_selecting: bool,
@@ -189,6 +185,10 @@ pub struct GitDiffPanel {
     flat_rows: Vec<FlatRow>,
     /// file_idx → index of its FileHeader row in flat_rows.
     flat_file_starts: Vec<usize>,
+    /// Prefix sum of estimated row heights (length = `flat_rows.len() + 1`).
+    /// `flat_row_height_prefix[i]` is the estimated pixel offset of row `i`.
+    /// Enables O(1) content-height and O(log N) offset↔index conversions.
+    flat_row_height_prefix: Vec<f32>,
     /// Whether the flat cache needs rebuilding before next render.
     flat_cache_dirty: bool,
     /// Unified (interleaved) vs Split (side-by-side) diff view.
@@ -247,7 +247,6 @@ impl GitDiffPanel {
             _copied_timer: None,
             scroll_to_file: None,
             pending_revert: None,
-            rendered_file_limit: FILE_RENDER_BATCH,
             copy_selecting: false,
             copy_anchor_line: None,
             copy_end_line: None,
@@ -257,6 +256,7 @@ impl GitDiffPanel {
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
+            flat_row_height_prefix: vec![0.0],
             flat_cache_dirty: true,
             view_mode: DiffViewMode::Unified,
             focus_handle: cx.focus_handle(),
@@ -315,7 +315,6 @@ impl GitDiffPanel {
             _copied_timer: None,
             scroll_to_file: None,
             pending_revert: None,
-            rendered_file_limit: FILE_RENDER_BATCH,
             copy_selecting: false,
             copy_anchor_line: None,
             copy_end_line: None,
@@ -325,6 +324,7 @@ impl GitDiffPanel {
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
+            flat_row_height_prefix: vec![0.0],
             flat_cache_dirty: true,
             view_mode: DiffViewMode::Unified,
             focus_handle: cx.focus_handle(),
@@ -410,6 +410,59 @@ impl GitDiffPanel {
         self.scrollbar.visible = true;
         self.scrollbar.hide_task =
             Some(scrollbar::schedule_hide(cx, |v: &mut Self| &mut v.scrollbar));
+    }
+
+    /// Rebuild `flat_row_height_prefix` from `flat_rows`. Called once
+    /// per flat-cache rebuild so the three helpers below can run in
+    /// O(1) / O(log N) instead of walking all rows every render.
+    fn rebuild_row_height_prefix(&mut self) {
+        self.flat_row_height_prefix.clear();
+        self.flat_row_height_prefix.reserve(self.flat_rows.len() + 1);
+        self.flat_row_height_prefix.push(0.0);
+        let mut acc: f32 = 0.0;
+        for row in &self.flat_rows {
+            acc += row_height_estimate_px(row);
+            self.flat_row_height_prefix.push(acc);
+        }
+    }
+
+    /// Sum of estimated heights across all `flat_rows`. Stable between
+    /// renders, so the scrollbar thumb doesn't resize as items scroll in.
+    fn estimated_content_height_px(&self) -> f32 {
+        *self.flat_row_height_prefix.last().unwrap_or(&0.0)
+    }
+
+    /// Estimated pixel offset corresponding to the list's current logical
+    /// scroll position.
+    fn estimated_scroll_offset_px(&self) -> f32 {
+        let scroll_top = self.list_state.logical_scroll_top();
+        let cap = scroll_top
+            .item_ix
+            .min(self.flat_row_height_prefix.len().saturating_sub(1));
+        self.flat_row_height_prefix[cap] + f32::from(scroll_top.offset_in_item)
+    }
+
+    /// Locate the row containing `target_px` via binary search on the
+    /// prefix sums. Returns `(item_ix, remainder_px)` for
+    /// `ListOffset { item_ix, offset_in_item }`.
+    fn item_ix_for_estimated_offset(&self, target_px: f32) -> (usize, f32) {
+        if target_px <= 0.0 || self.flat_rows.is_empty() {
+            return (0, 0.0);
+        }
+        // binary_search_by with PartialOrd on f32 — safe because the
+        // prefix sums are monotonic non-decreasing and contain no NaN.
+        let prefix = &self.flat_row_height_prefix;
+        let ix = match prefix.binary_search_by(|v| {
+            v.partial_cmp(&target_px).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(i) => i,
+            // Err(i) returns the insertion point: the row whose start
+            // is strictly above target. The containing row is i-1.
+            Err(i) => i.saturating_sub(1),
+        };
+        let ix = ix.min(self.flat_rows.len());
+        let row_start = prefix[ix.min(prefix.len() - 1)];
+        (ix, (target_px - row_start).max(0.0))
     }
 
     /// Ensure the auto-scroll timer is running while a copy-selection drag
@@ -538,7 +591,6 @@ impl GitDiffPanel {
     /// (stage, unstage, revert) that shift file indices.
     fn reset_expanded_context(&mut self) {
         self.expanded_context.clear();
-        self.rendered_file_limit = FILE_RENDER_BATCH;
         self.flat_cache_dirty = true;
     }
 
@@ -965,10 +1017,6 @@ impl GitDiffPanel {
                                             panel.expanded_context.clear();
                                         }
                                         panel.collapsed_files.remove(&(section, file_path_key.clone()));
-                                        // Ensure the file is within the rendered batch
-                                        if idx >= panel.rendered_file_limit {
-                                            panel.rendered_file_limit = idx + 1;
-                                        }
                                         panel.scroll_to_file = Some(idx);
                                         panel.flat_cache_dirty = true;
                                         cx.notify();
@@ -1019,11 +1067,11 @@ impl GitDiffPanel {
     fn rebuild_flat_cache(&mut self) {
         let section = self.active_section;
         let files = self.active_files();
-        let render_limit = self.rendered_file_limit.min(files.len());
+        let files_count = files.len();
 
         // Phase 1: flatten segments for each file
-        let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(render_limit);
-        for file_idx in 0..render_limit {
+        let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(files_count);
+        for file_idx in 0..files_count {
             let file_key = (section, files[file_idx].path.clone());
             if self.collapsed_files.contains(&file_key) || files[file_idx].hunks.is_empty() {
                 all_segments.push(Vec::new());
@@ -1038,10 +1086,9 @@ impl GitDiffPanel {
         self.flat_file_starts.clear();
         let mut copy_texts: Vec<String> = Vec::new();
         let mut global_line_idx = 0usize;
-        let files_len = self.active_files().len();
         let split_mode = self.view_mode == DiffViewMode::Split;
 
-        for file_idx in 0..render_limit {
+        for file_idx in 0..files_count {
             self.flat_file_starts.push(self.flat_rows.len());
             self.flat_rows.push(FlatRow::FileHeader { file_idx });
 
@@ -1193,13 +1240,9 @@ impl GitDiffPanel {
             }
         }
 
-        let remaining = files_len.saturating_sub(render_limit);
-        if remaining > 0 {
-            self.flat_rows.push(FlatRow::LoadMore { remaining });
-        }
-
         self.cached_file_segments = all_segments;
         self.copy_line_contents = copy_texts;
+        self.rebuild_row_height_prefix();
         let scroll_pos = self.list_state.logical_scroll_top();
         let old_count = self.list_state.item_count();
         self.list_state.splice(0..old_count, self.flat_rows.len());
@@ -1268,18 +1311,6 @@ impl GitDiffPanel {
                 });
                 self.render_split_line_row(left_line, right_line, *global_line_idx, *is_last_in_file, entity)
             }
-            FlatRow::LoadMore { remaining } => div()
-                .w_full()
-                .py_2()
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(colors::text_muted())
-                        .child(format!("{remaining} more files...")),
-                )
-                .into_any_element(),
         }
     }
 
@@ -2177,7 +2208,20 @@ enum FlatRow {
         global_line_idx: usize,
         is_last_in_file: bool,
     },
-    LoadMore { remaining: usize },
+}
+
+/// Estimated rendered height per row type. Used to report a stable,
+/// total content height to the scrollbar — GPUI's `ListState` only
+/// sums measured items, so for long diffs the measured height grows
+/// (and the thumb shrinks) as rows scroll into view. These estimates
+/// must stay close to the actual `min_h` values in the render fns.
+fn row_height_estimate_px(row: &FlatRow) -> f32 {
+    match row {
+        FlatRow::FileHeader { .. } => 34.0,
+        FlatRow::EmptyFile { .. } => 40.0,
+        FlatRow::Line { .. } | FlatRow::SplitLine { .. } => 20.0,
+        FlatRow::CollapsedContext { .. } => 22.0,
+    }
 }
 
 // ── File tree builder ──
@@ -2439,9 +2483,16 @@ impl Render for GitDiffPanel {
                     if let Some(new_offset) =
                         scrollbar::drag_to_offset(&panel.scrollbar, event.position.y)
                     {
-                        panel
-                            .list_state
-                            .set_offset_from_scrollbar(point(px(0.0), -new_offset));
+                        // The scrollbar operates in estimated-px space,
+                        // which doesn't match ListState's measured-only
+                        // space. Translate the target px to a concrete
+                        // item index + remainder via our estimate table.
+                        let (item_ix, within) =
+                            panel.item_ix_for_estimated_offset(f32::from(new_offset));
+                        panel.list_state.scroll_to(ListOffset {
+                            item_ix,
+                            offset_in_item: px(within),
+                        });
                         panel.bump_scrollbar(cx);
                         cx.notify();
                     }
@@ -2783,11 +2834,14 @@ impl Render for GitDiffPanel {
             self.bump_scrollbar(cx);
         }
 
-        // Geometry for the scrollbar overlay.
-        let viewport_bounds = self.list_state.viewport_bounds();
-        let max_off_scroll = self.list_state.max_offset_for_scrollbar().height;
-        let scroll_content_height = viewport_bounds.size.height + max_off_scroll;
-        let scroll_offset_px = -self.list_state.scroll_px_offset_for_scrollbar().y;
+        // Geometry for the scrollbar overlay. We intentionally do NOT use
+        // `list_state.max_offset_for_scrollbar()` here because GPUI only
+        // sums heights of rows that have already been measured — for a
+        // long diff that would grow as the user scrolls, shrinking the
+        // thumb mid-scroll. Instead, estimate the full content height
+        // from `flat_rows` using fixed per-row-type heights.
+        let scroll_content_height = px(self.estimated_content_height_px());
+        let scroll_offset_px = px(self.estimated_scroll_offset_px());
         self.scrollbar.content_height = scroll_content_height;
         let viewport_height = self.scrollbar.track_height;
         let scroll_visible = self.scrollbar.visible;
@@ -2835,29 +2889,6 @@ impl Render for GitDiffPanel {
             on_thumb_down,
         ) {
             diff_content = diff_content.child(bar);
-        }
-
-        // Auto-load more files if there are un-rendered files
-        let render_limit = self.rendered_file_limit.min(self.active_files().len());
-        let remaining = self.active_files().len().saturating_sub(render_limit);
-        if remaining > 0 {
-            let entity_more = cx.entity().clone();
-            cx.spawn(async move |_, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
-                let _ = cx.update(|cx| {
-                    let _ = entity_more.update(cx, |panel, cx| {
-                        let total = panel.active_files().len();
-                        if panel.rendered_file_limit < total {
-                            panel.rendered_file_limit += FILE_RENDER_BATCH;
-                            panel.flat_cache_dirty = true;
-                            cx.notify();
-                        }
-                    });
-                });
-            })
-            .detach();
         }
 
         // Handle scroll-to-file: convert file_idx to flat row index

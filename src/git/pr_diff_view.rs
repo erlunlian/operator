@@ -18,8 +18,6 @@ use crate::util;
 const DEFAULT_CONTEXT: usize = 3;
 /// How many extra context lines to reveal per click.
 const EXPAND_STEP: usize = 20;
-/// How many files to render initially before showing "Load more".
-const FILE_RENDER_BATCH: usize = 20;
 /// Minimum file-tree sidebar width in pixels.
 const MIN_TREE_WIDTH: f32 = 40.0;
 /// Maximum file-tree sidebar width in pixels.
@@ -178,8 +176,6 @@ pub struct PrDiffPanel {
     _copied_timer: Option<Task<()>>,
     /// Whether the initial async refresh (gh check + PR detection) has been triggered.
     needs_initial_refresh: bool,
-    /// Max number of files to render (grows when user clicks "Load more").
-    rendered_file_limit: usize,
 
     // Line selection for copy
     /// Whether user is currently dragging to select lines.
@@ -202,6 +198,9 @@ pub struct PrDiffPanel {
     flat_rows: Vec<FlatRow>,
     /// file_idx → index of its FileHeader row in flat_rows.
     flat_file_starts: Vec<usize>,
+    /// Prefix sum of estimated row heights (length = `flat_rows.len() + 1`).
+    /// Enables O(1) content-height and O(log N) offset↔index conversions.
+    flat_row_height_prefix: Vec<f32>,
     /// Whether the flat cache needs rebuilding before next render.
     flat_cache_dirty: bool,
 
@@ -274,7 +273,6 @@ impl PrDiffPanel {
             copied_file_key: None,
             _copied_timer: None,
             needs_initial_refresh: false,
-            rendered_file_limit: FILE_RENDER_BATCH,
             copy_selecting: false,
             copy_anchor_line: None,
             copy_end_line: None,
@@ -284,6 +282,7 @@ impl PrDiffPanel {
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
+            flat_row_height_prefix: vec![0.0],
             flat_cache_dirty: true,
             reply_to: None,
             reply_input: None,
@@ -354,7 +353,6 @@ impl PrDiffPanel {
             copied_file_key: None,
             _copied_timer: None,
             needs_initial_refresh: true,
-            rendered_file_limit: FILE_RENDER_BATCH,
             copy_selecting: false,
             copy_anchor_line: None,
             copy_end_line: None,
@@ -364,6 +362,7 @@ impl PrDiffPanel {
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
+            flat_row_height_prefix: vec![0.0],
             flat_cache_dirty: true,
             reply_to: None,
             reply_input: None,
@@ -457,6 +456,54 @@ impl PrDiffPanel {
         self.scrollbar.visible = true;
         self.scrollbar.hide_task =
             Some(scrollbar::schedule_hide(cx, |v: &mut Self| &mut v.scrollbar));
+    }
+
+    /// Rebuild `flat_row_height_prefix` from `flat_rows`. Called once
+    /// per flat-cache rebuild so the three helpers below can run in
+    /// O(1) / O(log N) instead of walking all rows every render.
+    fn rebuild_row_height_prefix(&mut self) {
+        self.flat_row_height_prefix.clear();
+        self.flat_row_height_prefix.reserve(self.flat_rows.len() + 1);
+        self.flat_row_height_prefix.push(0.0);
+        let mut acc: f32 = 0.0;
+        for row in &self.flat_rows {
+            acc += row_height_estimate_px(row);
+            self.flat_row_height_prefix.push(acc);
+        }
+    }
+
+    /// Sum of estimated heights across all `flat_rows`. Stable between
+    /// renders, so the scrollbar thumb doesn't resize as items scroll in.
+    fn estimated_content_height_px(&self) -> f32 {
+        *self.flat_row_height_prefix.last().unwrap_or(&0.0)
+    }
+
+    /// Estimated pixel offset corresponding to the list's current logical
+    /// scroll position.
+    fn estimated_scroll_offset_px(&self) -> f32 {
+        let scroll_top = self.list_state.logical_scroll_top();
+        let cap = scroll_top
+            .item_ix
+            .min(self.flat_row_height_prefix.len().saturating_sub(1));
+        self.flat_row_height_prefix[cap] + f32::from(scroll_top.offset_in_item)
+    }
+
+    /// Locate the row containing `target_px` via binary search on the
+    /// prefix sums.
+    fn item_ix_for_estimated_offset(&self, target_px: f32) -> (usize, f32) {
+        if target_px <= 0.0 || self.flat_rows.is_empty() {
+            return (0, 0.0);
+        }
+        let prefix = &self.flat_row_height_prefix;
+        let ix = match prefix.binary_search_by(|v| {
+            v.partial_cmp(&target_px).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        let ix = ix.min(self.flat_rows.len());
+        let row_start = prefix[ix.min(prefix.len() - 1)];
+        (ix, (target_px - row_start).max(0.0))
     }
 
     /// Ensure the auto-scroll timer is running while a drag is active.
@@ -608,7 +655,6 @@ impl PrDiffPanel {
                             panel.diff_files = repo.branch_diff(&panel.base_ref);
                         }
                         panel.expanded_context.clear();
-                        panel.rendered_file_limit = FILE_RENDER_BATCH;
                         panel.flat_cache_dirty = true;
                         panel.loading = false;
                         cx.notify();
@@ -656,7 +702,6 @@ impl PrDiffPanel {
                         panel.diff_files = repo.branch_diff(&panel.base_ref);
                     }
                     panel.expanded_context.clear();
-                    panel.rendered_file_limit = FILE_RENDER_BATCH;
                     panel.flat_cache_dirty = true;
 
                     panel.pr_comments = comments;
@@ -1024,10 +1069,6 @@ impl PrDiffPanel {
                             .on_click(move |_, _window, cx| {
                                 entity.update(cx, |panel, cx| {
                                     panel.collapsed_files.remove(&idx);
-                                    // Ensure the file is within the rendered batch
-                                    if idx >= panel.rendered_file_limit {
-                                        panel.rendered_file_limit = idx + 1;
-                                    }
                                     panel.scroll_to_file = Some(idx);
                                     panel.flat_cache_dirty = true;
                                     cx.notify();
@@ -1138,9 +1179,9 @@ impl PrDiffPanel {
     /// Called at the start of render when `flat_cache_dirty` is true.
     fn rebuild_flat_cache(&mut self) {
         // Phase 1: flatten segments for each file
-        let render_limit = self.rendered_file_limit.min(self.diff_files.len());
-        let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(render_limit);
-        for file_idx in 0..render_limit {
+        let files_count = self.diff_files.len();
+        let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(files_count);
+        for file_idx in 0..files_count {
             if self.collapsed_files.contains(&file_idx) || self.diff_files[file_idx].hunks.is_empty()
             {
                 all_segments.push(Vec::new());
@@ -1157,7 +1198,7 @@ impl PrDiffPanel {
         let mut global_line_idx = 0usize;
         let split_mode = self.view_mode == DiffViewMode::Split;
 
-        for file_idx in 0..render_limit {
+        for file_idx in 0..files_count {
             self.flat_file_starts.push(self.flat_rows.len());
             self.flat_rows.push(FlatRow::FileHeader { file_idx });
 
@@ -1302,13 +1343,9 @@ impl PrDiffPanel {
             }
         }
 
-        let remaining = self.diff_files.len().saturating_sub(render_limit);
-        if remaining > 0 {
-            self.flat_rows.push(FlatRow::LoadMore { remaining });
-        }
-
         self.cached_file_segments = all_segments;
         self.copy_line_contents = copy_texts;
+        self.rebuild_row_height_prefix();
         let scroll_pos = self.list_state.logical_scroll_top();
         let old_count = self.list_state.item_count();
         self.list_state.splice(0..old_count, self.flat_rows.len());
@@ -1388,20 +1425,6 @@ impl PrDiffPanel {
                     }
                 });
                 self.render_split_line_row(left_line, right_line, *global_line_idx, *is_last_in_file, entity)
-            }
-            FlatRow::LoadMore { remaining } => {
-                div()
-                    .w_full()
-                    .py_2()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors::text_muted())
-                            .child(format!("{remaining} more files...")),
-                    )
-                    .into_any_element()
             }
         }
     }
@@ -3110,7 +3133,20 @@ enum FlatRow {
         global_line_idx: usize,
         is_last_in_file: bool,
     },
-    LoadMore { remaining: usize },
+}
+
+/// Estimated rendered height per row type. Used to report a stable,
+/// total content height to the scrollbar — GPUI's `ListState` only
+/// sums measured items, so for long diffs the measured height grows
+/// (and the thumb shrinks) as rows scroll into view. These estimates
+/// must stay close to the actual `min_h` values in the render fns.
+fn row_height_estimate_px(row: &FlatRow) -> f32 {
+    match row {
+        FlatRow::FileHeader { .. } => 34.0,
+        FlatRow::EmptyFile { .. } => 40.0,
+        FlatRow::Line { .. } | FlatRow::SplitLine { .. } => 20.0,
+        FlatRow::CollapsedContext { .. } => 22.0,
+    }
 }
 
 // ── File tree builder ──
@@ -3385,9 +3421,15 @@ impl Render for PrDiffPanel {
                     if let Some(new_offset) =
                         scrollbar::drag_to_offset(&panel.scrollbar, event.position.y)
                     {
-                        panel
-                            .list_state
-                            .set_offset_from_scrollbar(point(px(0.0), -new_offset));
+                        // Translate estimated-px target to a concrete item
+                        // index; see `item_ix_for_estimated_offset` for
+                        // why we don't use `set_offset_from_scrollbar`.
+                        let (item_ix, within) =
+                            panel.item_ix_for_estimated_offset(f32::from(new_offset));
+                        panel.list_state.scroll_to(ListOffset {
+                            item_ix,
+                            offset_in_item: px(within),
+                        });
                         panel.bump_scrollbar(cx);
                         cx.notify();
                     }
@@ -3906,10 +3948,11 @@ impl Render for PrDiffPanel {
             self.bump_scrollbar(cx);
         }
 
-        let viewport_bounds = self.list_state.viewport_bounds();
-        let max_off_scroll = self.list_state.max_offset_for_scrollbar().height;
-        let scroll_content_height = viewport_bounds.size.height + max_off_scroll;
-        let scroll_offset_px = -self.list_state.scroll_px_offset_for_scrollbar().y;
+        // Don't use `list_state.max_offset_for_scrollbar()` — it only
+        // sums heights of measured items, which for long diffs grows as
+        // the user scrolls and makes the thumb shrink mid-scroll.
+        let scroll_content_height = px(self.estimated_content_height_px());
+        let scroll_offset_px = px(self.estimated_scroll_offset_px());
         self.scrollbar.content_height = scroll_content_height;
         let viewport_height = self.scrollbar.track_height;
         let scroll_visible = self.scrollbar.visible;
@@ -3957,29 +4000,6 @@ impl Render for PrDiffPanel {
             on_thumb_down,
         ) {
             diff_content = diff_content.child(bar);
-        }
-
-        // Auto-load more files if there are un-rendered files
-        let render_limit = self.rendered_file_limit.min(self.diff_files.len());
-        let remaining = self.diff_files.len().saturating_sub(render_limit);
-        if remaining > 0 {
-            let entity_more = cx.entity().clone();
-            cx.spawn(async move |_, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
-                let _ = cx.update(|cx| {
-                    let _ = entity_more.update(cx, |panel, cx| {
-                        let total = panel.diff_files.len();
-                        if panel.rendered_file_limit < total {
-                            panel.rendered_file_limit += FILE_RENDER_BATCH;
-                            panel.flat_cache_dirty = true;
-                            cx.notify();
-                        }
-                    });
-                });
-            })
-            .detach();
         }
 
         // Handle scroll-to-file: convert file_idx to flat row index

@@ -176,6 +176,10 @@ pub struct GitDiffPanel {
     copy_anchor_line: Option<usize>,
     copy_end_line: Option<usize>,
     copy_line_contents: Vec<String>,
+    /// Running auto-scroll task when dragging near viewport edges.
+    _autoscroll_task: Option<Task<()>>,
+    /// Last known mouse Y (window coords) during a copy-selection drag.
+    last_drag_mouse_y: Option<f32>,
 
     // Virtual scroll cache
     /// Pre-flattened line segments per file (indexed by file_idx within active section).
@@ -241,6 +245,8 @@ impl GitDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            _autoscroll_task: None,
+            last_drag_mouse_y: None,
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
@@ -305,6 +311,8 @@ impl GitDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            _autoscroll_task: None,
+            last_drag_mouse_y: None,
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
@@ -376,6 +384,95 @@ impl GitDiffPanel {
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// Return the `global_line_idx` for a flat row index, if it has one.
+    fn gli_for_row(&self, row_ix: usize) -> Option<usize> {
+        match self.flat_rows.get(row_ix)? {
+            FlatRow::Line { global_line_idx, .. } => Some(*global_line_idx),
+            FlatRow::SplitLine { global_line_idx, .. } => Some(*global_line_idx),
+            _ => None,
+        }
+    }
+
+    /// Ensure the auto-scroll timer is running while a copy-selection drag
+    /// is active.  The timer re-reads `last_drag_mouse_y` each tick so it
+    /// works even when `on_mouse_move` stops firing (mouse left the window).
+    fn ensure_autoscroll_timer(&mut self, cx: &mut Context<Self>) {
+        if !self.copy_selecting {
+            self._autoscroll_task = None;
+            return;
+        }
+        if self._autoscroll_task.is_some() {
+            return;
+        }
+
+        let entity = cx.entity().clone();
+        self._autoscroll_task = Some(cx.spawn(async move |_, cx| {
+            const EDGE_ZONE: f32 = 40.0;
+            const SCROLL_SPEED: f32 = 300.0;
+            const TICK_MS: u64 = 16;
+
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(TICK_MS))
+                    .await;
+                let Ok(should_continue) = cx.update(|cx| {
+                    entity.update(cx, |panel, cx| {
+                        if !panel.copy_selecting {
+                            panel._autoscroll_task = None;
+                            return false;
+                        }
+                        let Some(mouse_y) = panel.last_drag_mouse_y else {
+                            return true;
+                        };
+
+                        let vp = panel.list_state.viewport_bounds();
+                        let top = f32::from(vp.origin.y);
+                        let bottom = top + f32::from(vp.size.height);
+
+                        let scroll_delta = if mouse_y < top + EDGE_ZONE {
+                            let ratio = ((top + EDGE_ZONE - mouse_y) / EDGE_ZONE).clamp(0.0, 1.0);
+                            -(SCROLL_SPEED * ratio * TICK_MS as f32 / 1000.0)
+                        } else if mouse_y > bottom - EDGE_ZONE {
+                            let ratio = ((mouse_y - (bottom - EDGE_ZONE)) / EDGE_ZONE).clamp(0.0, 1.0);
+                            SCROLL_SPEED * ratio * TICK_MS as f32 / 1000.0
+                        } else {
+                            return true; // not near edge, keep timer alive
+                        };
+
+                        panel.list_state.scroll_by(px(scroll_delta));
+
+                        let scroll_top = panel.list_state.logical_scroll_top();
+                        if scroll_delta < 0.0 {
+                            for i in scroll_top.item_ix..panel.flat_rows.len() {
+                                if let Some(gli) = panel.gli_for_row(i) {
+                                    panel.copy_end_line = Some(gli);
+                                    break;
+                                }
+                            }
+                        } else {
+                            let est_visible = (f32::from(vp.size.height) / 22.0) as usize;
+                            let end_ix = (scroll_top.item_ix + est_visible + 5)
+                                .min(panel.flat_rows.len());
+                            for i in (scroll_top.item_ix..end_ix).rev() {
+                                if let Some(gli) = panel.gli_for_row(i) {
+                                    panel.copy_end_line = Some(gli);
+                                    break;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                }) else {
+                    break;
+                };
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Compute a content hash for a diff file based on its hunks.
@@ -1512,19 +1609,24 @@ impl GitDiffPanel {
             .border_r_1()
             .border_color(colors::border())
             .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
-            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
                 entity_sel_down.update(cx, |panel, cx| {
                     panel.copy_anchor_line = Some(gli);
                     panel.copy_end_line = Some(gli);
                     panel.copy_selecting = true;
+                    panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                    panel.ensure_autoscroll_timer(cx);
                     cx.notify();
                 });
             })
-            .on_mouse_move(move |_, _window, cx| {
+            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_sel_move.update(cx, |panel, cx| {
-                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
-                        panel.copy_end_line = Some(gli);
-                        cx.notify();
+                    if panel.copy_selecting {
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                        if panel.copy_end_line != Some(gli) {
+                            panel.copy_end_line = Some(gli);
+                            cx.notify();
+                        }
                     }
                 });
             })
@@ -1704,19 +1806,24 @@ impl GitDiffPanel {
             .border_r_1()
             .border_color(colors::border())
             .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
-            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
                 entity_sel_down.update(cx, |panel, cx| {
                     panel.copy_anchor_line = Some(gli);
                     panel.copy_end_line = Some(gli);
                     panel.copy_selecting = true;
+                    panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                    panel.ensure_autoscroll_timer(cx);
                     cx.notify();
                 });
             })
-            .on_mouse_move(move |_, _window, cx| {
+            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_sel_move.update(cx, |panel, cx| {
-                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
-                        panel.copy_end_line = Some(gli);
-                        cx.notify();
+                    if panel.copy_selecting {
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                        if panel.copy_end_line != Some(gli) {
+                            panel.copy_end_line = Some(gli);
+                            cx.notify();
+                        }
                     }
                 });
             })
@@ -2300,7 +2407,7 @@ impl Render for GitDiffPanel {
             .track_focus(&self.focus_handle)
             .key_context("GitDiffPanel")
             .on_action(cx.listener(Self::handle_find))
-            // Handle tree resize drag across the whole panel
+            // Handle tree resize drag + track mouse Y for auto-scroll
             .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_move.update(cx, |panel, cx| {
                     if panel.resizing_tree {
@@ -2308,6 +2415,9 @@ impl Render for GitDiffPanel {
                         let new_w = (panel.tree_drag_start_width + delta).clamp(MIN_TREE_WIDTH, MAX_TREE_WIDTH);
                         panel.tree_width = new_w;
                         cx.notify();
+                    }
+                    if panel.copy_selecting {
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
                     }
                 });
             })
@@ -2322,6 +2432,8 @@ impl Render for GitDiffPanel {
                         }
                         if panel.copy_selecting {
                             panel.copy_selecting = false;
+                            panel._autoscroll_task = None;
+                            panel.last_drag_mouse_y = None;
                             panel.copy_selected_text(cx);
                             changed = true;
                         }

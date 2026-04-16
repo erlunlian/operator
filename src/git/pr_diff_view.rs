@@ -189,6 +189,10 @@ pub struct PrDiffPanel {
     copy_end_line: Option<usize>,
     /// Global line index → text content for copy (rebuilt with flat cache).
     copy_line_contents: Vec<String>,
+    /// Running auto-scroll task when dragging near viewport edges.
+    _autoscroll_task: Option<Task<()>>,
+    /// Last known mouse Y (window coords) during a drag.
+    last_drag_mouse_y: Option<f32>,
 
     // Virtual scroll cache
     /// Pre-flattened line segments per file (indexed by file_idx).
@@ -270,6 +274,8 @@ impl PrDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            _autoscroll_task: None,
+            last_drag_mouse_y: None,
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
@@ -346,6 +352,8 @@ impl PrDiffPanel {
             copy_anchor_line: None,
             copy_end_line: None,
             copy_line_contents: Vec::new(),
+            _autoscroll_task: None,
+            last_drag_mouse_y: None,
             cached_file_segments: Vec::new(),
             flat_rows: Vec::new(),
             flat_file_starts: Vec::new(),
@@ -425,6 +433,109 @@ impl PrDiffPanel {
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// Return the `global_line_idx` for a flat row index, if it has one.
+    fn gli_for_row(&self, row_ix: usize) -> Option<usize> {
+        match self.flat_rows.get(row_ix)? {
+            FlatRow::Line { global_line_idx, .. } => Some(*global_line_idx),
+            FlatRow::SplitLine { global_line_idx, .. } => Some(*global_line_idx),
+            _ => None,
+        }
+    }
+
+    /// Ensure the auto-scroll timer is running while a drag is active.
+    /// The timer re-reads `last_drag_mouse_y` each tick so it works even
+    /// when `on_mouse_move` stops firing (mouse left the window).
+    fn ensure_autoscroll_timer(&mut self, cx: &mut Context<Self>) {
+        let is_dragging = self.copy_selecting || self.comment_drag_start.is_some();
+        if !is_dragging {
+            self._autoscroll_task = None;
+            return;
+        }
+        if self._autoscroll_task.is_some() {
+            return;
+        }
+
+        let entity = cx.entity().clone();
+        self._autoscroll_task = Some(cx.spawn(async move |_, cx| {
+            const EDGE_ZONE: f32 = 40.0;
+            const SCROLL_SPEED: f32 = 300.0;
+            const TICK_MS: u64 = 16;
+
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(TICK_MS))
+                    .await;
+                let Ok(should_continue) = cx.update(|cx| {
+                    entity.update(cx, |panel, cx| {
+                        let is_dragging = panel.copy_selecting
+                            || panel.comment_drag_start.is_some();
+                        if !is_dragging {
+                            panel._autoscroll_task = None;
+                            return false;
+                        }
+                        let Some(mouse_y) = panel.last_drag_mouse_y else {
+                            return true;
+                        };
+
+                        let vp = panel.list_state.viewport_bounds();
+                        let top = f32::from(vp.origin.y);
+                        let bottom = top + f32::from(vp.size.height);
+
+                        let scroll_delta = if mouse_y < top + EDGE_ZONE {
+                            let ratio = ((top + EDGE_ZONE - mouse_y) / EDGE_ZONE).clamp(0.0, 1.0);
+                            -(SCROLL_SPEED * ratio * TICK_MS as f32 / 1000.0)
+                        } else if mouse_y > bottom - EDGE_ZONE {
+                            let ratio = ((mouse_y - (bottom - EDGE_ZONE)) / EDGE_ZONE).clamp(0.0, 1.0);
+                            SCROLL_SPEED * ratio * TICK_MS as f32 / 1000.0
+                        } else {
+                            return true; // not near edge, keep timer alive
+                        };
+
+                        panel.list_state.scroll_by(px(scroll_delta));
+
+                        let scroll_top = panel.list_state.logical_scroll_top();
+                        if scroll_delta < 0.0 {
+                            for i in scroll_top.item_ix..panel.flat_rows.len() {
+                                if let Some(gli) = panel.gli_for_row(i) {
+                                    if panel.copy_selecting {
+                                        panel.copy_end_line = Some(gli);
+                                    }
+                                    if panel.comment_drag_start.is_some() {
+                                        panel.comment_drag_end_gli = Some(gli);
+                                    }
+                                    break;
+                                }
+                            }
+                        } else {
+                            let est_visible =
+                                (f32::from(vp.size.height) / 22.0) as usize;
+                            let end_ix = (scroll_top.item_ix + est_visible + 5)
+                                .min(panel.flat_rows.len());
+                            for i in (scroll_top.item_ix..end_ix).rev() {
+                                if let Some(gli) = panel.gli_for_row(i) {
+                                    if panel.copy_selecting {
+                                        panel.copy_end_line = Some(gli);
+                                    }
+                                    if panel.comment_drag_start.is_some() {
+                                        panel.comment_drag_end_gli = Some(gli);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                }) else {
+                    break;
+                };
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Refresh the branch diff and reload PR data asynchronously.
@@ -1602,13 +1713,15 @@ impl PrDiffPanel {
                 .when(gutter_highlight, |d: Stateful<Div>| d.opacity(1.0))
                 .group_hover("pr-diff-line", |s| s.opacity(1.0).bg(rgba(0x89b4fa30)).text_color(colors::accent()))
                 .hover(|s| s.bg(rgba(0x89b4fa40)))
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
                     let path = path_down.clone();
                     entity_down.update(cx, |panel, cx| {
                         panel.comment_drag_start = Some((path, ln, side));
                         panel.comment_drag_end = None;
                         panel.comment_drag_start_gli = Some(gli);
                         panel.comment_drag_end_gli = Some(gli);
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                        panel.ensure_autoscroll_timer(cx);
                         cx.notify();
                     });
                     cx.stop_propagation();
@@ -1699,23 +1812,29 @@ impl PrDiffPanel {
             .bg(drag_highlight)
             .font_family("Menlo")
             .text_xs()
-            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
                 entity_sel_down.update(cx, |panel, cx| {
                     panel.copy_anchor_line = Some(gli);
                     panel.copy_end_line = Some(gli);
                     panel.copy_selecting = true;
+                    panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                    panel.ensure_autoscroll_timer(cx);
                     cx.notify();
                 });
             })
-            .on_mouse_move(move |_, _window, cx| {
+            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
                 entity_sel_move.update(cx, |panel, cx| {
                     let mut changed = false;
-                    if panel.copy_selecting && panel.copy_end_line != Some(gli) {
-                        panel.copy_end_line = Some(gli);
-                        changed = true;
+                    if panel.copy_selecting {
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                        if panel.copy_end_line != Some(gli) {
+                            panel.copy_end_line = Some(gli);
+                            changed = true;
+                        }
                     }
                     // Track comment drag across the whole row, not just the "+" button
                     if panel.comment_drag_start.is_some() {
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
                         if panel.comment_drag_end_gli != Some(gli) {
                             panel.comment_drag_end_gli = Some(gli);
                             changed = true;
@@ -3245,6 +3364,9 @@ impl Render for PrDiffPanel {
                         panel.tree_width = new_w;
                         cx.notify();
                     }
+                    if panel.copy_selecting || panel.comment_drag_start.is_some() {
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                    }
                 });
             })
             .on_mouse_up(
@@ -3265,12 +3387,16 @@ impl Render for PrDiffPanel {
                             panel.comment_drag_end = None;
                             panel.comment_drag_start_gli = None;
                             panel.comment_drag_end_gli = None;
+                            panel._autoscroll_task = None;
+                            panel.last_drag_mouse_y = None;
                             panel.start_comment(path, start, end, drag_side, cx);
                             changed = true;
                         }
                         // End text selection and copy
                         if panel.copy_selecting {
                             panel.copy_selecting = false;
+                            panel._autoscroll_task = None;
+                            panel.last_drag_mouse_y = None;
                             panel.copy_selected_text(cx);
                             changed = true;
                         }

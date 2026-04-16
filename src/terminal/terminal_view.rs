@@ -69,6 +69,10 @@ pub struct TerminalView {
     size_changed: Arc<AtomicBool>,
     /// URL currently hovered with Cmd held (for underline + click-to-open).
     hovered_url: Option<HoveredUrl>,
+    /// Running auto-scroll task when dragging selection past viewport edges.
+    _autoscroll_task: Option<Task<()>>,
+    /// Last known mouse Y (window coords) during a selection drag.
+    last_drag_mouse_y: Option<f32>,
 }
 
 impl TerminalView {
@@ -104,6 +108,8 @@ impl TerminalView {
             scroll_px: 0.0,
             size_changed: Arc::new(AtomicBool::new(false)),
             hovered_url: None,
+            _autoscroll_task: None,
+            last_drag_mouse_y: None,
         }
     }
 
@@ -114,6 +120,99 @@ impl TerminalView {
         let col = (x / self.cell_width).max(0.0) as usize;
         let line = (y / CELL_HEIGHT_PX).max(0.0) as usize;
         GridPos { line, col }
+    }
+
+    /// Ensure the auto-scroll timer is running while a selection drag is
+    /// active.  The timer re-reads `last_drag_mouse_y` each tick so it
+    /// adapts even when `on_mouse_move` stops firing (mouse left the window).
+    fn ensure_autoscroll_timer(&mut self, cx: &mut Context<Self>) {
+        if self.selection_start.is_none() {
+            self._autoscroll_task = None;
+            return;
+        }
+        // Already running — it will pick up the latest last_drag_mouse_y.
+        if self._autoscroll_task.is_some() {
+            return;
+        }
+
+        let entity = cx.entity().clone();
+        self._autoscroll_task = Some(cx.spawn(async move |_, cx| {
+            const EDGE_ZONE: f32 = 30.0;
+            const TICK_MS: u64 = 50;
+
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(TICK_MS))
+                    .await;
+                let Ok(should_continue) = cx.update(|cx| {
+                    entity.update(cx, |view, cx| {
+                        if view.selection_start.is_none() {
+                            view._autoscroll_task = None;
+                            return false;
+                        }
+                        let Some(mouse_y) = view.last_drag_mouse_y else {
+                            return true; // keep timer alive, no position yet
+                        };
+
+                        let bounds = *view.last_bounds.lock().unwrap();
+                        let top = f32::from(bounds.origin.y);
+                        let bottom = top + f32::from(bounds.size.height);
+                        let visible_rows = ((f32::from(bounds.size.height) - PADDING_PX * 2.0)
+                            / CELL_HEIGHT_PX)
+                            .floor()
+                            .max(1.0) as usize;
+
+                        // In alacritty: Scroll::Delta(+) = UP (history),
+                        //               Scroll::Delta(-) = DOWN (recent).
+                        let scroll_dir: i32 = if mouse_y < top + EDGE_ZONE {
+                            1
+                        } else if mouse_y > bottom - EDGE_ZONE {
+                            -1
+                        } else {
+                            return true; // not near edge, keep timer alive but skip scroll
+                        };
+
+                        let term_model = view.terminal.read(cx);
+                        let is_alt_screen = {
+                            let t = term_model.term.lock();
+                            t.mode().contains(TermMode::ALT_SCREEN)
+                        };
+                        if is_alt_screen {
+                            return true;
+                        }
+                        {
+                            let mut t = term_model.term.lock();
+                            t.scroll_display(Scroll::Delta(scroll_dir));
+                        }
+                        // Adjust selection_start for the content shift.
+                        // scroll_dir > 0 = scroll up = content shifts DOWN.
+                        if let Some(ref mut start) = view.selection_start {
+                            if scroll_dir > 0 {
+                                start.line = start.line.saturating_add(1);
+                            } else {
+                                start.line = start.line.saturating_sub(1);
+                            }
+                        }
+                        // Extend selection to the viewport edge.
+                        if let Some(ref mut end) = view.selection_end {
+                            if scroll_dir > 0 {
+                                end.line = 0;
+                                end.col = 0;
+                            } else {
+                                end.line = visible_rows.saturating_sub(1);
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                }) else {
+                    break;
+                };
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Send a mouse event to the terminal PTY using SGR or legacy encoding.
@@ -522,6 +621,8 @@ impl Render for TerminalView {
                     let pos = this.mouse_to_grid(event.position);
                     this.selection_start = Some(pos);
                     this.selection_end = Some(pos);
+                    this.last_drag_mouse_y = Some(f32::from(event.position.y));
+                    this.ensure_autoscroll_timer(cx);
                 }
                 cx.notify();
             }))
@@ -553,10 +654,13 @@ impl Render for TerminalView {
                 } else if this.selection_start.is_some() {
                     let pos = this.mouse_to_grid(event.position);
                     this.selection_end = Some(pos);
+                    this.last_drag_mouse_y = Some(f32::from(event.position.y));
                     cx.notify();
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                this._autoscroll_task = None;
+                this.last_drag_mouse_y = None;
                 let term_model = this.terminal.read(cx);
                 let has_mouse_mode = {
                     let t = term_model.term.lock();

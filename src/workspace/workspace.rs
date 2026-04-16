@@ -182,9 +182,13 @@ impl Workspace {
                     state.work_dir = Some(work_dir);
                     state.title =
                         (!ready.title.is_empty()).then_some(ready.title.clone());
-                    let short = ready.pr.short();
+                    let display_name = if ready.title.is_empty() {
+                        ready.pr.short()
+                    } else {
+                        ready.title.clone()
+                    };
                     state.pr = Some(ready.pr);
-                    Some(short)
+                    Some(display_name)
                 }
                 Err(msg) => {
                     state.status = PrReviewStatus::Error(msg);

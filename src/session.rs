@@ -83,6 +83,10 @@ pub struct WorkspaceState {
     /// Per-workspace: right panel collapsed.
     #[serde(default)]
     pub right_panel_collapsed: Option<bool>,
+    /// If set, this workspace is a GitHub PR review for the given URL —
+    /// restored by kicking off the async clone+checkout pipeline.
+    #[serde(default)]
+    pub pr_review_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -185,6 +189,7 @@ impl SessionState {
                     right_panel_width: rp_width,
                     sidebar_collapsed: sb_collapsed,
                     right_panel_collapsed: rp_collapsed,
+                    pr_review_url: ws.pr_review.as_ref().map(|s| s.url.clone()),
                 }
             })
             .collect();
@@ -334,6 +339,12 @@ impl SessionState {
                         ws.cached_right_panel_width = ws_state.right_panel_width;
                         ws.cached_sidebar_collapsed = ws_state.sidebar_collapsed;
                         ws.cached_right_panel_collapsed = ws_state.right_panel_collapsed;
+                        ws
+                    })
+                } else if let Some(url) = ws_state.pr_review_url.clone() {
+                    cx.new(|cx| {
+                        let mut ws = crate::workspace::Workspace::new_empty(cx);
+                        ws.init_pr_review(url, cx);
                         ws
                     })
                 } else {

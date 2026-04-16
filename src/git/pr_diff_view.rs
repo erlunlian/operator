@@ -11,6 +11,7 @@ use super::markdown;
 use crate::actions::FindInFile;
 use crate::text_input::TextInput;
 use crate::theme::colors;
+use crate::ui::scrollbar::{self, ScrollbarState};
 use crate::util;
 
 /// How many context lines around each change to show by default.
@@ -233,6 +234,10 @@ pub struct PrDiffPanel {
     /// Matches: (global_line_idx, start_byte, end_byte).
     search_matches: Vec<(usize, usize, usize)>,
     search_match_ix: usize,
+
+    // Auto-hiding scrollbar over the diff list.
+    scrollbar: ScrollbarState,
+    last_scroll_offset: f32,
 }
 
 impl PrDiffPanel {
@@ -296,6 +301,8 @@ impl PrDiffPanel {
             search_input: None,
             search_matches: Vec::new(),
             search_match_ix: 0,
+            scrollbar: ScrollbarState::default(),
+            last_scroll_offset: 0.0,
         }
     }
 
@@ -374,6 +381,8 @@ impl PrDiffPanel {
             search_input: None,
             search_matches: Vec::new(),
             search_match_ix: 0,
+            scrollbar: ScrollbarState::default(),
+            last_scroll_offset: 0.0,
         }
     }
 
@@ -442,6 +451,12 @@ impl PrDiffPanel {
             FlatRow::SplitLine { global_line_idx, .. } => Some(*global_line_idx),
             _ => None,
         }
+    }
+
+    fn bump_scrollbar(&mut self, cx: &mut Context<Self>) {
+        self.scrollbar.visible = true;
+        self.scrollbar.hide_task =
+            Some(scrollbar::schedule_hide(cx, |v: &mut Self| &mut v.scrollbar));
     }
 
     /// Ensure the auto-scroll timer is running while a drag is active.
@@ -3367,6 +3382,15 @@ impl Render for PrDiffPanel {
                     if panel.copy_selecting || panel.comment_drag_start.is_some() {
                         panel.last_drag_mouse_y = Some(f32::from(event.position.y));
                     }
+                    if let Some(new_offset) =
+                        scrollbar::drag_to_offset(&panel.scrollbar, event.position.y)
+                    {
+                        panel
+                            .list_state
+                            .set_offset_from_scrollbar(point(px(0.0), -new_offset));
+                        panel.bump_scrollbar(cx);
+                        cx.notify();
+                    }
                 });
             })
             .on_mouse_up(
@@ -3398,6 +3422,12 @@ impl Render for PrDiffPanel {
                             panel._autoscroll_task = None;
                             panel.last_drag_mouse_y = None;
                             panel.copy_selected_text(cx);
+                            changed = true;
+                        }
+                        if panel.scrollbar.drag_cursor_within_thumb.is_some() {
+                            panel.scrollbar.drag_cursor_within_thumb = None;
+                            panel.list_state.scrollbar_drag_ended();
+                            panel.bump_scrollbar(cx);
                             changed = true;
                         }
                         if changed {
@@ -3868,7 +3898,44 @@ impl Render for PrDiffPanel {
         )
         .flex_1();
 
-        let diff_content = div()
+        // Detect ListState scroll changes between renders so the scrollbar
+        // auto-shows when the user scrolls with wheel/trackpad.
+        let cur_list_offset = f32::from(-self.list_state.scroll_px_offset_for_scrollbar().y);
+        if (cur_list_offset - self.last_scroll_offset).abs() > 0.5 {
+            self.last_scroll_offset = cur_list_offset;
+            self.bump_scrollbar(cx);
+        }
+
+        let viewport_bounds = self.list_state.viewport_bounds();
+        let max_off_scroll = self.list_state.max_offset_for_scrollbar().height;
+        let scroll_content_height = viewport_bounds.size.height + max_off_scroll;
+        let scroll_offset_px = -self.list_state.scroll_px_offset_for_scrollbar().y;
+        self.scrollbar.content_height = scroll_content_height;
+        let viewport_height = self.scrollbar.track_height;
+        let scroll_visible = self.scrollbar.visible;
+        let scroll_dragging = self.scrollbar.drag_cursor_within_thumb.is_some();
+
+        let entity_for_bounds = cx.entity().clone();
+        let entity_for_thumb = cx.entity().clone();
+        let bounds_sink: Rc<dyn Fn(Bounds<Pixels>, &mut App)> =
+            Rc::new(move |bounds, cx| {
+                entity_for_bounds.update(cx, |panel, _cx| {
+                    panel.scrollbar.track_origin_y = bounds.origin.y;
+                    panel.scrollbar.track_height = bounds.size.height;
+                });
+            });
+        let on_thumb_down: Rc<dyn Fn(Pixels, Pixels, &mut Window, &mut App)> =
+            Rc::new(move |cursor_y, thumb_top, _window, cx| {
+                entity_for_thumb.update(cx, |panel, cx| {
+                    panel.list_state.scrollbar_drag_started();
+                    scrollbar::start_drag(&mut panel.scrollbar, cursor_y, thumb_top);
+                    panel.bump_scrollbar(cx);
+                    cx.notify();
+                });
+            });
+
+        let mut diff_content = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -3876,6 +3943,21 @@ impl Render for PrDiffPanel {
             .overflow_x_hidden()
             .px(px(16.0))
             .child(diff_list);
+
+        if let Some(bar) = scrollbar::render_vertical(
+            "pr-diff-scrollbar",
+            scrollbar::Geometry {
+                scroll_offset: scroll_offset_px,
+                content_height: scroll_content_height,
+                viewport_height,
+            },
+            scroll_visible,
+            scroll_dragging,
+            bounds_sink,
+            on_thumb_down,
+        ) {
+            diff_content = diff_content.child(bar);
+        }
 
         // Auto-load more files if there are un-rendered files
         let render_limit = self.rendered_file_limit.min(self.diff_files.len());

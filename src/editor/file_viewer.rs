@@ -10,6 +10,7 @@ use crate::actions::{FindInFile, SaveFile};
 use crate::editor::syntax::{self, HighlightSpan};
 use crate::settings::AppSettings;
 use crate::theme::colors;
+use crate::ui::scrollbar::{self, ScrollbarState};
 
 // ── Pre-computed highlight data for rendering ──
 
@@ -218,6 +219,12 @@ pub struct FileViewer {
     code_area_width: Rc<Cell<f32>>,
     /// Current wrap width in characters used for markdown soft-wrapping.
     current_wrap_chars: usize,
+
+    // Scrollbar state (auto-hide)
+    scrollbar: ScrollbarState,
+    /// Last seen scroll offset, used to detect scroll events and bump
+    /// scrollbar visibility.
+    last_scroll_offset: f32,
 }
 
 impl FileViewer {
@@ -276,6 +283,8 @@ impl FileViewer {
             char_width: Rc::new(Cell::new(DEFAULT_CHAR_WIDTH)),
             code_area_width: Rc::new(Cell::new(0.0)),
             current_wrap_chars: MARKDOWN_WRAP_CHARS,
+            scrollbar: ScrollbarState::default(),
+            last_scroll_offset: 0.0,
         }
     }
 
@@ -321,6 +330,8 @@ impl FileViewer {
             char_width: Rc::new(Cell::new(DEFAULT_CHAR_WIDTH)),
             code_area_width: Rc::new(Cell::new(0.0)),
             current_wrap_chars: MARKDOWN_WRAP_CHARS,
+            scrollbar: ScrollbarState::default(),
+            last_scroll_offset: 0.0,
         }
     }
 
@@ -1327,6 +1338,14 @@ impl FileViewer {
         self.scroll_handle.scroll_to_item(visual_row, ScrollStrategy::Top);
     }
 
+    /// Make the scrollbar visible and (re)schedule it to fade out after
+    /// the idle timeout. Called whenever the user scrolls or drags.
+    fn bump_scrollbar(&mut self, cx: &mut Context<Self>) {
+        self.scrollbar.visible = true;
+        self.scrollbar.hide_task =
+            Some(scrollbar::schedule_hide(cx, |v: &mut Self| &mut v.scrollbar));
+    }
+
     // ── Mouse position helpers ──
 
     /// Convert a screen position to a (row, col) in the buffer.
@@ -2268,6 +2287,17 @@ impl FileViewer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(new_offset) = scrollbar::drag_to_offset(&self.scrollbar, event.position.y) {
+            let state = self.scroll_handle.0.borrow();
+            let base = state.base_handle.clone();
+            let x = base.offset().x;
+            drop(state);
+            base.set_offset(point(x, -new_offset));
+            self.bump_scrollbar(cx);
+            cx.notify();
+            return;
+        }
+
         if !self.mouse_selecting {
             return;
         }
@@ -2291,6 +2321,12 @@ impl FileViewer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.scrollbar.drag_cursor_within_thumb.is_some() {
+            self.scrollbar.drag_cursor_within_thumb = None;
+            self.bump_scrollbar(cx);
+            cx.notify();
+        }
+
         if !self.mouse_selecting {
             return;
         }
@@ -2696,6 +2732,13 @@ impl Render for FileViewer {
         let refs_panel = self.references_panel.clone();
         let entity_handle = cx.entity().clone();
 
+        // Detect scroll changes across renders and bump scrollbar visibility.
+        let current_offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
+        if (current_offset_y - self.last_scroll_offset).abs() > 0.5 {
+            self.last_scroll_offset = current_offset_y;
+            self.bump_scrollbar(cx);
+        }
+
         // Virtual scrolling editor lines with click-to-position
         root = root.child({
                 let code_left = self.code_area_left.clone();
@@ -2703,7 +2746,7 @@ impl Render for FileViewer {
                 let char_width = self.char_width.clone();
                 let code_width = self.code_area_width.clone();
                 let entity_for_resize = cx.entity().clone();
-                let editor_container = div()
+                let mut editor_container = div()
                     .relative()
                     .flex_1()
                     .size_full()
@@ -2853,6 +2896,45 @@ impl Render for FileViewer {
                         .size_full()
                         .track_scroll(self.scroll_handle.clone())
                     );
+
+                // ── Auto-hiding vertical scrollbar overlay ──
+                let scroll_offset_px = -self.scroll_handle.0.borrow().base_handle.offset().y;
+                let content_height = px(line_count as f32 * 18.0);
+                self.scrollbar.content_height = content_height;
+                let viewport_height = self.scrollbar.track_height;
+                let scroll_visible = self.scrollbar.visible;
+                let scroll_dragging = self.scrollbar.drag_cursor_within_thumb.is_some();
+                let entity_for_bounds = cx.entity().clone();
+                let entity_for_thumb = cx.entity().clone();
+                let bounds_sink: Rc<dyn Fn(Bounds<Pixels>, &mut App)> =
+                    Rc::new(move |bounds, cx| {
+                        entity_for_bounds.update(cx, |view, _cx| {
+                            view.scrollbar.track_origin_y = bounds.origin.y;
+                            view.scrollbar.track_height = bounds.size.height;
+                        });
+                    });
+                let on_thumb_down: Rc<dyn Fn(Pixels, Pixels, &mut Window, &mut App)> =
+                    Rc::new(move |cursor_y, thumb_top, _window, cx| {
+                        entity_for_thumb.update(cx, |view, cx| {
+                            scrollbar::start_drag(&mut view.scrollbar, cursor_y, thumb_top);
+                            view.bump_scrollbar(cx);
+                            cx.notify();
+                        });
+                    });
+                if let Some(bar) = scrollbar::render_vertical(
+                    "file-viewer-scrollbar",
+                    scrollbar::Geometry {
+                        scroll_offset: scroll_offset_px,
+                        content_height,
+                        viewport_height,
+                    },
+                    scroll_visible,
+                    scroll_dragging,
+                    bounds_sink,
+                    on_thumb_down,
+                ) {
+                    editor_container = editor_container.child(bar);
+                }
 
                 editor_container
             });

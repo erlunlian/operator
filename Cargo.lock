@@ -3966,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "operator"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

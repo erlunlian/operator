@@ -27,7 +27,9 @@ pub enum FocusRegion {
 #[derive(Clone, Debug)]
 pub enum UpdatePhase {
     Idle,
-    Installing,
+    /// Installing an update. Carries a live snapshot of download /
+    /// extract / finalize progress for the sidebar progress bar.
+    Installing(crate::updater::ProgressState),
     Error(String),
 }
 
@@ -461,13 +463,49 @@ impl OperatorApp {
             cx.open_url(&info.download_url);
             return;
         }
-        self.update_phase = UpdatePhase::Installing;
+
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::updater::ProgressState::default(),
+        ));
+        self.update_phase = UpdatePhase::Installing(*progress.lock().unwrap());
         cx.notify();
 
+        // UI-side poll task: every 100ms, snapshot `progress` and republish
+        // it as `UpdatePhase::Installing(_)` so the sidebar re-renders the
+        // bar. Exits once the phase leaves `Installing` (success or error).
+        let poll_progress = progress.clone();
+        let poll_entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let snap = *poll_progress.lock().unwrap();
+                let Some(entity) = poll_entity.upgrade() else { break };
+                let keep_going = cx.update(|cx| {
+                    entity.update(cx, |app, cx| {
+                        if matches!(app.update_phase, UpdatePhase::Installing(_)) {
+                            app.update_phase = UpdatePhase::Installing(snap);
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                });
+                match keep_going {
+                    Ok(true) => continue,
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+
+        let bg_progress = progress.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::updater::apply_update(&info) })
+                .spawn(async move { crate::updater::apply_update(&info, &bg_progress) })
                 .await;
             match result {
                 Ok(()) => {

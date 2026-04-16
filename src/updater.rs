@@ -1,6 +1,7 @@
 use serde::Deserialize;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GITHUB_REPO: &str = "erlunlian/operator";
@@ -26,6 +27,25 @@ pub struct UpdateInfo {
     /// URL to a `.zip` of `Operator.app` for in-app auto-update.
     /// `None` for older releases that only ship a DMG.
     pub zip_url: Option<String>,
+}
+
+/// Which stage of the apply-update pipeline is currently running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstallPhase {
+    #[default]
+    Starting,
+    Downloading,
+    Extracting,
+    Finalizing,
+}
+
+/// Live progress shared between the background updater thread and the UI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProgressState {
+    pub phase: InstallPhase,
+    pub bytes_downloaded: u64,
+    /// `None` until the download response provides Content-Length.
+    pub total_bytes: Option<u64>,
 }
 
 /// Check GitHub releases for a newer version. Runs synchronously (call from background thread).
@@ -92,9 +112,12 @@ pub fn check_for_update(current_version: &str, force: bool) -> Option<UpdateInfo
 /// process exits. The caller should quit the app immediately after
 /// this returns `Ok`.
 ///
-/// Runs synchronously (shells out to `curl`/`ditto`) — call from a
+/// `progress` is updated in place throughout the pipeline; the caller
+/// polls it from the UI thread to drive a progress bar.
+///
+/// Runs synchronously (shells out to `ditto`) — call from a
 /// background thread.
-pub fn apply_update(info: &UpdateInfo) -> Result<(), String> {
+pub fn apply_update(info: &UpdateInfo, progress: &Mutex<ProgressState>) -> Result<(), String> {
     let zip_url = info
         .zip_url
         .as_deref()
@@ -108,8 +131,10 @@ pub fn apply_update(info: &UpdateInfo) -> Result<(), String> {
     let extract_dir = temp_dir.join("extracted");
     std::fs::create_dir(&extract_dir).map_err(|e| format!("mkdir extract: {e}"))?;
 
-    download_to_file(zip_url, &zip_path)?;
+    set_phase(progress, InstallPhase::Downloading);
+    download_to_file(zip_url, &zip_path, progress)?;
 
+    set_phase(progress, InstallPhase::Extracting);
     let status = std::process::Command::new("ditto")
         .arg("-x")
         .arg("-k")
@@ -121,6 +146,7 @@ pub fn apply_update(info: &UpdateInfo) -> Result<(), String> {
         return Err(format!("ditto exited with {status}"));
     }
 
+    set_phase(progress, InstallPhase::Finalizing);
     let staged_app = find_app_in(&extract_dir)?;
     let script_path = temp_dir.join("apply.sh");
     std::fs::write(&script_path, APPLY_SH).map_err(|e| format!("write apply.sh: {e}"))?;
@@ -225,7 +251,11 @@ fn make_temp_dir() -> Result<PathBuf, String> {
     Ok(base)
 }
 
-fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
+fn download_to_file(
+    url: &str,
+    dest: &Path,
+    progress: &Mutex<ProgressState>,
+) -> Result<(), String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(120)))
         .user_agent("operator-updater")
@@ -235,11 +265,37 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
         .get(url)
         .call()
         .map_err(|e| format!("download: {e}"))?;
+
+    let total_bytes = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    {
+        let mut p = progress.lock().unwrap();
+        p.total_bytes = total_bytes;
+        p.bytes_downloaded = 0;
+    }
+
     let mut reader = resp.body_mut().as_reader();
     let mut file = std::fs::File::create(dest).map_err(|e| format!("create file: {e}"))?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| format!("write file: {e}"))?;
+    // 64 KiB buffer: large enough to keep syscall overhead low, small enough to
+    // update the progress bar smoothly on fast connections.
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| format!("write file: {e}"))?;
+        progress.lock().unwrap().bytes_downloaded += n as u64;
+    }
     file.flush().map_err(|e| format!("flush: {e}"))?;
     Ok(())
+}
+
+fn set_phase(progress: &Mutex<ProgressState>, phase: InstallPhase) {
+    progress.lock().unwrap().phase = phase;
 }
 
 fn find_app_in(dir: &Path) -> Result<PathBuf, String> {

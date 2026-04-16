@@ -64,6 +64,53 @@ fn drop_indicator() -> Div {
         .rounded_full()
 }
 
+/// Thin horizontal progress bar for the auto-update install flow.
+/// Shows a filled portion while the zip is downloading (known size);
+/// falls back to a full muted bar when the total is unknown (e.g.
+/// during extract / finalize, where there's no byte count).
+fn render_update_progress_bar(state: crate::updater::ProgressState) -> Div {
+    use crate::updater::InstallPhase;
+    let fraction: f32 = match state.phase {
+        InstallPhase::Starting | InstallPhase::Downloading => {
+            match (state.total_bytes, state.bytes_downloaded) {
+                (Some(total), got) if total > 0 => (got as f64 / total as f64).clamp(0.0, 1.0) as f32,
+                _ => 0.0,
+            }
+        }
+        InstallPhase::Extracting => 0.9,
+        InstallPhase::Finalizing => 1.0,
+    };
+    div()
+        .w_full()
+        .h(px(3.0))
+        .bg(colors::surface_hover())
+        .rounded_full()
+        .child(
+            div()
+                .h_full()
+                .w(relative(fraction))
+                .bg(colors::accent())
+                .rounded_full(),
+        )
+}
+
+/// Format a byte count as a short human string (e.g. "12.3 MB").
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 pub struct WorkspaceSidebar;
 
 impl WorkspaceSidebar {
@@ -173,18 +220,11 @@ impl WorkspaceSidebar {
                 .border_t_1()
                 .border_color(colors::border())
                 .cursor_pointer()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(colors::text_muted())
-                        .child("+"),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(colors::text_muted())
-                        .child("New Workspace (Cmd+N)"),
-                )
+                .text_color(colors::text_muted())
+                .hover(|s| s.bg(colors::surface_hover()).text_color(colors::text()))
+                .tooltip(|_window, cx| crate::util::render_tooltip("New Workspace (Cmd+N)", cx))
+                .child(div().text_sm().child("+"))
+                .child(div().text_sm().child("New Workspace"))
                 .on_click(move |_, window, cx| {
                     on_new(window, cx);
                 }),
@@ -196,35 +236,66 @@ impl WorkspaceSidebar {
         // releases that didn't ship a zip.
         if let Some(info) = update_info {
             let version = info.latest_version.clone();
-            let (label, clickable) = match &update_phase {
+            let (label, clickable, progress) = match &update_phase {
                 crate::app::UpdatePhase::Idle => {
-                    (format!("v{version} available \u{21BB}"), true)
+                    (format!("v{version} available \u{21BB}"), true, None)
                 }
-                crate::app::UpdatePhase::Installing => {
-                    (format!("Installing v{version}\u{2026}"), false)
+                crate::app::UpdatePhase::Installing(p) => {
+                    let label = match p.phase {
+                        crate::updater::InstallPhase::Starting
+                        | crate::updater::InstallPhase::Downloading => {
+                            match (p.total_bytes, p.bytes_downloaded) {
+                                (Some(total), got) if total > 0 => {
+                                    let pct = ((got as f64 / total as f64) * 100.0)
+                                        .clamp(0.0, 100.0)
+                                        as u32;
+                                    format!(
+                                        "Downloading v{version}\u{2026} {pct}% ({} / {})",
+                                        format_bytes(got),
+                                        format_bytes(total),
+                                    )
+                                }
+                                _ => format!("Downloading v{version}\u{2026}"),
+                            }
+                        }
+                        crate::updater::InstallPhase::Extracting => {
+                            format!("Extracting v{version}\u{2026}")
+                        }
+                        crate::updater::InstallPhase::Finalizing => {
+                            format!("Finalizing v{version}\u{2026}")
+                        }
+                    };
+                    (label, false, Some(*p))
                 }
                 crate::app::UpdatePhase::Error(msg) => {
                     let short = msg.lines().next().unwrap_or("unknown");
-                    (format!("Update failed ({short}) \u{2014} retry"), true)
+                    (format!("Update failed ({short}) \u{2014} retry"), true, None)
                 }
             };
             let apply = on_apply_update.clone();
-            let mut row = div()
-                .id("update-indicator")
+            let mut inner = div()
                 .flex()
-                .flex_row()
+                .flex_col()
                 .items_center()
-                .justify_center()
                 .gap_1()
                 .w_full()
-                .px_3()
-                .py_1()
                 .child(
                     div()
                         .text_xs()
                         .text_color(colors::accent())
                         .child(label),
                 );
+            if let Some(p) = progress {
+                inner = inner.child(render_update_progress_bar(p));
+            }
+            let mut row = div()
+                .id("update-indicator")
+                .flex()
+                .flex_col()
+                .w_full()
+                .px_3()
+                .py_1()
+                .child(inner);
             if clickable {
                 row = row
                     .cursor_pointer()

@@ -23,6 +23,14 @@ pub enum FocusRegion {
     RightPanel,
 }
 
+/// Where the in-app auto-updater is in its pipeline.
+#[derive(Clone, Debug)]
+pub enum UpdatePhase {
+    Idle,
+    Installing,
+    Error(String),
+}
+
 // Layout constraints
 const MIN_SIDEBAR_WIDTH: f32 = 120.0;
 const MAX_SIDEBAR_WIDTH: f32 = 500.0;
@@ -55,6 +63,8 @@ pub struct OperatorApp {
     ws_drop_index: Option<usize>,
     /// Available update info (checked on startup).
     pub update_info: Option<crate::updater::UpdateInfo>,
+    /// Phase of the in-app update apply flow.
+    pub update_phase: UpdatePhase,
     /// Handle to the current diff file-watcher task. Dropped (cancelled) before
     /// starting a new watcher so old watchers don't accumulate.
     diff_watcher_task: Option<Task<()>>,
@@ -109,6 +119,7 @@ impl OperatorApp {
             quit_requested: false,
             ws_drop_index: None,
             update_info: None,
+            update_phase: UpdatePhase::Idle,
             diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
@@ -175,6 +186,7 @@ impl OperatorApp {
             quit_requested: false,
             ws_drop_index: None,
             update_info: None,
+            update_phase: UpdatePhase::Idle,
             diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
@@ -429,6 +441,46 @@ impl OperatorApp {
                         cx.notify();
                     });
                 });
+            }
+        })
+        .detach();
+    }
+
+    /// Download the zip asset, stage the new `.app`, spawn the apply
+    /// helper, and quit so the helper can swap the bundle in place.
+    /// Falls back to opening the release page if the release doesn't
+    /// ship a zip or if we're running a dev build.
+    pub fn apply_update(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.update_info.clone() else {
+            return;
+        };
+        if !matches!(self.update_phase, UpdatePhase::Idle | UpdatePhase::Error(_)) {
+            return;
+        }
+        if info.zip_url.is_none() {
+            cx.open_url(&info.download_url);
+            return;
+        }
+        self.update_phase = UpdatePhase::Installing;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::updater::apply_update(&info) })
+                .await;
+            match result {
+                Ok(()) => {
+                    let _ = cx.update(|cx| cx.quit());
+                }
+                Err(msg) => {
+                    let _ = cx.update(|cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.update_phase = UpdatePhase::Error(msg);
+                            cx.notify();
+                        });
+                    });
+                }
             }
         })
         .detach();
@@ -1896,6 +1948,13 @@ impl Render for OperatorApp {
                 }),
                 sidebar_width,
                 self.update_info.as_ref(),
+                self.update_phase.clone(),
+                {
+                    let app = cx.entity().clone();
+                    Rc::new(move |_window: &mut Window, cx: &mut App| {
+                        app.update(cx, |app, cx| app.apply_update(cx));
+                    })
+                },
             ))
         } else {
             None

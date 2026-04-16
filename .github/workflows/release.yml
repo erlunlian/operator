@@ -27,9 +27,14 @@ jobs:
       - name: Create DMG
         run: ./script/create-dmg
 
+      - name: Create update zip
+        run: ditto -c -k --keepParent target/release/Operator.app target/release/Operator.zip
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          files: target/release/Operator.dmg
+          files: |
+            target/release/Operator.dmg
+            target/release/Operator.zip
           generate_release_notes: true

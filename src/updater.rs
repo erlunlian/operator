@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GITHUB_REPO: &str = "erlunlian/operator";
@@ -16,9 +18,14 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+#[derive(Clone)]
 pub struct UpdateInfo {
     pub latest_version: String,
+    /// URL to the release page or DMG — used as a user-facing fallback link.
     pub download_url: String,
+    /// URL to a `.zip` of `Operator.app` for in-app auto-update.
+    /// `None` for older releases that only ship a DMG.
+    pub zip_url: Option<String>,
 }
 
 /// Check GitHub releases for a newer version. Runs synchronously (call from background thread).
@@ -64,14 +71,186 @@ pub fn check_for_update(current_version: &str, force: bool) -> Option<UpdateInfo
                     response.tag_name
                 )
             });
+        let zip_url = response
+            .assets
+            .iter()
+            .find(|a| a.name.ends_with(".zip"))
+            .map(|a| a.browser_download_url.clone());
 
         Some(UpdateInfo {
             latest_version: latest.to_string(),
             download_url: dmg_url,
+            zip_url,
         })
     } else {
         None
     }
+}
+
+/// Download the update zip, extract it, and spawn a detached helper
+/// that swaps the `.app` bundle in place and relaunches once this
+/// process exits. The caller should quit the app immediately after
+/// this returns `Ok`.
+///
+/// Runs synchronously (shells out to `curl`/`ditto`) — call from a
+/// background thread.
+pub fn apply_update(info: &UpdateInfo) -> Result<(), String> {
+    let zip_url = info
+        .zip_url
+        .as_deref()
+        .ok_or_else(|| "no zip asset for this release".to_string())?;
+
+    let target_app = current_app_bundle()
+        .ok_or_else(|| "not running from a .app bundle".to_string())?;
+
+    let temp_dir = make_temp_dir()?;
+    let zip_path = temp_dir.join("update.zip");
+    let extract_dir = temp_dir.join("extracted");
+    std::fs::create_dir(&extract_dir).map_err(|e| format!("mkdir extract: {e}"))?;
+
+    download_to_file(zip_url, &zip_path)?;
+
+    let status = std::process::Command::new("ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(&zip_path)
+        .arg(&extract_dir)
+        .status()
+        .map_err(|e| format!("spawn ditto: {e}"))?;
+    if !status.success() {
+        return Err(format!("ditto exited with {status}"));
+    }
+
+    let staged_app = find_app_in(&extract_dir)?;
+    let script_path = temp_dir.join("apply.sh");
+    std::fs::write(&script_path, APPLY_SH).map_err(|e| format!("write apply.sh: {e}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&script_path)
+        .map_err(|e| format!("stat apply.sh: {e}"))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms)
+        .map_err(|e| format!("chmod apply.sh: {e}"))?;
+
+    let pid = std::process::id().to_string();
+    std::process::Command::new("/bin/bash")
+        .arg(&script_path)
+        .arg(&pid)
+        .arg(&staged_app)
+        .arg(&target_app)
+        .arg(&temp_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn apply.sh: {e}"))?;
+
+    Ok(())
+}
+
+/// Helper that waits for the parent PID to exit, then atomically
+/// swaps the app bundle and relaunches. Kept out of band so it
+/// survives the parent's termination.
+const APPLY_SH: &str = r#"#!/bin/bash
+set +e
+PARENT_PID="$1"
+STAGED_APP="$2"
+TARGET_APP="$3"
+TEMP_DIR="$4"
+
+LOG="$TEMP_DIR/apply.log"
+exec > "$LOG" 2>&1
+set -x
+
+# Wait up to 30s for the old app to quit.
+for i in $(seq 1 60); do
+  if ! kill -0 "$PARENT_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+
+BAK="${TARGET_APP}.old"
+if [ -d "$TARGET_APP" ]; then
+  rm -rf "$BAK"
+  if ! mv "$TARGET_APP" "$BAK"; then
+    echo "failed to move old bundle aside"
+    open -n "$TARGET_APP"
+    exit 1
+  fi
+fi
+
+if ! ditto "$STAGED_APP" "$TARGET_APP"; then
+  echo "ditto failed; restoring backup"
+  rm -rf "$TARGET_APP"
+  mv "$BAK" "$TARGET_APP"
+  open -n "$TARGET_APP"
+  exit 1
+fi
+
+xattr -cr "$TARGET_APP" 2>/dev/null || true
+rm -rf "$BAK"
+open -n "$TARGET_APP"
+
+sleep 2
+rm -rf "$TEMP_DIR"
+"#;
+
+/// Walk up from the running executable to find the enclosing
+/// `.app` bundle (e.g. `.../Operator.app/Contents/MacOS/operator`
+/// → `.../Operator.app`). Returns `None` when running a raw
+/// `cargo run` binary.
+fn current_app_bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let mut cur = exe.as_path();
+    while let Some(parent) = cur.parent() {
+        if parent.extension().and_then(|e| e.to_str()) == Some("app") {
+            return Some(parent.to_path_buf());
+        }
+        cur = parent;
+    }
+    None
+}
+
+fn make_temp_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir().join(format!(
+        "operator-update-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&base).map_err(|e| format!("mkdir temp: {e}"))?;
+    Ok(base)
+}
+
+fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(120)))
+        .user_agent("operator-updater")
+        .build()
+        .new_agent();
+    let mut resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("download: {e}"))?;
+    let mut reader = resp.body_mut().as_reader();
+    let mut file = std::fs::File::create(dest).map_err(|e| format!("create file: {e}"))?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| format!("write file: {e}"))?;
+    file.flush().map_err(|e| format!("flush: {e}"))?;
+    Ok(())
+}
+
+fn find_app_in(dir: &Path) -> Result<PathBuf, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("app") {
+            return Ok(path);
+        }
+    }
+    Err(format!("no .app found in {}", dir.display()))
 }
 
 /// Returns true if enough time has passed since the last check.

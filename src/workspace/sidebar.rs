@@ -88,6 +88,8 @@ impl WorkspaceSidebar {
         on_drag_end: Rc<dyn Fn(&mut Window, &mut App)>,
         width: f32,
         update_info: Option<&crate::updater::UpdateInfo>,
+        update_phase: crate::app::UpdatePhase,
+        on_apply_update: Rc<dyn Fn(&mut Window, &mut App)>,
     ) -> Stateful<Div> {
         let on_drag_end2 = on_drag_end.clone();
 
@@ -188,33 +190,48 @@ impl WorkspaceSidebar {
                 }),
         );
 
-        // Update available indicator — compact row below New Workspace
+        // Update available indicator — compact row below New Workspace.
+        // Clicking it downloads the zip asset, swaps the bundle, and
+        // relaunches. Falls back to opening the release page for older
+        // releases that didn't ship a zip.
         if let Some(info) = update_info {
-            let url = info.download_url.clone();
             let version = info.latest_version.clone();
-            sidebar = sidebar.child(
-                div()
-                    .id("update-indicator")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .w_full()
-                    .px_3()
-                    .py_1()
+            let (label, clickable) = match &update_phase {
+                crate::app::UpdatePhase::Idle => {
+                    (format!("v{version} available \u{21BB}"), true)
+                }
+                crate::app::UpdatePhase::Installing => {
+                    (format!("Installing v{version}\u{2026}"), false)
+                }
+                crate::app::UpdatePhase::Error(msg) => {
+                    let short = msg.lines().next().unwrap_or("unknown");
+                    (format!("Update failed ({short}) \u{2014} retry"), true)
+                }
+            };
+            let apply = on_apply_update.clone();
+            let mut row = div()
+                .id("update-indicator")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .w_full()
+                .px_3()
+                .py_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors::accent())
+                        .child(label),
+                );
+            if clickable {
+                row = row
                     .cursor_pointer()
                     .hover(|s| s.bg(colors::surface_hover()))
-                    .on_click(move |_, _window, cx| {
-                        cx.open_url(&url);
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors::accent())
-                            .child(format!("v{version} available \u{2197}")),
-                    ),
-            );
+                    .on_click(move |_, window, cx| apply(window, cx));
+            }
+            sidebar = sidebar.child(row);
         }
 
         sidebar

@@ -62,6 +62,12 @@ impl TextInput {
         self.selection = None;
     }
 
+    pub fn set_text(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.cursor = self.text.len();
+        self.selection = None;
+    }
+
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
     }

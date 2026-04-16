@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -878,6 +879,53 @@ impl OperatorApp {
         });
     }
 
+    /// Cmd+L — edit the PR URL for the currently-open PR review workspace.
+    /// No-op when the active workspace isn't a PR review.
+    fn edit_pr_link(
+        &mut self,
+        _: &EditPrLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_url = {
+            let ws = self.active_workspace().read(cx);
+            ws.pr_review.as_ref().map(|s| s.url.clone())
+        };
+        let Some(url) = current_url else {
+            return;
+        };
+        let prev = window.focused(cx);
+        self.command_center.update(cx, |cc, cx| {
+            cc.previous_focus = prev;
+            cc.show_pr_review_mode_with_prefill(url, cx);
+        });
+    }
+
+    /// Cmd+Shift+L — open a new blank workspace and immediately show the PR
+    /// review input so the user can paste a URL.
+    fn new_pr_review(
+        &mut self,
+        _: &NewPrReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only push a new workspace if the current one isn't already empty —
+        // otherwise a fresh Cmd+Shift+L on the welcome screen would waste a tab.
+        let active_is_empty = self.active_workspace().read(cx).is_empty_welcome();
+        if !active_is_empty {
+            let new_ws = cx.new(|cx| Workspace::new_empty(cx));
+            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
+            self.workspaces.push(new_ws);
+            self.active_workspace_ix = self.workspaces.len() - 1;
+            cx.notify();
+        }
+        let prev = window.focused(cx);
+        self.command_center.update(cx, |cc, cx| {
+            cc.previous_focus = prev;
+            cc.show_pr_review_mode(cx);
+        });
+    }
+
     fn find_file(
         &mut self,
         _: &FindFile,
@@ -911,6 +959,17 @@ impl OperatorApp {
                 cc.dismiss(cx);
             });
             self.open_directory(dir, cx);
+            return;
+        }
+
+        // Check for pending PR review URL
+        let pending_pr_url = cc.read(cx).pending_pr_url.clone();
+        if let Some(url) = pending_pr_url {
+            cc.update(cx, |cc, cx| {
+                cc.pending_pr_url = None;
+                cc.dismiss(cx);
+            });
+            self.start_pr_review(url, cx);
             return;
         }
 
@@ -950,6 +1009,11 @@ impl OperatorApp {
                 CommandAction::CloneRepo => {
                     self.command_center.update(cx, |cc, cx| {
                         cc.show_clone_mode(cx);
+                    });
+                }
+                CommandAction::ReviewPr => {
+                    self.command_center.update(cx, |cc, cx| {
+                        cc.show_pr_review_mode(cx);
                     });
                 }
                 CommandAction::NewTerminalTab => {
@@ -1034,6 +1098,50 @@ impl OperatorApp {
         }
     }
 
+    /// Create a PR review workspace from a URL. Reuses the current workspace
+    /// if it's a blank welcome or already a PR review (so "change URL" swaps
+    /// in-place); otherwise pushes a new workspace.
+    pub fn start_pr_review(&mut self, url: String, cx: &mut Context<Self>) {
+        let ws = self.active_workspace().clone();
+        let reuse = {
+            let w = ws.read(cx);
+            w.is_empty_welcome() || w.is_pr_review()
+        };
+        if reuse {
+            self.cache_editor_files(cx);
+            self.cache_right_panel_state(cx);
+            ws.update(cx, |ws, cx| ws.init_pr_review(url, cx));
+        } else {
+            let new_ws = cx.new(|cx| {
+                let mut ws = Workspace::new_empty(cx);
+                ws.init_pr_review(url, cx);
+                ws
+            });
+            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
+            self.workspaces.push(new_ws);
+            self.active_workspace_ix = self.workspaces.len() - 1;
+        }
+        // PR review workspaces don't use the right panel at all.
+        self.right_panel.update(cx, |rp, cx| {
+            rp.diff_panel.update(cx, |panel, cx| {
+                let split = panel.is_split_view();
+                *panel = GitDiffPanel::empty(cx);
+                panel.set_split_view(split);
+                cx.notify();
+            });
+            rp.pr_diff_panel.update(cx, |panel, cx| {
+                let split = panel.is_split_view();
+                *panel = PrDiffPanel::empty(cx);
+                panel.set_split_view(split);
+                cx.notify();
+            });
+            rp.editor = None;
+            cx.notify();
+        });
+        self.diff_watcher_task = None;
+        cx.notify();
+    }
+
     /// Open a directory in the active workspace (or set it if empty).
     pub fn open_directory(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         // Track in recent projects (update cached copy and persist)
@@ -1043,7 +1151,7 @@ impl OperatorApp {
         self.cache_editor_files(cx);
 
         let ws = self.active_workspace().clone();
-        if !ws.read(cx).has_directory() {
+        if ws.read(cx).is_empty_welcome() {
             ws.update(cx, |ws, cx| ws.set_directory(dir.clone(), cx));
         } else {
             // Create a new workspace for this directory
@@ -1066,7 +1174,7 @@ impl OperatorApp {
 
     /// Switch to a different workspace, caching editor state and restoring the target's files.
     fn switch_to_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix == self.active_workspace_ix {
+        if ix >= self.workspaces.len() || ix == self.active_workspace_ix {
             return;
         }
         self.cache_editor_files(cx);
@@ -1219,6 +1327,7 @@ impl OperatorApp {
 
     fn render_center(&self, center_focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let ws_entity = self.active_workspace().clone();
+        let app_entity = cx.entity().clone();
         let ws = ws_entity.read(cx);
 
         // When the sidebar is collapsed, the tab bar is the leftmost element
@@ -1226,7 +1335,14 @@ impl OperatorApp {
         // 70px for traffic lights + 28px for the sidebar toggle button
         let tab_bar_left_inset = if self.sidebar_collapsed { px(98.0) } else { px(0.0) };
 
-        if let Some(layout_entity) = &ws.layout {
+        if let Some(pr_state) = ws.pr_review.as_ref() {
+            self.render_pr_review_center(
+                pr_state,
+                tab_bar_left_inset,
+                ws_entity.clone(),
+                app_entity,
+            )
+        } else if let Some(layout_entity) = &ws.layout {
             let layout = layout_entity.read(cx);
             layout.render_tree(layout_entity, center_focused, tab_bar_left_inset, cx)
         } else {
@@ -1235,10 +1351,186 @@ impl OperatorApp {
         }
     }
 
+    fn render_pr_review_center(
+        &self,
+        state: &crate::workspace::pr_review::PrReviewState,
+        left_inset: Pixels,
+        workspace: Entity<Workspace>,
+        app: Entity<Self>,
+    ) -> AnyElement {
+        use crate::workspace::pr_review::PrReviewStatus;
+
+        let header_title = state
+            .pr
+            .as_ref()
+            .map(|p| p.short())
+            .unwrap_or_else(|| "PR Review".to_string());
+        let header_subtitle = state
+            .title
+            .clone()
+            .unwrap_or_else(|| state.url.clone());
+        let is_loading = matches!(state.status, PrReviewStatus::Loading(_));
+
+        let ws_for_refresh = workspace.clone();
+        let refresh_button = div()
+            .id("pr-review-refresh")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(24.0))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()))
+            .when(is_loading, |d| d.opacity(0.4))
+            .child(
+                div()
+                    .font_family(util::ICON_FONT)
+                    .text_color(colors::text_muted())
+                    .text_xs()
+                    .child("\u{f021}"),
+            )
+            .on_click(move |_, _window, cx| {
+                ws_for_refresh.update(cx, |ws, cx| {
+                    ws.refresh_pr_review(cx);
+                });
+            });
+
+        let app_for_edit = app.clone();
+        let edit_button = div()
+            .id("pr-review-edit-url")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(24.0))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|s| s.bg(colors::surface_hover()))
+            .child(
+                div()
+                    .font_family(util::ICON_FONT)
+                    .text_color(colors::text_muted())
+                    .text_xs()
+                    .child("\u{f040}"),
+            )
+            .on_click(move |_, _window, cx| {
+                app_for_edit.update(cx, |app, cx| {
+                    app.command_center.update(cx, |cc, cx| {
+                        cc.show_pr_review_mode(cx);
+                    });
+                });
+            });
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .w_full()
+            .h(px(36.0))
+            .px_3()
+            .pl(left_inset + px(12.0))
+            .bg(colors::surface())
+            .border_b_1()
+            .border_color(colors::border())
+            .child(
+                div()
+                    .font_family(util::ICON_FONT)
+                    .text_color(colors::text_muted())
+                    .text_sm()
+                    .child("\u{e726}"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors::text())
+                    .child(header_title),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_x_hidden()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .overflow_x_hidden()
+                            .child(header_subtitle),
+                    ),
+            )
+            .child(refresh_button)
+            .child(edit_button);
+
+        let body: AnyElement = match &state.status {
+            PrReviewStatus::Loading(msg) => div()
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(colors::bg())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(colors::text())
+                        .child("Preparing pull request…"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .child(msg.clone()),
+                )
+                .into_any_element(),
+            PrReviewStatus::Error(msg) => div()
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(colors::bg())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(colors::text())
+                        .child("Couldn't load this PR"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .max_w(px(520.0))
+                        .child(msg.clone()),
+                )
+                .into_any_element(),
+            PrReviewStatus::Ready => div()
+                .flex()
+                .flex_1()
+                .size_full()
+                .overflow_hidden()
+                .child(state.panel.clone())
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(colors::bg())
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
     fn render_welcome_screen(&self, cx: &mut Context<Self>) -> AnyElement {
         let app_entity = cx.entity().clone();
         let app_open = cx.entity().clone();
         let app_clone = cx.entity().clone();
+        let app_pr = cx.entity().clone();
 
         let recent_paths = self.recent_projects.paths.clone();
 
@@ -1349,6 +1641,45 @@ impl OperatorApp {
                             app_clone.update(cx, |app, cx| {
                                 app.command_center.update(cx, |cc, cx| {
                                     cc.show_clone_mode(cx);
+                                });
+                            });
+                        }),
+                )
+                // Review PR card
+                .child(
+                    div()
+                        .id("welcome-review-pr")
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .w(px(180.0))
+                        .h(px(90.0))
+                        .rounded_lg()
+                        .bg(colors::surface())
+                        .border_1()
+                        .border_color(colors::border())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(colors::surface_hover()))
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_family(util::ICON_FONT)
+                                .text_color(colors::text_muted())
+                                .text_base()
+                                .child("\u{e726}"), // nf-dev-git_pull_request
+                        )
+                        .child(
+                            div()
+                                .text_color(colors::text())
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Review PR"),
+                        )
+                        .on_click(move |_, _window, cx| {
+                            app_pr.update(cx, |app, cx| {
+                                app.command_center.update(cx, |cc, cx| {
+                                    cc.show_pr_review_mode(cx);
                                 });
                             });
                         }),
@@ -1570,10 +1901,12 @@ impl Render for OperatorApp {
             None
         };
 
+        let active_is_pr_review = self.active_workspace().read(cx).is_pr_review();
         let center_focused = self.focus_region == FocusRegion::Center
-            || self.right_panel_collapsed;
+            || self.right_panel_collapsed
+            || active_is_pr_review;
         let center = self.render_center(center_focused, cx);
-        let right_panel = if !self.right_panel_collapsed {
+        let right_panel = if !self.right_panel_collapsed && !active_is_pr_review {
             Some(self.right_panel.clone())
         } else {
             None
@@ -1606,6 +1939,8 @@ impl Render for OperatorApp {
             .on_action(cx.listener(Self::toggle_command_center))
             .on_action(cx.listener(Self::find_file))
             .on_action(cx.listener(Self::search_workspace))
+            .on_action(cx.listener(Self::edit_pr_link))
+            .on_action(cx.listener(Self::new_pr_review))
             .on_action(cx.listener(Self::toggle_debug_panel))
             .on_action(cx.listener(Self::request_quit))
             .on_action(cx.listener(Self::check_for_updates_manual))
@@ -1788,8 +2123,10 @@ impl Render for OperatorApp {
             );
         }
 
-        // Right panel toggle (always visible, top-right)
-        root = root.child(
+        // Right panel toggle (hidden on PR review workspaces — they don't use
+        // the right panel).
+        if !active_is_pr_review {
+            root = root.child(
             div()
                 .id("toggle-right-panel-btn")
                 .absolute()
@@ -1817,7 +2154,8 @@ impl Render for OperatorApp {
                         .text_size(px(14.0))
                         .child("\u{F06FE}"), // nf-cod-layout_sidebar_right
                 ),
-        );
+            );
+        }
 
         // Debug overlay (update counts and subsystem data only when visible)
         {

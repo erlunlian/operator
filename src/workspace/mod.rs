@@ -1,5 +1,6 @@
-pub mod workspace;
+pub mod pr_review;
 pub mod sidebar;
+pub mod workspace;
 
-pub use workspace::Workspace;
 pub use sidebar::WorkspaceSidebar;
+pub use workspace::Workspace;

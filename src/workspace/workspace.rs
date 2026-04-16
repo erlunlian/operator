@@ -1,8 +1,10 @@
 use gpui::*;
 use std::path::PathBuf;
 
+use crate::git::PrDiffPanel;
 use crate::pane::PaneGroup;
 use crate::terminal::terminal::DetectedClaudeStatus;
+use crate::workspace::pr_review::{self, PrReviewState, PrReviewStatus};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClaudeStatus {
@@ -46,6 +48,9 @@ pub struct Workspace {
     pub cached_sidebar_collapsed: Option<bool>,
     /// Whether the right panel was collapsed when switching away.
     pub cached_right_panel_collapsed: Option<bool>,
+    /// If set, this workspace is a PR review (no terminals, no user-chosen
+    /// directory) and should render its `PrDiffPanel` as the main view.
+    pub pr_review: Option<PrReviewState>,
 }
 
 impl Workspace {
@@ -65,6 +70,7 @@ impl Workspace {
             cached_right_panel_width: None,
             cached_sidebar_collapsed: None,
             cached_right_panel_collapsed: None,
+            pr_review: None,
         }
     }
 
@@ -82,7 +88,114 @@ impl Workspace {
             cached_right_panel_width: None,
             cached_sidebar_collapsed: None,
             cached_right_panel_collapsed: None,
+            pr_review: None,
         }
+    }
+
+    /// Turn this workspace into a PR review workspace and kick off the
+    /// background clone+checkout task. Safe to call on an empty workspace,
+    /// an existing PR review (to switch URL), or after a refresh.
+    pub fn init_pr_review(&mut self, url: String, cx: &mut Context<Self>) {
+        // Reuse the existing panel entity when switching URLs / refreshing so
+        // the user's split-view preference and observers survive.
+        let panel = match self.pr_review.take() {
+            Some(existing) => {
+                existing.panel.update(cx, |p, cx| {
+                    let split = p.is_split_view();
+                    *p = PrDiffPanel::empty(cx);
+                    p.set_split_view(split);
+                    cx.notify();
+                });
+                existing.panel
+            }
+            None => {
+                let panel = cx.new(|cx| PrDiffPanel::empty(cx));
+                cx.observe(&panel, |_this, _p, cx| cx.notify()).detach();
+                panel
+            }
+        };
+
+        let preview = pr_review::parse_pr_url(&url).map(|p| p.short());
+        self.name = SharedString::from(
+            preview
+                .clone()
+                .unwrap_or_else(|| "PR Review".to_string()),
+        );
+        self.directory = None;
+        self.git_branch = None;
+        self.layout = None;
+        self.pr_review = Some(PrReviewState {
+            url: url.clone(),
+            panel,
+            status: PrReviewStatus::Loading("Preparing clone…".into()),
+            work_dir: None,
+            pr: None,
+            title: None,
+        });
+        cx.notify();
+
+        let url_for_task = url;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { pr_review::setup_pr_blocking(&url_for_task) })
+                .await;
+            let _ = cx.update(|cx| {
+                let _ = this.update(cx, |ws, cx| {
+                    ws.finalize_pr_review(result, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Re-run the setup pipeline for the current PR (fetch + re-checkout).
+    /// No-op if this workspace isn't a PR review or is already loading.
+    pub fn refresh_pr_review(&mut self, cx: &mut Context<Self>) {
+        let url = match self.pr_review.as_ref() {
+            Some(s) if !matches!(s.status, PrReviewStatus::Loading(_)) => s.url.clone(),
+            _ => return,
+        };
+        self.init_pr_review(url, cx);
+    }
+
+    /// Apply the background setup result to this workspace's PR review state.
+    fn finalize_pr_review(
+        &mut self,
+        result: Result<pr_review::PrReviewReady, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let new_name: Option<String> = {
+            let Some(state) = self.pr_review.as_mut() else {
+                return;
+            };
+            match result {
+                Ok(ready) => {
+                    let work_dir = ready.work_dir.clone();
+                    state.panel.update(cx, |panel, cx| {
+                        let split = panel.is_split_view();
+                        *panel = PrDiffPanel::new(work_dir.clone(), cx);
+                        panel.set_split_view(split);
+                        cx.notify();
+                    });
+                    state.status = PrReviewStatus::Ready;
+                    state.work_dir = Some(work_dir);
+                    state.title =
+                        (!ready.title.is_empty()).then_some(ready.title.clone());
+                    let short = ready.pr.short();
+                    state.pr = Some(ready.pr);
+                    Some(short)
+                }
+                Err(msg) => {
+                    state.status = PrReviewStatus::Error(msg);
+                    None
+                }
+            }
+        };
+        if let Some(name) = new_name {
+            self.name = SharedString::from(name);
+        }
+        cx.notify();
     }
 
     /// Set the directory for this workspace, creating the terminal layout.
@@ -103,6 +216,16 @@ impl Workspace {
 
     pub fn has_directory(&self) -> bool {
         self.directory.is_some()
+    }
+
+    /// True for a freshly-created workspace that has no directory and no PR
+    /// review in progress — i.e. the welcome screen is being shown.
+    pub fn is_empty_welcome(&self) -> bool {
+        self.directory.is_none() && self.pr_review.is_none()
+    }
+
+    pub fn is_pr_review(&self) -> bool {
+        self.pr_review.is_some()
     }
 
     fn detect_git_branch(dir: &PathBuf) -> Option<String> {

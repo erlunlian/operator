@@ -14,6 +14,8 @@ pub enum CommandCenterMode {
     Commands,
     /// Clone repo: user types a git URL, then Enter clones it.
     CloneRepo,
+    /// PR review: user types a GitHub PR URL, then Enter opens it in a new workspace.
+    PrReview,
     /// Workspace grep search: user types a query, results show file:line matches.
     SearchWorkspace,
     /// File name search (Cmd+P): user types a name, results show matching file paths.
@@ -32,6 +34,7 @@ pub struct CommandEntry {
 pub enum CommandAction {
     OpenProject,
     CloneRepo,
+    ReviewPr,
     NewTerminalTab,
     ToggleFilesPanel,
     ToggleSidebar,
@@ -70,6 +73,8 @@ pub struct CommandCenter {
     pub input: Entity<TextInput>,
     /// Set after a clone completes — the app reads this.
     pub cloned_dir: Option<PathBuf>,
+    /// Set when the user submits a PR review URL — the app reads this.
+    pub pending_pr_url: Option<String>,
     /// Set when the user presses Enter on a command — the app reads and clears this.
     pub pending_action: Option<CommandAction>,
     /// Status message shown during clone.
@@ -184,6 +189,7 @@ impl CommandCenter {
             commands: Self::default_commands(),
             input,
             cloned_dir: None,
+            pending_pr_url: None,
             pending_action: None,
             status_message: None,
             cloning: false,
@@ -229,6 +235,11 @@ impl CommandCenter {
                 label: "Clone Repository".into(),
                 description: "Clone a git repository".into(),
                 action: CommandAction::CloneRepo,
+            },
+            CommandEntry {
+                label: "Review Pull Request".into(),
+                description: "Open a GitHub PR for code review".into(),
+                action: CommandAction::ReviewPr,
             },
             CommandEntry {
                 label: "New Terminal Tab".into(),
@@ -308,6 +319,38 @@ impl CommandCenter {
         cx.notify();
     }
 
+    pub fn show_pr_review_mode(&mut self, cx: &mut Context<Self>) {
+        self.show_pr_review_mode_with_prefill(String::new(), cx);
+    }
+
+    /// Open PR Review mode with `prefill` in the input (used by Cmd+L on an
+    /// existing PR review so the user can edit the current URL).
+    pub fn show_pr_review_mode_with_prefill(
+        &mut self,
+        prefill: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.visible = true;
+        self.reset_state(cx);
+        self.mode = CommandCenterMode::PrReview;
+        self.input.update(cx, |inp, _cx| {
+            inp.set_placeholder(
+                "Paste a GitHub PR URL (e.g. https://github.com/user/repo/pull/123)...",
+            );
+        });
+        if !prefill.is_empty() {
+            // reset_state defers clearing the input; defer the set_text so it
+            // lands after the clear.
+            let input = self.input.clone();
+            let text = prefill.clone();
+            cx.defer(move |cx| {
+                input.update(cx, |inp, _cx| inp.set_text(&text));
+            });
+            self.query = prefill;
+        }
+        cx.notify();
+    }
+
     pub fn show_workspace_search_mode(&mut self, cx: &mut Context<Self>) {
         self.visible = true;
         self.reset_state(cx);
@@ -336,7 +379,7 @@ impl CommandCenter {
             CommandCenterMode::Commands => self.filtered_commands().len(),
             CommandCenterMode::SearchWorkspace => self.search_results.len(),
             CommandCenterMode::FileSearch => self.file_results.len(),
-            CommandCenterMode::CloneRepo => 0,
+            CommandCenterMode::CloneRepo | CommandCenterMode::PrReview => 0,
         }
     }
 
@@ -381,6 +424,20 @@ impl CommandCenter {
             CommandCenterMode::CloneRepo => {
                 let url = self.query.clone();
                 self.clone_repo(url, cx);
+            }
+            CommandCenterMode::PrReview => {
+                let url = self.query.trim().to_string();
+                if url.is_empty() {
+                    return;
+                }
+                if crate::workspace::pr_review::parse_pr_url(&url).is_none() {
+                    self.status_message = Some(
+                        "Not a GitHub PR URL. Try https://github.com/owner/repo/pull/123".into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.pending_pr_url = Some(url);
             }
             CommandCenterMode::SearchWorkspace => {
                 if !self.search_results.is_empty() {
@@ -1134,6 +1191,21 @@ impl Render for CommandCenter {
                             .text_sm()
                             .text_color(colors::text_muted())
                             .child("Paste a git URL and press Enter to clone"),
+                    );
+                }
+            }
+            CommandCenterMode::PrReview => {
+                if self.query.is_empty() && self.status_message.is_none() {
+                    modal = modal.child(
+                        div()
+                            .px_4()
+                            .py_6()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_sm()
+                            .text_color(colors::text_muted())
+                            .child("Paste a GitHub PR URL and press Enter"),
                     );
                 }
             }

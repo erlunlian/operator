@@ -401,6 +401,7 @@ impl WorkspaceSidebar {
                     .hover(|s| s.bg(colors::surface_hover()).text_color(colors::text()))
                     .cursor_pointer()
                     .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
                         on_close(close_ix, window, cx);
                     })
                     .child(

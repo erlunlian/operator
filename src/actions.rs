@@ -20,6 +20,8 @@ actions!(
         FindFile,
         FindInFile,
         SearchWorkspace,
+        EditPrLink,
+        NewPrReview,
         Quit,
         ToggleDebugPanel,
         OpenDirectory,

@@ -100,6 +100,8 @@ fn main() {
             KeyBinding::new("cmd-shift-f", SearchWorkspace, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
             KeyBinding::new("cmd-k", ToggleCommandCenter, None),
+            KeyBinding::new("cmd-l", EditPrLink, None),
+            KeyBinding::new("cmd-shift-l", NewPrReview, None),
             KeyBinding::new("cmd-w", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
             KeyBinding::new("escape", crate::settings::settings_panel::CloseSettingsWindow, Some("SettingsPanel")),
             KeyBinding::new("cmd-o", OpenDirectory, None),

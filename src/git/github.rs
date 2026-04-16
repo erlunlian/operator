@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Resolve the `gh` binary path, checking PATH first, then common install locations.
-fn gh_bin() -> &'static str {
+pub fn gh_bin() -> &'static str {
     use std::sync::OnceLock;
     static GH: OnceLock<String> = OnceLock::new();
     GH.get_or_init(|| {

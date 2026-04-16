@@ -1,14 +1,17 @@
 use gpui::*;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Direction, Line, Point as GridPoint};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Term, TermMode};
 use regex::Regex;
+use crate::actions::FindInFile;
 use crate::terminal::terminal::{alac_color_to_gpui, JsonListener, TerminalModel};
 use crate::theme::colors;
 
@@ -73,6 +76,15 @@ pub struct TerminalView {
     _autoscroll_task: Option<Task<()>>,
     /// Last known mouse Y (window coords) during a selection drag.
     last_drag_mouse_y: Option<f32>,
+    /// Cmd+F search state.
+    search_active: bool,
+    search_query: String,
+    search_input: Option<Entity<crate::text_input::TextInput>>,
+    /// Matches as (line_start, col_start, line_end, col_end) in grid coords.
+    /// `line` is `alacritty_terminal::index::Line(i32)`: negative = scrollback,
+    /// `0..screen_lines` = viewport when `display_offset == 0`.
+    search_matches: Vec<(i32, usize, i32, usize)>,
+    search_match_ix: usize,
 }
 
 impl TerminalView {
@@ -110,6 +122,11 @@ impl TerminalView {
             hovered_url: None,
             _autoscroll_task: None,
             last_drag_mouse_y: None,
+            search_active: false,
+            search_query: String::new(),
+            search_input: None,
+            search_matches: Vec::new(),
+            search_match_ix: 0,
         }
     }
 
@@ -359,6 +376,138 @@ impl TerminalView {
         None
     }
 
+    // ── Cmd+F search ──
+
+    /// Recompute matches for the current query against the full grid
+    /// (scrollback + viewport). Results are stored and reused for highlighting
+    /// and `Enter`/`Shift+Enter` navigation.
+    const MAX_SEARCH_MATCHES: usize = 10_000;
+
+    fn update_search_matches(&mut self, cx: &mut Context<Self>) {
+        self.search_matches.clear();
+        if self.search_query.is_empty() {
+            self.search_match_ix = 0;
+            return;
+        }
+        // Alacritty's search engine expects a regex; escape so we do literal
+        // (substring) matching. Case-insensitivity is handled inside
+        // `RegexSearch::new` when the query has no uppercase chars.
+        let escaped = regex::escape(&self.search_query);
+        let Ok(mut regex) = RegexSearch::new(&escaped) else {
+            self.search_match_ix = 0;
+            return;
+        };
+
+        let term_model = self.terminal.read(cx);
+        let term = term_model.term.lock();
+        let grid = term.grid();
+        let start = GridPoint::new(grid.topmost_line(), Column(0));
+        let end = GridPoint::new(grid.bottommost_line(), grid.last_column());
+
+        let iter = RegexIter::new(start, end, Direction::Right, &*term, &mut regex);
+        for (i, m) in iter.enumerate() {
+            if i >= Self::MAX_SEARCH_MATCHES {
+                break;
+            }
+            let s = *m.start();
+            let e = *m.end();
+            self.search_matches.push((s.line.0, s.column.0, e.line.0, e.column.0));
+        }
+
+        if self.search_matches.is_empty() {
+            self.search_match_ix = 0;
+        } else if self.search_match_ix >= self.search_matches.len() {
+            self.search_match_ix = self.search_matches.len() - 1;
+        }
+    }
+
+    fn jump_to_current_match(&self, cx: &mut Context<Self>) {
+        let Some(&(line_start, col_start, _, _)) = self.search_matches.get(self.search_match_ix)
+        else {
+            return;
+        };
+        let term_model = self.terminal.read(cx);
+        let mut term = term_model.term.lock();
+        term.scroll_to_point(GridPoint::new(Line(line_start), Column(col_start)));
+    }
+
+    fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let n = self.search_matches.len();
+        self.search_match_ix = if forward {
+            (self.search_match_ix + 1) % n
+        } else {
+            (self.search_match_ix + n - 1) % n
+        };
+        self.jump_to_current_match(cx);
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_active = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_match_ix = 0;
+
+        let next_entity = cx.entity().clone();
+        let cancel_entity = cx.entity().clone();
+
+        let input = cx.new(|cx| {
+            let mut inp = crate::text_input::TextInput::new(cx);
+            inp.set_placeholder("Search terminal...");
+
+            inp.set_on_submit(Rc::new(move |_text, _window, cx| {
+                next_entity.update(cx, |view, cx| {
+                    view.step_match(true, cx);
+                    cx.notify();
+                });
+            }));
+
+            inp.set_on_cancel(Rc::new(move |window, cx| {
+                cancel_entity.update(cx, |view, cx| {
+                    view.close_search(window);
+                    cx.notify();
+                });
+            }));
+
+            inp
+        });
+
+        cx.observe(&input, |view, input, cx| {
+            let new_text = input.read(cx).text.clone();
+            if view.search_query != new_text {
+                view.search_query = new_text;
+                view.search_match_ix = 0;
+                view.update_search_matches(cx);
+                view.jump_to_current_match(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+
+        self.search_input = Some(input.clone());
+        input.read(cx).focus(window);
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_input = None;
+        self.search_matches.clear();
+        self.search_match_ix = 0;
+        self.focus_handle.focus(window);
+    }
+
+    fn handle_find(&mut self, _: &FindInFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_active {
+            self.close_search(window);
+        } else {
+            self.open_search(window, cx);
+        }
+        cx.notify();
+    }
 }
 
 impl Render for TerminalView {
@@ -367,8 +516,14 @@ impl Render for TerminalView {
             self.has_been_focused = true;
             self.focus_handle.focus(window);
         }
-        let terminal = self.terminal.read(cx);
-        let term = terminal.term.clone();
+
+        // Recompute matches before borrowing anything from `cx`, so highlights
+        // track live PTY output while the search bar is open.
+        if self.search_active {
+            self.update_search_matches(cx);
+        }
+
+        let term = self.terminal.read(cx).term.clone();
 
         let terminal_entity = self.terminal.clone();
         let last_size = self.last_size.clone();
@@ -382,6 +537,11 @@ impl Render for TerminalView {
         let sel_end = self.selection_end;
         let hovered_url = self.hovered_url.clone();
         let show_pointer = self.hovered_url.is_some();
+
+        let search_active = self.search_active;
+        let search_match_ix = self.search_match_ix;
+        let search_matches: Rc<Vec<(i32, usize, i32, usize)>> =
+            Rc::new(self.search_matches.clone());
 
         let grid_canvas = canvas(
             // Prepaint: resize detection
@@ -411,6 +571,7 @@ impl Render for TerminalView {
             // Paint: render the terminal grid using Alacritty's display_iter
             {
                 let term = term.clone();
+                let search_matches = search_matches.clone();
                 move |bounds: Bounds<Pixels>, _prepaint: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
                     // Selection range (normalized so lo <= hi)
                     let selection = match (sel_start, sel_end) {
@@ -419,11 +580,32 @@ impl Render for TerminalView {
                     };
                     let sel_bg = colors::accent();
                     let sel_fg = colors::bg();
+                    // Search match highlight colors (yellow, matching the terminal
+                    // palette's Yellow / BrightBlack for active / inactive).
+                    let active_match_bg = rgb(0xf9e2af);
+                    let inactive_match_bg = rgb(0x585b70);
+                    let match_fg = colors::bg();
                     let term_lock = term.lock();
                     let content = term_lock.renderable_content();
                     let display_offset = content.display_offset;
                     let cursor = content.cursor;
                     let term_colors = content.colors;
+
+                    // Prefilter matches to those whose line range overlaps the viewport —
+                    // keeps per-cell highlighting O(visible matches), not O(total matches).
+                    let visible_matches: Vec<(i32, usize, i32, usize, bool)> = if search_active {
+                        let screen_lines = term_lock.grid().screen_lines() as i32;
+                        let top = -(display_offset as i32);
+                        let bot = screen_lines - 1 - display_offset as i32;
+                        search_matches
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (ls, _, le, _))| *le >= top && *ls <= bot)
+                            .map(|(ix, &(ls, cs, le, ce))| (ls, cs, le, ce, ix == search_match_ix))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
 
                     let bg_color = colors::bg();
                     let line_height = px(CELL_HEIGHT_PX);
@@ -503,8 +685,38 @@ impl Render for TerminalView {
                                 true
                             });
 
-                            let fg = if is_cursor { colors::surface() } else if is_selected { sel_fg } else { rc.fg };
-                            let cell_bg = if is_cursor { colors::accent() } else if is_selected { sel_bg } else { rc.bg };
+                            // Cell position in grid (absolute Line) coords.
+                            let grid_line = *screen_row as i32 - display_offset as i32;
+                            // Some(true) = active match, Some(false) = inactive.
+                            let match_kind: Option<bool> = visible_matches.iter().find_map(
+                                |&(ls, cs, le, ce, is_active)| {
+                                    if grid_line < ls || grid_line > le { return None; }
+                                    if grid_line == ls && rc.col < cs { return None; }
+                                    if grid_line == le && rc.col > ce { return None; }
+                                    Some(is_active)
+                                },
+                            );
+
+                            let fg = if is_cursor {
+                                colors::surface()
+                            } else if is_selected {
+                                sel_fg
+                            } else if match_kind.is_some() {
+                                match_fg
+                            } else {
+                                rc.fg
+                            };
+                            let cell_bg = if is_cursor {
+                                colors::accent()
+                            } else if is_selected {
+                                sel_bg
+                            } else {
+                                match match_kind {
+                                    Some(true) => active_match_bg,
+                                    Some(false) => inactive_match_bg,
+                                    None => rc.bg,
+                                }
+                            };
 
                             if cell_bg != bg_color {
                                 match &mut current_bg {
@@ -584,6 +796,7 @@ impl Render for TerminalView {
             .relative()
             .flex()
             .flex_1()
+            .min_h(px(0.0))
             .size_full()
             .bg(colors::bg())
             .overflow_hidden()
@@ -592,7 +805,7 @@ impl Render for TerminalView {
         if show_pointer {
             container = container.cursor(CursorStyle::PointingHand);
         }
-        container
+        let container = container
             // ── Mouse ──
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.focus(window);
@@ -883,6 +1096,63 @@ impl Render for TerminalView {
                     term.write_str_to_pty(&joined);
                     term.write_to_pty(b"\x1b[201~");
                 }
-            }))
+            }));
+
+        // Search bar (Cmd+F) — rendered above the terminal grid when active.
+        let search_bar = if self.search_active {
+            self.search_input.as_ref().map(|search_input| {
+                let match_count = self.search_matches.len();
+                let match_info = if self.search_query.is_empty() {
+                    String::new()
+                } else if match_count == 0 {
+                    "No matches".to_string()
+                } else if match_count >= Self::MAX_SEARCH_MATCHES {
+                    format!("{}/{}+", self.search_match_ix + 1, match_count)
+                } else {
+                    format!("{}/{}", self.search_match_ix + 1, match_count)
+                };
+
+                div()
+                    .id("terminal-search-bar")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .bg(colors::surface())
+                    .border_b_1()
+                    .border_color(colors::border())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .pl_2()
+                            .child("Find:"),
+                    )
+                    .child(div().flex_1().child(search_input.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .pr_2()
+                            .child(match_info),
+                    )
+            })
+        } else {
+            None
+        };
+
+        let mut root = div()
+            .key_context("Terminal")
+            .on_action(cx.listener(Self::handle_find))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(colors::bg())
+            .overflow_hidden();
+        if let Some(bar) = search_bar {
+            root = root.child(bar);
+        }
+        root.child(container)
     }
 }

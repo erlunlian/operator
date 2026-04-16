@@ -97,6 +97,7 @@ fn main() {
             KeyBinding::new("cmd-f", FindInFile, Some("FileEditor")),
             KeyBinding::new("cmd-f", FindInFile, Some("GitDiffPanel")),
             KeyBinding::new("cmd-f", FindInFile, Some("PrDiffPanel")),
+            KeyBinding::new("cmd-f", FindInFile, Some("Terminal")),
             KeyBinding::new("cmd-p", FindFile, None),
             KeyBinding::new("cmd-shift-f", SearchWorkspace, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),

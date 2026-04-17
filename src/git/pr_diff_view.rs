@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use super::diff_model::*;
 use super::git_repo::GitRepo;
-use super::github::{self, GhStatus, PrInfo, PrReviewComment};
+use super::github::{self, CheckKind, GhStatus, MergeMethod, PrInfo, PrReviewComment};
 use super::markdown;
 use crate::actions::FindInFile;
 use crate::text_input::TextInput;
@@ -51,6 +51,17 @@ fn comment_bg() -> Rgba {
 }
 fn comment_border() -> Rgba {
     rgba(0x89b4fa40)
+}
+
+/// Icon char (Nerd Font) + color for a check's normalized state.
+fn check_icon_style(kind: CheckKind) -> (&'static str, Rgba) {
+    match kind {
+        // nf-fa-check, nf-fa-close, nf-fa-dot_circle_o, nf-fa-minus
+        CheckKind::Success => ("\u{f00c}", colors::diff_added()),
+        CheckKind::Failure => ("\u{f00d}", colors::diff_removed()),
+        CheckKind::InProgress => ("\u{f192}", rgb(0xf9e2af)),
+        CheckKind::Skipped => ("\u{f068}", colors::text_muted()),
+    }
 }
 
 /// Merge potentially-overlapping highlight ranges into a sorted, non-overlapping list.
@@ -237,6 +248,13 @@ pub struct PrDiffPanel {
     // Auto-hiding scrollbar over the diff list.
     scrollbar: ScrollbarState,
     last_scroll_offset: f32,
+
+    // Merge / checks UI state
+    checks_expanded: bool,
+    submitting_merge: bool,
+    merge_error: Option<String>,
+    /// Repeating timer that re-fetches PR status every ~60s while the panel exists.
+    _poll_task: Option<Task<()>>,
 }
 
 impl PrDiffPanel {
@@ -302,6 +320,10 @@ impl PrDiffPanel {
             search_match_ix: 0,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            checks_expanded: false,
+            submitting_merge: false,
+            merge_error: None,
+            _poll_task: None,
         }
     }
 
@@ -382,6 +404,10 @@ impl PrDiffPanel {
             search_match_ix: 0,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            checks_expanded: false,
+            submitting_merge: false,
+            merge_error: None,
+            _poll_task: None,
         }
     }
 
@@ -721,6 +747,132 @@ impl PrDiffPanel {
         .detach();
     }
 
+    /// Start a background timer that re-calls `refresh` every 60s. The timer
+    /// self-terminates when the panel entity is dropped (leaving PR mode).
+    /// Idempotent — subsequent calls are no-ops.
+    fn start_poll_if_needed(&mut self, cx: &mut Context<Self>) {
+        if self._poll_task.is_some() {
+            return;
+        }
+        self._poll_task = Some(cx.spawn(async move |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(60))
+                    .await;
+                let result = cx.update(|cx| {
+                    let _ = entity.update(cx, |panel, cx| {
+                        if !panel.loading {
+                            panel.refresh(cx);
+                        }
+                    });
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Kick off a merge action. When `auto` is true, enables auto-merge;
+    /// otherwise attempts to merge immediately. On success, triggers a full
+    /// refresh so the new state is reflected. On failure, stores the error
+    /// for display.
+    fn submit_merge(&mut self, method: MergeMethod, auto: bool, cx: &mut Context<Self>) {
+        let Some(work_dir) = self.work_dir.clone() else { return };
+        let Some(ref pr_info) = self.pr_info else { return };
+        let pr_number = pr_info.number;
+
+        self.submitting_merge = true;
+        self.merge_error = None;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if auto {
+                        github::enable_auto_merge(&work_dir, pr_number, method)
+                    } else {
+                        github::merge_pr(&work_dir, pr_number, method)
+                    }
+                })
+                .await;
+
+            let _ = cx.update(|cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    panel.submitting_merge = false;
+                    match result {
+                        Ok(()) => {
+                            // Optimistic UI: flip local state immediately so the
+                            // button doesn't flash its old label before the
+                            // refresh round-trip completes.
+                            if let Some(ref mut pr) = panel.pr_info {
+                                if auto {
+                                    pr.auto_merge_request =
+                                        Some(github::AutoMergeRequest {
+                                            enabled_by: None,
+                                            merge_method: Some(
+                                                match method {
+                                                    MergeMethod::Squash => "SQUASH",
+                                                    MergeMethod::Merge => "MERGE",
+                                                    MergeMethod::Rebase => "REBASE",
+                                                }
+                                                .to_string(),
+                                            ),
+                                        });
+                                } else {
+                                    pr.state = "MERGED".to_string();
+                                }
+                            }
+                            panel.refresh(cx);
+                        }
+                        Err(e) => {
+                            panel.merge_error = Some(e);
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn submit_disable_auto_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(work_dir) = self.work_dir.clone() else { return };
+        let Some(ref pr_info) = self.pr_info else { return };
+        let pr_number = pr_info.number;
+
+        self.submitting_merge = true;
+        self.merge_error = None;
+        cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { github::disable_auto_merge(&work_dir, pr_number) })
+                .await;
+
+            let _ = cx.update(|cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    panel.submitting_merge = false;
+                    match result {
+                        Ok(()) => {
+                            if let Some(ref mut pr) = panel.pr_info {
+                                pr.auto_merge_request = None;
+                            }
+                            panel.refresh(cx);
+                        }
+                        Err(e) => {
+                            panel.merge_error = Some(e);
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
     fn rebuild_comment_index(&mut self) {
         self.comment_index.clear();
         for (idx, comment) in self.pr_comments.iter().enumerate() {
@@ -947,6 +1099,409 @@ impl PrDiffPanel {
 
     fn total_deletions(&self) -> usize {
         self.diff_files.iter().map(|f| f.deletions()).sum()
+    }
+
+    // ── Checks / merge status bar ──
+
+    /// Render the checks + merge action bar shown below the header when a PR
+    /// is loaded. Returns None when there's no PR info yet.
+    fn render_pr_status_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pr = self.pr_info.as_ref()?;
+
+        let mut bar = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(colors::border());
+
+        // Checks summary
+        if !pr.status_check_rollup.is_empty() {
+            let mut n_success = 0;
+            let mut n_failure = 0;
+            let mut n_progress = 0;
+            let mut n_skipped = 0;
+            for c in &pr.status_check_rollup {
+                match c.kind() {
+                    CheckKind::Success => n_success += 1,
+                    CheckKind::Failure => n_failure += 1,
+                    CheckKind::InProgress => n_progress += 1,
+                    CheckKind::Skipped => n_skipped += 1,
+                }
+            }
+
+            let (summary_icon, summary_color) = if n_failure > 0 {
+                check_icon_style(CheckKind::Failure)
+            } else if n_progress > 0 {
+                check_icon_style(CheckKind::InProgress)
+            } else {
+                check_icon_style(CheckKind::Success)
+            };
+
+            let mut parts: Vec<String> = Vec::new();
+            if n_failure > 0 {
+                parts.push(format!("{n_failure} failing"));
+            }
+            if n_progress > 0 {
+                parts.push(format!("{n_progress} in progress"));
+            }
+            if n_skipped > 0 {
+                parts.push(format!("{n_skipped} skipped"));
+            }
+            if n_success > 0 {
+                parts.push(format!("{n_success} successful"));
+            }
+            let summary_text = parts.join(", ");
+
+            let expanded = self.checks_expanded;
+            // nf-fa-angle_down when open, nf-fa-angle_right when closed
+            let caret = if expanded { "\u{f107}" } else { "\u{f105}" };
+            let entity_toggle = cx.entity().clone();
+
+            bar = bar.child(
+                div()
+                    .id("pr-checks-summary")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py(px(6.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(colors::surface_hover()))
+                    .on_click(move |_, _window, cx| {
+                        entity_toggle.update(cx, |panel, cx| {
+                            panel.checks_expanded = !panel.checks_expanded;
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(12.0))
+                            .text_color(summary_color)
+                            .child(summary_icon),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors::text())
+                            .child(summary_text),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family(util::ICON_FONT)
+                            .text_size(px(9.0))
+                            .text_color(colors::text_muted())
+                            .child(caret),
+                    ),
+            );
+
+            if expanded {
+                let mut list = div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .bg(colors::surface());
+                for (idx, check) in pr.status_check_rollup.iter().enumerate() {
+                    let (icon, color) = check_icon_style(check.kind());
+                    let name = check.display_name().to_string();
+                    let label = match check.workflow_name.as_deref() {
+                        Some(wf) if !wf.is_empty() && wf != name => format!("{wf} / {name}"),
+                        _ => name,
+                    };
+                    let url = check.url().map(|s| s.to_string());
+                    let has_url = url.is_some();
+                    let mut row = div()
+                        .id(("pr-check-row", idx))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .px_3()
+                        .py(px(3.0))
+                        .text_xs()
+                        .child(
+                            div()
+                                .font_family(util::ICON_FONT)
+                                .text_size(px(11.0))
+                                .text_color(color)
+                                .w(px(16.0))
+                                .flex_shrink_0()
+                                .child(icon),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(colors::text())
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(label),
+                        );
+                    if has_url {
+                        row = row
+                            .cursor_pointer()
+                            .hover(|s| s.bg(colors::surface_hover()))
+                            .on_click(move |_, _window, cx| {
+                                if let Some(ref u) = url {
+                                    cx.open_url(u);
+                                }
+                            });
+                    }
+                    list = list.child(row);
+                }
+                bar = bar.child(list);
+            }
+        }
+
+        // Merge action row
+        bar = bar.child(self.render_merge_action_row(pr, cx));
+
+        // Error row (if any)
+        if let Some(ref err) = self.merge_error {
+            bar = bar.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py(px(4.0))
+                    .text_xs()
+                    .text_color(colors::diff_removed())
+                    .bg(rgba(0xf8514914))
+                    .child(err.clone()),
+            );
+        }
+
+        Some(bar.into_any_element())
+    }
+
+    fn render_merge_action_row(&self, pr: &PrInfo, cx: &mut Context<Self>) -> Div {
+        let base_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py(px(8.0));
+
+        // Closed / merged PR — no actions, just status.
+        if pr.state != "OPEN" {
+            let (icon, color, text) = match pr.state.as_str() {
+                "MERGED" => ("\u{f00c}", colors::accent(), "Merged"),
+                "CLOSED" => ("\u{f00d}", colors::diff_removed(), "Closed"),
+                _ => ("\u{f192}", colors::text_muted(), pr.state.as_str()),
+            };
+            return base_row
+                .child(
+                    div()
+                        .font_family(util::ICON_FONT)
+                        .text_size(px(14.0))
+                        .text_color(color)
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors::text())
+                        .child(text.to_string()),
+                );
+        }
+
+        // Auto-merge already enabled — show disable button.
+        if let Some(ref req) = pr.auto_merge_request {
+            let method = req
+                .merge_method
+                .clone()
+                .unwrap_or_else(|| "SQUASH".to_string())
+                .to_lowercase();
+            let user = req
+                .enabled_by
+                .as_ref()
+                .map(|u| format!("@{}", u.login))
+                .unwrap_or_default();
+            let text = if user.is_empty() {
+                format!("Auto-merge enabled ({method})")
+            } else {
+                format!("Auto-merge enabled ({method}) by {user}")
+            };
+            let submitting = self.submitting_merge;
+            let entity = cx.entity().clone();
+            let label = if submitting { "Working..." } else { "Disable auto-merge" };
+            return base_row
+                .child(
+                    div()
+                        .font_family(util::ICON_FONT)
+                        .text_size(px(14.0))
+                        .text_color(colors::diff_added())
+                        .child("\u{f00c}"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(colors::text())
+                        .child(text),
+                )
+                .child(
+                    div()
+                        .id("pr-disable-auto-merge")
+                        .px_3()
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .border_1()
+                        .border_color(colors::border())
+                        .text_color(colors::text())
+                        .when(submitting, |d: Stateful<Div>| d.opacity(0.6))
+                        .when(!submitting, |d: Stateful<Div>| {
+                            d.cursor_pointer().hover(|s| s.bg(colors::surface_hover()))
+                        })
+                        .child(label)
+                        .on_click(move |_, _window, cx| {
+                            entity.update(cx, |panel, cx| {
+                                if !panel.submitting_merge {
+                                    panel.submit_disable_auto_merge(cx);
+                                }
+                            });
+                        }),
+                );
+        }
+
+        // Open PR, no auto-merge set — compute status + primary action.
+        let merge_state = pr.merge_state_status.as_deref().unwrap_or("UNKNOWN");
+        let mergeable = pr.mergeable.as_deref().unwrap_or("UNKNOWN");
+        let review_decision = pr.review_decision.as_deref();
+
+        let conflicts = mergeable == "CONFLICTING" || merge_state == "DIRTY";
+        let changes_requested = review_decision == Some("CHANGES_REQUESTED");
+        let clean_like = matches!(merge_state, "CLEAN" | "UNSTABLE" | "HAS_HOOKS");
+        let is_ready = clean_like && !pr.is_draft && !conflicts && !changes_requested;
+
+        let (status_icon, status_color, status_text) = if pr.is_draft {
+            ("\u{f040}", colors::text_muted(), "This pull request is a draft".to_string())
+        } else if conflicts {
+            (
+                "\u{f071}",
+                colors::diff_removed(),
+                "This branch has conflicts that must be resolved".to_string(),
+            )
+        } else if changes_requested {
+            (
+                "\u{f071}",
+                rgb(0xf9e2af),
+                "Changes were requested".to_string(),
+            )
+        } else if merge_state == "BEHIND" {
+            (
+                "\u{f071}",
+                rgb(0xf9e2af),
+                "This branch is out-of-date with the base branch".to_string(),
+            )
+        } else if merge_state == "BLOCKED" {
+            (
+                "\u{f071}",
+                rgb(0xf9e2af),
+                "Merging is blocked by required checks or reviews".to_string(),
+            )
+        } else if merge_state == "UNSTABLE" {
+            (
+                "\u{f00c}",
+                colors::diff_added(),
+                "Non-required checks are failing, but this PR can still merge".to_string(),
+            )
+        } else if merge_state == "CLEAN" || merge_state == "HAS_HOOKS" {
+            ("\u{f00c}", colors::diff_added(), "Ready to merge".to_string())
+        } else {
+            (
+                "\u{f192}",
+                colors::text_muted(),
+                format!("Merge state: {merge_state}"),
+            )
+        };
+
+        let submitting = self.submitting_merge;
+        let can_enable_auto = !pr.is_draft && !conflicts;
+
+        let mut row = base_row
+            .child(
+                div()
+                    .font_family(util::ICON_FONT)
+                    .text_size(px(14.0))
+                    .text_color(status_color)
+                    .flex_shrink_0()
+                    .child(status_icon),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(colors::text())
+                    .child(status_text),
+            );
+
+        if is_ready {
+            let label = if submitting { "Merging..." } else { "Merge (squash)" };
+            let entity = cx.entity().clone();
+            row = row.child(
+                div()
+                    .id("pr-merge-btn")
+                    .px_3()
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .bg(colors::diff_added())
+                    .text_color(rgb(0xffffff))
+                    .when(submitting, |d: Stateful<Div>| d.opacity(0.6))
+                    .when(!submitting, |d: Stateful<Div>| {
+                        d.cursor_pointer().hover(|s| s.opacity(0.85))
+                    })
+                    .child(label)
+                    .on_click(move |_, _window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            if !panel.submitting_merge {
+                                panel.submit_merge(MergeMethod::Squash, false, cx);
+                            }
+                        });
+                    }),
+            );
+        } else if can_enable_auto {
+            let label = if submitting { "Working..." } else { "Enable auto-merge (squash)" };
+            let entity = cx.entity().clone();
+            row = row.child(
+                div()
+                    .id("pr-auto-merge-btn")
+                    .px_3()
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .border_1()
+                    .border_color(colors::border())
+                    .text_color(colors::text())
+                    .when(submitting, |d: Stateful<Div>| d.opacity(0.6))
+                    .when(!submitting, |d: Stateful<Div>| {
+                        d.cursor_pointer().hover(|s| s.bg(colors::surface_hover()))
+                    })
+                    .child(label)
+                    .on_click(move |_, _window, cx| {
+                        entity.update(cx, |panel, cx| {
+                            if !panel.submitting_merge {
+                                panel.submit_merge(MergeMethod::Squash, true, cx);
+                            }
+                        });
+                    }),
+            );
+        }
+
+        row
     }
 
     // ── File tree (left side) ──
@@ -3369,6 +3924,7 @@ impl Render for PrDiffPanel {
         if self.needs_initial_refresh {
             self.needs_initial_refresh = false;
             self.refresh(cx);
+            self.start_poll_if_needed(cx);
         }
 
         // Rebuild the flat row cache if data has changed
@@ -3808,6 +4364,11 @@ impl Render for PrDiffPanel {
                     .border_color(colors::border())
                     .child("Loading PR data..."),
             );
+        }
+
+        // PR status bar: checks + merge action row
+        if let Some(status_bar) = self.render_pr_status_bar(cx) {
+            panel = panel.child(status_bar);
         }
 
         // Empty state

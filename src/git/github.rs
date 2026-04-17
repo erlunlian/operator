@@ -73,17 +73,127 @@ pub struct PrInfo {
     /// Number of files changed as reported by GitHub.
     #[serde(default)]
     pub changed_files: u64,
+    /// MERGEABLE / CONFLICTING / UNKNOWN.
+    #[serde(default)]
+    pub mergeable: Option<String>,
+    /// BEHIND / BLOCKED / CLEAN / DIRTY / DRAFT / HAS_HOOKS / UNKNOWN / UNSTABLE.
+    #[serde(default)]
+    pub merge_state_status: Option<String>,
+    /// APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / None (no required reviewers).
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub is_draft: bool,
+    /// Present when auto-merge is enabled on the PR.
+    #[serde(default)]
+    pub auto_merge_request: Option<AutoMergeRequest>,
+    /// Merged list of check runs + legacy status contexts on the head commit.
+    #[serde(default)]
+    pub status_check_rollup: Vec<CheckRun>,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct AutoMergeRequest {
+    #[serde(default)]
+    pub enabled_by: Option<GhUser>,
+    /// MERGE / SQUASH / REBASE.
+    #[serde(default)]
+    pub merge_method: Option<String>,
+}
+
+/// Entry from `statusCheckRollup` — may be a modern CheckRun (GitHub Actions /
+/// apps) or a legacy StatusContext (e.g. Vercel, older integrations). We
+/// flatten both into one struct and normalize via `kind()`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct CheckRun {
+    #[serde(default, rename = "__typename")]
+    pub typename: String,
+    /// CheckRun.name
+    #[serde(default)]
+    pub name: Option<String>,
+    /// StatusContext.context
+    #[serde(default)]
+    pub context: Option<String>,
+    /// CheckRun.status: QUEUED / IN_PROGRESS / COMPLETED / WAITING / PENDING / REQUESTED.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// CheckRun.conclusion: SUCCESS / FAILURE / NEUTRAL / CANCELLED / SKIPPED / TIMED_OUT / ACTION_REQUIRED.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    /// StatusContext.state: ERROR / EXPECTED / FAILURE / PENDING / SUCCESS.
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub details_url: Option<String>,
+    #[serde(default)]
+    pub target_url: Option<String>,
+    #[serde(default)]
+    pub workflow_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckKind {
+    Success,
+    Failure,
+    InProgress,
+    Skipped,
+}
+
+impl CheckRun {
+    pub fn display_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.context.as_deref())
+            .unwrap_or("check")
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.details_url.as_deref().or(self.target_url.as_deref())
+    }
+
+    pub fn kind(&self) -> CheckKind {
+        // Legacy StatusContext: only `state`.
+        if self.conclusion.is_none() && self.status.is_none() {
+            return match self.state.as_deref() {
+                Some("SUCCESS") => CheckKind::Success,
+                Some("FAILURE") | Some("ERROR") => CheckKind::Failure,
+                _ => CheckKind::InProgress,
+            };
+        }
+        // CheckRun: still running if not yet COMPLETED.
+        if self
+            .status
+            .as_deref()
+            .map(|s| s != "COMPLETED")
+            .unwrap_or(false)
+        {
+            return CheckKind::InProgress;
+        }
+        match self.conclusion.as_deref() {
+            Some("SUCCESS") => CheckKind::Success,
+            Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED") => {
+                CheckKind::Failure
+            }
+            Some("NEUTRAL") | Some("SKIPPED") => CheckKind::Skipped,
+            _ => CheckKind::InProgress,
+        }
+    }
+}
+
+/// Fields requested from `gh pr view --json`. Kept as a const so `detect_pr`
+/// and any future light refresh can share the exact same schema.
+const PR_VIEW_JSON_FIELDS: &str = "number,title,state,baseRefName,headRefName,url,\
+additions,deletions,changedFiles,mergeable,mergeStateStatus,reviewDecision,\
+isDraft,autoMergeRequest,statusCheckRollup";
 
 /// Detect whether a PR is open for the current branch.
 pub fn detect_pr(repo_dir: &Path) -> Option<PrInfo> {
     let output = Command::new(gh_bin())
-        .args([
-            "pr",
-            "view",
-            "--json",
-            "number,title,state,baseRefName,headRefName,url,additions,deletions,changedFiles",
-        ])
+        .args(["pr", "view", "--json", PR_VIEW_JSON_FIELDS])
         .current_dir(repo_dir)
         .output()
         .ok()?;
@@ -94,6 +204,85 @@ pub fn detect_pr(repo_dir: &Path) -> Option<PrInfo> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).ok()
+}
+
+/// Which merge method to use. Matches `gh pr merge` flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "--merge",
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Rebase => "--rebase",
+        }
+    }
+}
+
+/// Merge the PR immediately. Requires the PR to be in a mergeable state.
+pub fn merge_pr(repo_dir: &Path, pr_number: u64, method: MergeMethod) -> Result<(), String> {
+    let output = Command::new(gh_bin())
+        .args(["pr", "merge", &pr_number.to_string(), method.flag()])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr merge failed: {stderr}"));
+    }
+    Ok(())
+}
+
+/// Enable auto-merge on the PR. Merges once requirements are met.
+pub fn enable_auto_merge(
+    repo_dir: &Path,
+    pr_number: u64,
+    method: MergeMethod,
+) -> Result<(), String> {
+    let output = Command::new(gh_bin())
+        .args([
+            "pr",
+            "merge",
+            &pr_number.to_string(),
+            "--auto",
+            method.flag(),
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr merge --auto failed: {stderr}"));
+    }
+    Ok(())
+}
+
+/// Disable auto-merge on the PR.
+pub fn disable_auto_merge(repo_dir: &Path, pr_number: u64) -> Result<(), String> {
+    let output = Command::new(gh_bin())
+        .args([
+            "pr",
+            "merge",
+            &pr_number.to_string(),
+            "--disable-auto",
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr merge --disable-auto failed: {stderr}"));
+    }
+    Ok(())
 }
 
 // ── PR review comments ──

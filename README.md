@@ -5,6 +5,9 @@ A native macOS code editor built from scratch in Rust with [GPUI](https://gpui.r
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Rust](https://img.shields.io/badge/language-Rust-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
+![Status](https://img.shields.io/badge/status-alpha-red)
+
+> ⚠️ **Alpha software.** Operator is in active early development. Expect bugs, breaking changes, and rough edges. Please [open an issue](https://github.com/erlunlian/operator/issues) if something breaks — feedback at this stage is especially valuable.
 
 ## Features
 
@@ -17,13 +20,29 @@ A native macOS code editor built from scratch in Rust with [GPUI](https://gpui.r
 - **Session persistence** — remembers open workspaces, tabs, splits, and window state across restarts
 - **Catppuccin Mocha** theme
 
-## Requirements
+## Install
+
+Download the latest `Operator.dmg` from the [Releases page](https://github.com/erlunlian/operator/releases/latest), open it, and drag `Operator.app` into `/Applications`.
+
+The app isn't code-signed or notarized yet, so macOS will quarantine it on first launch and refuse to open it ("Operator is damaged and can't be opened" or "cannot be opened because the developer cannot be verified"). Clear the quarantine attribute once:
+
+```bash
+xattr -cr /Applications/Operator.app
+```
+
+Then open the app normally from Finder / Launchpad / Spotlight.
+
+### Auto-update
+
+Operator checks GitHub for new releases hourly in the background and on demand via **Operator → Check for Updates…** in the menu bar. When an update is available the sidebar shows an "Update available" row; clicking **Install** downloads the new build, swaps the `.app` bundle in place, and relaunches automatically. You do **not** need to re-download the DMG or re-run `xattr` for subsequent updates.
+
+## Build from source
+
+Requirements:
 
 - macOS 13+
 - Rust toolchain (`rustup`)
 - `cargo-watch` (for dev mode): `cargo install cargo-watch`
-
-## Quick Start
 
 ```bash
 git clone https://github.com/erlunlian/operator.git

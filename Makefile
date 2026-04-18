@@ -29,25 +29,46 @@ release:
 dmg: release
 	./script/create-dmg
 
-# Bump version in Cargo.toml, commit, create git tag, and push.
+# Bump version via PR, merge it, then tag main and push the tag.
 # Usage: make release-tag BUMP=minor  (default: patch)
+# Requires: gh CLI authenticated, clean working tree, local main == origin/main.
 release-tag:
-	@current=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
+	@set -e; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Working tree is not clean. Commit or stash changes first." >&2; exit 1; \
+	fi; \
+	if [ "$$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then \
+		echo "Must be on main branch." >&2; exit 1; \
+	fi; \
+	git fetch origin main --quiet; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
+		echo "Local main differs from origin/main. Sync first." >&2; exit 1; \
+	fi; \
+	current=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
 	IFS='.' read -r major minor patch <<< "$$current"; \
 	case "$(BUMP)" in \
 		major) major=$$((major + 1)); minor=0; patch=0 ;; \
 		minor) minor=$$((minor + 1)); patch=0 ;; \
 		patch) patch=$$((patch + 1)) ;; \
-		*) echo "Unknown BUMP=$(BUMP). Use major, minor, or patch." && exit 1 ;; \
+		*) echo "Unknown BUMP=$(BUMP). Use major, minor, or patch." >&2; exit 1 ;; \
 	esac; \
 	next="$$major.$$minor.$$patch"; \
+	branch="release/v$$next"; \
+	echo "Releasing v$$next via PR on $$branch..."; \
+	git checkout -b "$$branch"; \
 	sed -i '' "s/^version = \"$$current\"/version = \"$$next\"/" Cargo.toml; \
-	cargo check --quiet 2>/dev/null; \
+	cargo check --quiet; \
 	git add Cargo.toml Cargo.lock; \
 	git commit -m "Bump version to $$next"; \
+	git push -u origin "$$branch"; \
+	gh pr create --base main --head "$$branch" --title "Bump version to $$next" --body "Release v$$next."; \
+	gh pr merge "$$branch" --squash --delete-branch; \
+	git checkout main --quiet; \
+	git pull --ff-only --quiet; \
+	git branch -D "$$branch" 2>/dev/null || true; \
 	git tag "v$$next"; \
-	git push origin HEAD "v$$next"; \
-	echo "Released v$$next"
+	git push origin "v$$next"; \
+	echo "Released v$$next — the Release workflow will build and publish the DMG/zip."
 
 # Copy to /Applications
 install:

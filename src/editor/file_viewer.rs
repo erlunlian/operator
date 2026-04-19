@@ -684,6 +684,98 @@ impl FileViewer {
         self.insert_text("    ");
     }
 
+    // ── Line comments ──
+
+    /// Returns the line-comment token for this file's language, if any.
+    /// Keyed off the file extension so it works even when the highlighter
+    /// falls back (e.g. `.toml` highlights as rust but uses `#` for comments).
+    fn line_comment_prefix(&self) -> Option<&'static str> {
+        let ext = self.path.extension()?.to_str()?;
+        Some(match ext {
+            "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx"
+            | "go" | "swift" | "kt" | "kts" | "java" | "c" | "cc" | "cpp" | "cxx"
+            | "h" | "hh" | "hpp" | "cs" | "scala" | "dart" | "groovy" => "//",
+            "py" | "pyi" | "toml" | "sh" | "bash" | "zsh" | "fish" | "rb"
+            | "yaml" | "yml" | "conf" | "ini" | "r" | "pl" | "elixir" | "ex"
+            | "exs" | "nix" | "dockerfile" | "makefile" | "mk" => "#",
+            "lua" | "sql" | "hs" | "elm" => "--",
+            _ => return None,
+        })
+    }
+
+    /// Toggle line comments on the current line or all lines intersecting the
+    /// active selection. Comments are inserted at the minimum indent across
+    /// non-blank lines, which matches VSCode/Zed behavior.
+    fn toggle_line_comment(&mut self) {
+        let Some(prefix) = self.line_comment_prefix() else {
+            return;
+        };
+
+        let (start_row, end_row) = if let Some(sel) = self.selection {
+            let (sr, _, er, ec) = sel.ordered();
+            // Exclude the trailing row when the selection ends at column 0 of a
+            // later row — the caret is visually on that row but no content is
+            // actually selected on it.
+            let end = if er > sr && ec == 0 { er - 1 } else { er };
+            (sr, end)
+        } else {
+            (self.cursor_row, self.cursor_row)
+        };
+
+        let end_row = end_row.min(self.buffer.len().saturating_sub(1));
+        if start_row > end_row {
+            return;
+        }
+
+        let is_blank = |line: &str| line.trim().is_empty();
+
+        let min_indent = (start_row..=end_row)
+            .filter_map(|r| {
+                let line = &self.buffer[r];
+                if is_blank(line) {
+                    None
+                } else {
+                    Some(line.len() - line.trim_start().len())
+                }
+            })
+            .min();
+
+        let Some(min_indent) = min_indent else {
+            return; // all lines blank — nothing to toggle
+        };
+
+        let all_commented = (start_row..=end_row).all(|r| {
+            let line = &self.buffer[r];
+            if is_blank(line) {
+                return true;
+            }
+            line.get(min_indent..)
+                .is_some_and(|rest| rest.starts_with(prefix))
+        });
+
+        self.save_undo();
+
+        for r in start_row..=end_row {
+            let line = &mut self.buffer[r];
+            if is_blank(line) {
+                continue;
+            }
+            if all_commented {
+                let after = min_indent + prefix.len();
+                let drop_space = line.as_bytes().get(after) == Some(&b' ');
+                let remove_end = if drop_space { after + 1 } else { after };
+                line.drain(min_indent..remove_end);
+            } else {
+                let insertion = format!("{} ", prefix);
+                line.insert_str(min_indent, &insertion);
+            }
+        }
+
+        self.clamp_col();
+        self.dirty = true;
+        self.recompute_highlights_full();
+    }
+
     // ── Vim motions ──
 
     fn move_word_forward(&mut self) {
@@ -1856,6 +1948,10 @@ impl FileViewer {
                         self.dirty = true;
                     }
                     self.recompute_highlights();
+                    true
+                }
+                "/" => {
+                    self.toggle_line_comment();
                     true
                 }
                 _ => false,

@@ -974,9 +974,19 @@ impl Render for TerminalView {
                             let term = this.terminal.read(cx);
                             if let Some(clipboard) = cx.read_from_clipboard() {
                                 let text = clipboard.text().unwrap_or_default();
-                                term.write_to_pty(b"\x1b[200~");
-                                if !text.is_empty() { term.write_str_to_pty(&text); }
-                                term.write_to_pty(b"\x1b[201~");
+                                let bracketed = term.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+                                if bracketed {
+                                    term.write_to_pty(b"\x1b[200~");
+                                    if !text.is_empty() { term.write_str_to_pty(&text); }
+                                    term.write_to_pty(b"\x1b[201~");
+                                } else if !text.is_empty() {
+                                    // Apps that haven't enabled bracketed paste (e.g. plain
+                                    // readline prompts) would echo \x1b[200~ literally.
+                                    // Strip CRs and convert LF to CR so multi-line pastes act
+                                    // like pressing Enter between lines.
+                                    let normalized = text.replace('\r', "").replace('\n', "\r");
+                                    term.write_str_to_pty(&normalized);
+                                }
                             }
                         }
                         "backspace" => { this.terminal.read(cx).write_to_pty(b"\x15"); }
@@ -1092,9 +1102,14 @@ impl Render for TerminalView {
                     .collect();
                 if !path_strs.is_empty() {
                     let joined = path_strs.join(" ");
-                    term.write_to_pty(b"\x1b[200~");
-                    term.write_str_to_pty(&joined);
-                    term.write_to_pty(b"\x1b[201~");
+                    let bracketed = term.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+                    if bracketed {
+                        term.write_to_pty(b"\x1b[200~");
+                        term.write_str_to_pty(&joined);
+                        term.write_to_pty(b"\x1b[201~");
+                    } else {
+                        term.write_str_to_pty(&joined);
+                    }
                 }
             }));
 

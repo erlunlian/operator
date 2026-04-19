@@ -11,6 +11,7 @@ mod debug;
 mod editor;
 mod git;
 mod pane;
+mod panic_hook;
 mod recent_projects;
 mod right_panel;
 mod session;
@@ -65,6 +66,7 @@ fn disable_titlebar_drag(window: &mut gpui::Window) {
 }
 
 fn main() {
+    panic_hook::install();
     env_logger::init();
 
     Application::new().run(|cx: &mut App| {

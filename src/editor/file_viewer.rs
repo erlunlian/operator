@@ -347,8 +347,10 @@ impl FileViewer {
         let mut line_start = 0;
         let mut buffer_row: usize = 0;
 
-        for line_text in content.split('\n') {
-            let line_text = line_text.strip_suffix('\r').unwrap_or(line_text);
+        // Iterate with `lines()` to match how `buffer` is built (also `lines()`).
+        // `split('\n')` would emit a phantom trailing empty entry for content
+        // ending in '\n', whose `buffer_row` would be out of bounds for `buffer`.
+        for line_text in content.lines() {
             let line_byte_start = line_start;
             let line_byte_end = line_byte_start + line_text.len();
 
@@ -427,6 +429,17 @@ impl FileViewer {
             if content.as_bytes().get(line_start) == Some(&b'\n') {
                 line_start += 1;
             }
+        }
+
+        // Mirror the empty-content guard in `buffer` (which becomes `[String::new()]`)
+        // so `rendered_lines.len() >= buffer.len()` always holds.
+        if result.is_empty() {
+            result.push(RenderedLine {
+                text: SharedString::from(" ".to_string()),
+                highlights: vec![],
+                buffer_row: 0,
+                byte_offset: 0,
+            });
         }
 
         result
@@ -1469,8 +1482,12 @@ impl FileViewer {
         let col_chars = (x_in_code / cw).max(0.0) as usize;
 
         // Convert character count to byte offset within the visual chunk,
-        // then add byte_offset to get position in the full buffer line
+        // then add byte_offset to get position in the full buffer line.
+        // Clamp defensively: a stale `rendered_lines` mustn't be able to
+        // crash the process via an out-of-bounds buffer index on click.
+        let row = row.min(self.buffer.len().saturating_sub(1));
         let line = &self.buffer[row];
+        let byte_offset = byte_offset.min(line.len());
         let chunk = &line[byte_offset..];
         let mut byte_col = 0;
         for (i, (byte_idx, ch)) in chunk.char_indices().enumerate() {

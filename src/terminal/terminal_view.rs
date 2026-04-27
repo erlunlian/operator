@@ -814,7 +814,8 @@ impl Render for TerminalView {
                     let term = this.terminal.read(cx).term.clone();
                     let pos = this.mouse_to_grid(event.position);
                     if let Some(hit) = this.detect_url_at(pos, &term) {
-                        let _ = std::process::Command::new("open").arg(&hit.url).spawn();
+                        log::info!("terminal Cmd+Click: opening {}", hit.url);
+                        cx.open_url(&hit.url);
                         this.hovered_url = None;
                         cx.notify();
                         return;

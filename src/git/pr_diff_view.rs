@@ -1979,7 +1979,7 @@ impl PrDiffPanel {
                         None
                     }
                 });
-                self.render_split_line_row(left_line, right_line, *global_line_idx, *is_last_in_file, entity)
+                self.render_split_line_row(*file_idx, left_line, right_line, *global_line_idx, *is_last_in_file, entity)
             }
         }
     }
@@ -2531,14 +2531,21 @@ impl PrDiffPanel {
         wrapper.into_any_element()
     }
 
-    /// Render one side of a split diff row (gutter + prefix + content).
-    /// `is_left` determines which line number to show for context lines.
+    /// Render one side of a split diff row (gutter + "+" + prefix + content).
+    /// `is_left` selects which side this half represents: LEFT shows old line numbers
+    /// and accepts comments on the LEFT side; RIGHT shows new line numbers and accepts
+    /// RIGHT-side comments.
     fn render_split_half(
+        &self,
         line: Option<&DiffLine>,
         is_left: bool,
         search_hl: &[(usize, usize, bool)],
+        file_path: &str,
+        global_line_idx: usize,
+        entity: &Entity<Self>,
     ) -> Div {
-        let (row_bg, gutter_bg_color, text_col, prefix, line_num_str, content) = match line {
+        let side = if is_left { CommentSide::Left } else { CommentSide::Right };
+        let (row_bg, gutter_bg_color, text_col, prefix, line_num_str, content, line_num) = match line {
             Some(l) => {
                 let (bg, gbg, tc, pfx) = match l.kind {
                     DiffLineKind::Added => (added_line_bg(), added_gutter_bg(), colors::diff_added(), "+"),
@@ -2551,10 +2558,10 @@ impl PrDiffPanel {
                     l.new_lineno
                 };
                 let ln_str = ln.map(|n| format!("{n}")).unwrap_or_default();
-                (bg, gbg, tc, pfx, ln_str, Some(l))
+                (bg, gbg, tc, pfx, ln_str, Some(l), ln)
             }
             None => {
-                (rgba(0x00000000), gutter_bg(), colors::text_muted(), " ", String::new(), None)
+                (rgba(0x00000000), gutter_bg(), colors::text_muted(), " ", String::new(), None, None)
             }
         };
 
@@ -2623,7 +2630,110 @@ impl PrDiffPanel {
                 .into_any_element()
         };
 
+        // Comment "+" button (between gutter and prefix). Mirrors the unified
+        // path's button so each split half can start a comment on its own side.
+        let gli = global_line_idx;
+        let can_comment = self.can_comment();
+        let comment_btn: AnyElement = if let (true, Some(ln)) = (can_comment, line_num) {
+            let entity_down = entity.clone();
+            let entity_up = entity.clone();
+            let entity_move = entity.clone();
+            let path_down = file_path.to_string();
+            let path_up = file_path.to_string();
+            let id_path = file_path.to_string();
+
+            let in_drag = self.comment_drag_start.as_ref().map_or(false, |(p, start, s)| {
+                if p != file_path || *s != side { return false; }
+                let end = self.comment_drag_end.unwrap_or(*start);
+                let lo = (*start).min(end);
+                let hi = (*start).max(end);
+                ln >= lo && ln <= hi
+            });
+            let in_active = self.active_comment_line.as_ref().map_or(false, |(p, start, end, s)| {
+                if p != file_path || *s != side { return false; }
+                let lo = (*start).min(*end);
+                let hi = (*start).max(*end);
+                ln >= lo && ln <= hi
+            });
+            let gutter_highlight = in_drag || in_active;
+
+            div()
+                .id(ElementId::Name(
+                    format!("pr-split-cbtn-{}-{ln}-{}", id_path, side.api_str()).into(),
+                ))
+                .w(px(18.0))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .text_color(colors::accent())
+                .cursor_pointer()
+                .bg(if gutter_highlight { rgba(0xf9e2af40) } else { gutter_bg_color })
+                .opacity(0.0)
+                .when(gutter_highlight, |d: Stateful<Div>| d.opacity(1.0))
+                .group_hover("pr-split-line", |s| s.opacity(1.0).bg(rgba(0x89b4fa30)).text_color(colors::accent()))
+                .hover(|s| s.bg(rgba(0x89b4fa40)))
+                .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _window, cx| {
+                    let path = path_down.clone();
+                    entity_down.update(cx, |panel, cx| {
+                        panel.comment_drag_start = Some((path, ln, side));
+                        panel.comment_drag_end = None;
+                        panel.comment_drag_start_gli = Some(gli);
+                        panel.comment_drag_end_gli = Some(gli);
+                        panel.last_drag_mouse_y = Some(f32::from(event.position.y));
+                        panel.ensure_autoscroll_timer(cx);
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                })
+                .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
+                    let path = path_up.clone();
+                    entity_up.update(cx, |panel, cx| {
+                        if let Some((ref drag_path, start_ln, drag_side)) =
+                            panel.comment_drag_start.take()
+                        {
+                            if drag_path == &path {
+                                let start = start_ln.min(ln);
+                                let end = start_ln.max(ln);
+                                panel.comment_drag_end = None;
+                                panel.comment_drag_start_gli = None;
+                                panel.comment_drag_end_gli = None;
+                                panel.start_comment(path, start, end, drag_side, cx);
+                            }
+                        }
+                    });
+                    cx.stop_propagation();
+                })
+                .on_mouse_move(move |_, _window, cx| {
+                    entity_move.update(cx, |panel, cx| {
+                        if panel.comment_drag_start.is_some() {
+                            let mut changed = false;
+                            if panel.comment_drag_end != Some(ln) {
+                                panel.comment_drag_end = Some(ln);
+                                changed = true;
+                            }
+                            if panel.comment_drag_end_gli != Some(gli) {
+                                panel.comment_drag_end_gli = Some(gli);
+                                changed = true;
+                            }
+                            if changed { cx.notify(); }
+                        }
+                    });
+                })
+                .child("+")
+                .into_any_element()
+        } else {
+            div()
+                .w(px(18.0))
+                .flex_shrink_0()
+                .bg(gutter_bg_color)
+                .into_any_element()
+        };
+
         div()
+            .group("pr-split-line")
             .flex()
             .flex_row()
             .flex_1()
@@ -2635,12 +2745,13 @@ impl PrDiffPanel {
                     .w(px(44.0))
                     .flex_shrink_0()
                     .text_right()
-                    .pr(px(8.0))
+                    .pr(px(4.0))
                     .pl(px(4.0))
                     .bg(gutter_bg_color)
                     .text_color(colors::text_muted())
                     .child(line_num_str),
             )
+            .child(comment_btn)
             .child(
                 div()
                     .w(px(16.0))
@@ -2655,15 +2766,17 @@ impl PrDiffPanel {
     /// Render a side-by-side diff row with left (old) and right (new) halves.
     fn render_split_line_row(
         &self,
+        file_idx: usize,
         left: Option<&DiffLine>,
         right: Option<&DiffLine>,
         global_line_idx: usize,
         is_last_in_file: bool,
         entity: &Entity<Self>,
     ) -> AnyElement {
+        let file_path = self.diff_files[file_idx].path.clone();
         let search_hl = self.search_highlights_for_gli(global_line_idx);
-        let left_half = Self::render_split_half(left, true, &search_hl);
-        let right_half = Self::render_split_half(right, false, &search_hl);
+        let left_half = self.render_split_half(left, true, &search_hl, &file_path, global_line_idx, entity);
+        let right_half = self.render_split_half(right, false, &search_hl, &file_path, global_line_idx, entity);
 
         let line_selected = self.is_line_selected(global_line_idx);
         let sel_bg = if line_selected { rgba(0x89b4fa30) } else { rgba(0x00000000) };
@@ -2672,7 +2785,38 @@ impl PrDiffPanel {
         let entity_sel_move = entity.clone();
         let gli = global_line_idx;
 
-        div()
+        // Existing comments / active form may attach to either side at either
+        // side's line number. A removed-only row has no right line; an added-only
+        // row has no left line.
+        let left_line_num = left.and_then(|l| l.old_lineno);
+        let right_line_num = right.and_then(|l| l.new_lineno);
+
+        let active = self.active_comment_line.as_ref();
+        let has_form_left = active.map_or(false, |(p, _s, e, side)| {
+            p == &file_path && *side == CommentSide::Left && left_line_num == Some(*e)
+        });
+        let has_form_right = active.map_or(false, |(p, _s, e, side)| {
+            p == &file_path && *side == CommentSide::Right && right_line_num == Some(*e)
+        });
+        let has_form = has_form_left || has_form_right;
+
+        let left_comment_indices: Vec<usize> = left_line_num
+            .and_then(|ln| {
+                self.comment_index
+                    .get(&(file_path.clone(), ln, "LEFT".to_string()))
+                    .cloned()
+            })
+            .unwrap_or_default();
+        let right_comment_indices: Vec<usize> = right_line_num
+            .and_then(|ln| {
+                self.comment_index
+                    .get(&(file_path.clone(), ln, "RIGHT".to_string()))
+                    .cloned()
+            })
+            .unwrap_or_default();
+        let has_comments = !left_comment_indices.is_empty() || !right_comment_indices.is_empty();
+
+        let line_row = div()
             .flex()
             .flex_row()
             .w_full()
@@ -2680,10 +2824,6 @@ impl PrDiffPanel {
             .bg(sel_bg)
             .font_family("Menlo")
             .text_xs()
-            .border_l_1()
-            .border_r_1()
-            .border_color(colors::border())
-            .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                 entity_sel_down.update(cx, |panel, cx| {
                     panel.copy_anchor_line = Some(gli);
@@ -2708,8 +2848,39 @@ impl PrDiffPanel {
                     .flex_shrink_0()
                     .bg(colors::border()),
             )
-            .child(right_half)
-            .into_any_element()
+            .child(right_half);
+
+        if !has_form && !has_comments {
+            return line_row
+                .border_l_1()
+                .border_r_1()
+                .border_color(colors::border())
+                .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
+                .into_any_element();
+        }
+
+        let mut wrapper = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .border_l_1()
+            .border_r_1()
+            .border_color(colors::border())
+            .when(is_last_in_file, |d: Div| d.border_b_1().rounded_b_md())
+            .child(line_row);
+
+        if has_form {
+            wrapper = wrapper.child(self.render_comment_form(entity));
+        }
+
+        for idx in left_comment_indices {
+            wrapper = wrapper.child(self.render_comment_bubble(idx, entity));
+        }
+        for idx in right_comment_indices {
+            wrapper = wrapper.child(self.render_comment_bubble(idx, entity));
+        }
+
+        wrapper.into_any_element()
     }
 
     fn render_collapsed_row(

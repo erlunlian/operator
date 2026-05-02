@@ -1,8 +1,10 @@
 use gpui::*;
 use std::path::PathBuf;
 
-use crate::git::PrDiffPanel;
+use crate::editor::EditorView;
+use crate::git::{GitDiffPanel, PrDiffPanel};
 use crate::pane::PaneGroup;
+use crate::right_panel::RightPanelTab;
 use crate::terminal::terminal::DetectedClaudeStatus;
 use crate::workspace::pr_review::{self, PrReviewState, PrReviewStatus};
 
@@ -38,20 +40,28 @@ pub struct Workspace {
     /// Per-pane Claude statuses (only non-idle entries are stored).
     pub pane_statuses: Vec<ClaudeStatus>,
     pub layout: Option<Entity<PaneGroup>>,
-    /// Editor files cached when switching away from this workspace.
-    pub cached_editor_files: Vec<PathBuf>,
-    /// Right panel tab cached when switching away from this workspace.
-    pub cached_right_panel_tab: Option<String>,
-    /// Right panel width cached when switching away from this workspace.
-    pub cached_right_panel_width: Option<f32>,
-    /// Whether the left sidebar was collapsed when switching away.
-    pub cached_sidebar_collapsed: Option<bool>,
-    /// Whether the right panel was collapsed when switching away.
-    pub cached_right_panel_collapsed: Option<bool>,
+    /// The right-panel editor for this workspace. Lazily created on first
+    /// file open; persists across workspace switches so tabs, scroll, and
+    /// undo state survive without reload.
+    pub editor: Option<Entity<EditorView>>,
+    /// Git status diff panel for this workspace. Some when a directory is set.
+    pub git_diff_panel: Option<Entity<GitDiffPanel>>,
+    /// Pull-request diff panel for this workspace. Some when a directory is set.
+    pub pr_diff_panel: Option<Entity<PrDiffPanel>>,
+    pub right_panel_tab: RightPanelTab,
+    pub right_panel_width: f32,
+    pub right_panel_collapsed: bool,
+    pub sidebar_collapsed: bool,
+    /// Background task watching the working tree for FS changes and refreshing
+    /// the GitDiffPanel. Held to keep the watcher alive — dropped (cancelled)
+    /// when the workspace is removed or its directory changes.
+    _diff_watcher: Option<Task<()>>,
     /// If set, this workspace is a PR review (no terminals, no user-chosen
     /// directory) and should render its `PrDiffPanel` as the main view.
     pub pr_review: Option<PrReviewState>,
 }
+
+const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 400.0;
 
 impl Workspace {
     /// Create a workspace with a directory already selected (has terminal layout).
@@ -59,17 +69,27 @@ impl Workspace {
         let git_branch = Self::detect_git_branch(&directory);
         let layout = cx.new(|cx| PaneGroup::new_terminal(Some(directory.clone()), cx));
         cx.observe(&layout, |_this, _layout, cx| cx.notify()).detach();
+
+        let git_diff_panel = cx.new(|cx| GitDiffPanel::new(directory.clone(), cx));
+        cx.observe(&git_diff_panel, |_this, _p, cx| cx.notify()).detach();
+        let pr_diff_panel = cx.new(|cx| PrDiffPanel::new(directory.clone(), cx));
+        cx.observe(&pr_diff_panel, |_this, _p, cx| cx.notify()).detach();
+        let diff_watcher = Self::start_diff_watcher(git_diff_panel.clone(), cx);
+
         Self {
             name: SharedString::from(name.to_string()),
             directory: Some(directory),
             git_branch,
             pane_statuses: Vec::new(),
             layout: Some(layout),
-            cached_editor_files: Vec::new(),
-            cached_right_panel_tab: None,
-            cached_right_panel_width: None,
-            cached_sidebar_collapsed: None,
-            cached_right_panel_collapsed: None,
+            editor: None,
+            git_diff_panel: Some(git_diff_panel),
+            pr_diff_panel: Some(pr_diff_panel),
+            right_panel_tab: RightPanelTab::Git,
+            right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
+            right_panel_collapsed: false,
+            sidebar_collapsed: false,
+            _diff_watcher: diff_watcher,
             pr_review: None,
         }
     }
@@ -83,11 +103,14 @@ impl Workspace {
             git_branch: None,
             pane_statuses: Vec::new(),
             layout: None,
-            cached_editor_files: Vec::new(),
-            cached_right_panel_tab: None,
-            cached_right_panel_width: None,
-            cached_sidebar_collapsed: None,
-            cached_right_panel_collapsed: None,
+            editor: None,
+            git_diff_panel: None,
+            pr_diff_panel: None,
+            right_panel_tab: RightPanelTab::Git,
+            right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
+            right_panel_collapsed: false,
+            sidebar_collapsed: false,
+            _diff_watcher: None,
             pr_review: None,
         }
     }
@@ -124,6 +147,11 @@ impl Workspace {
         self.directory = None;
         self.git_branch = None;
         self.layout = None;
+        // PR review workspaces don't use the right panel — drop any state.
+        self.editor = None;
+        self.git_diff_panel = None;
+        self.pr_diff_panel = None;
+        self._diff_watcher = None;
         self.pr_review = Some(PrReviewState {
             url: url.clone(),
             panel,
@@ -202,7 +230,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Set the directory for this workspace, creating the terminal layout.
+    /// Set the directory for this workspace, creating the terminal layout
+    /// and the diff panels.
     pub fn set_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         let dir_name = directory
             .file_name()
@@ -210,9 +239,41 @@ impl Workspace {
             .unwrap_or_else(|| "Workspace".to_string());
         self.name = SharedString::from(dir_name);
         self.git_branch = Self::detect_git_branch(&directory);
+
         let layout = cx.new(|cx| PaneGroup::new_terminal(Some(directory.clone()), cx));
         cx.observe(&layout, |_this, _layout, cx| cx.notify()).detach();
         self.layout = Some(layout);
+
+        // Replace any existing diff panels for the new directory. The
+        // editor stays — it's tied to the workspace, not the directory,
+        // and a workspace's directory usually doesn't change after creation.
+        let split_git = self
+            .git_diff_panel
+            .as_ref()
+            .map(|p| p.read(cx).is_split_view())
+            .unwrap_or(false);
+        let git_diff_panel = cx.new(|cx| {
+            let mut panel = GitDiffPanel::new(directory.clone(), cx);
+            panel.set_split_view(split_git);
+            panel
+        });
+        cx.observe(&git_diff_panel, |_this, _p, cx| cx.notify()).detach();
+
+        let split_pr = self
+            .pr_diff_panel
+            .as_ref()
+            .map(|p| p.read(cx).is_split_view())
+            .unwrap_or(false);
+        let pr_diff_panel = cx.new(|cx| {
+            let mut panel = PrDiffPanel::new(directory.clone(), cx);
+            panel.set_split_view(split_pr);
+            panel
+        });
+        cx.observe(&pr_diff_panel, |_this, _p, cx| cx.notify()).detach();
+
+        self._diff_watcher = Self::start_diff_watcher(git_diff_panel.clone(), cx);
+        self.git_diff_panel = Some(git_diff_panel);
+        self.pr_diff_panel = Some(pr_diff_panel);
 
         self.directory = Some(directory);
         cx.notify();
@@ -230,6 +291,45 @@ impl Workspace {
 
     pub fn is_pr_review(&self) -> bool {
         self.pr_review.is_some()
+    }
+
+    /// Open a file in this workspace's editor, creating the editor lazily.
+    /// `line` optionally navigates to a specific line after opening.
+    pub fn open_file_in_editor(
+        &mut self,
+        path: PathBuf,
+        line: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = self.directory.clone() else {
+            return;
+        };
+        if self.editor.is_none() {
+            let editor = cx.new(|cx| EditorView::new(dir, cx));
+            cx.observe(&editor, |_this, _e, cx| cx.notify()).detach();
+            self.editor = Some(editor);
+        }
+        if let Some(editor) = &self.editor {
+            editor.update(cx, |view, cx| {
+                view.open_file(path, cx);
+                if let Some(line) = line {
+                    view.navigate_to_line(line, None, cx);
+                }
+            });
+        }
+        self.right_panel_tab = RightPanelTab::Files;
+        cx.notify();
+    }
+
+    /// Notify the editor's active viewer that it needs to re-measure (e.g.
+    /// after the right panel was resized).
+    pub fn notify_active_viewer(&self, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.editor {
+            let editor = editor.read(cx);
+            if let Some(viewer) = editor.pane_group.read(cx).active_viewer(cx) {
+                viewer.update(cx, |_, cx| cx.notify());
+            }
+        }
     }
 
     fn detect_git_branch(dir: &PathBuf) -> Option<String> {
@@ -304,5 +404,112 @@ impl Workspace {
         });
     }
 
+    fn start_diff_watcher(
+        diff_panel: Entity<GitDiffPanel>,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        let workdir = diff_panel.read(cx).workdir()?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    use notify::EventKind;
+                    match event.kind {
+                        EventKind::Create(_)
+                        | EventKind::Modify(_)
+                        | EventKind::Remove(_) => {
+                            if event.paths.iter().all(|p| should_ignore_fs_path(p)) {
+                                return;
+                            }
+                            let _ = tx.send(());
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        ) {
+            Ok(w) => w,
+            Err(_) => return None,
+        };
+
+        use notify::Watcher;
+        let _ = watcher.watch(&workdir, notify::RecursiveMode::Recursive);
+
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let task = cx.spawn(async move |_ws, cx| {
+            let _watcher = watcher;
+            loop {
+                let rx = rx.clone();
+                let got_event = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let rx = rx.lock().unwrap();
+                        if rx.recv().is_err() {
+                            return false;
+                        }
+                        while rx.try_recv().is_ok() {}
+                        true
+                    })
+                    .await;
+
+                if !got_event {
+                    break;
+                }
+
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+
+                let ok = cx.update(|cx| {
+                    diff_panel.update(cx, |panel, cx| {
+                        panel.refresh();
+                        cx.notify();
+                    })
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        });
+        Some(task)
+    }
 }
 
+/// Returns true if a filesystem event for `path` should be ignored by the
+/// diff watcher. Excludes build artifacts, dependency caches, git-internal
+/// object/pack churn, and editor swap files.
+fn should_ignore_fs_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            let name = name.to_string_lossy();
+            match name.as_ref() {
+                "target"
+                | "node_modules"
+                | ".next"
+                | ".turbo"
+                | "dist"
+                | "build"
+                | ".cache"
+                | ".DS_Store" => return true,
+                _ => {}
+            }
+        }
+    }
+    let s = path.to_string_lossy();
+    if s.contains("/.git/objects/") || s.contains("/.git/lfs/") || s.contains("/.git/logs/") {
+        return true;
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.ends_with('~')
+            || name.ends_with(".swp")
+            || name.ends_with(".swx")
+            || name.starts_with(".#")
+            || (name.starts_with('#') && name.ends_with('#'))
+        {
+            return true;
+        }
+    }
+    false
+}

@@ -7,9 +7,8 @@ use crate::actions::*;
 use crate::command_center::{CommandAction, CommandCenter};
 use crate::debug::DebugPanel;
 use crate::debug::metrics::SubsystemMetrics;
-use crate::git::{GitDiffPanel, PrDiffPanel};
 use crate::recent_projects::RecentProjects;
-use crate::right_panel::{RightPanel, RightPanelTab};
+use crate::right_panel::{self, RightPanelTab};
 use crate::settings::AppSettings;
 use crate::settings::settings_panel::SettingsPanel;
 use crate::theme::colors;
@@ -42,11 +41,8 @@ const MIN_CENTER_WIDTH: f32 = 100.0;
 pub struct OperatorApp {
     pub workspaces: Vec<Entity<Workspace>>,
     pub active_workspace_ix: usize,
-    pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     resizing_sidebar: bool,
-    pub right_panel_collapsed: bool,
-    pub right_panel: Entity<RightPanel>,
     resizing_right_panel: bool,
     pub settings_panel_open: bool,
     pub _settings_panel: Entity<SettingsPanel>,
@@ -67,9 +63,6 @@ pub struct OperatorApp {
     pub update_info: Option<crate::updater::UpdateInfo>,
     /// Phase of the in-app update apply flow.
     pub update_phase: UpdatePhase,
-    /// Handle to the current diff file-watcher task. Dropped (cancelled) before
-    /// starting a new watcher so old watchers don't accumulate.
-    diff_watcher_task: Option<Task<()>>,
     /// Debug overlay showing live process metrics.
     debug_panel: Entity<DebugPanel>,
     /// Background task that periodically logs metrics to stderr.
@@ -83,10 +76,6 @@ impl OperatorApp {
         let ws = cx.new(|cx| Workspace::new_empty(cx));
         cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
 
-        let diff_panel = cx.new(|cx| GitDiffPanel::empty(cx));
-        let pr_diff_panel = cx.new(|cx| PrDiffPanel::empty(cx));
-        let right_panel = cx.new(|_cx| RightPanel::new(diff_panel, pr_diff_panel));
-
         let settings_panel = cx.new(|cx| SettingsPanel::new(cx));
         let command_center = cx.new(|cx| CommandCenter::new(cx));
         cx.observe(&command_center, |this, cc, cx| {
@@ -95,7 +84,6 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
-        let diff_watcher_task = Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
         let debug_panel = cx.new(|cx| DebugPanel::new(cx));
         let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
@@ -104,11 +92,8 @@ impl OperatorApp {
         let mut app = Self {
             workspaces: vec![ws],
             active_workspace_ix: 0,
-            sidebar_collapsed: false,
             sidebar_width: 260.0,
             resizing_sidebar: false,
-            right_panel_collapsed: false,
-            right_panel,
             resizing_right_panel: false,
             settings_panel_open: false,
             _settings_panel: settings_panel,
@@ -122,7 +107,6 @@ impl OperatorApp {
             ws_drop_index: None,
             update_info: None,
             update_phase: UpdatePhase::Idle,
-            diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
             _update_check_task: update_check_task,
@@ -134,11 +118,8 @@ impl OperatorApp {
     pub fn from_restored(
         workspaces: Vec<Entity<Workspace>>,
         active_workspace_ix: usize,
-        sidebar_collapsed: bool,
         sidebar_width: f32,
-        right_panel_collapsed: bool,
         window_bounds: Option<(f32, f32, f32, f32)>,
-        right_panel: Entity<RightPanel>,
         settings_panel: Entity<SettingsPanel>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -162,7 +143,6 @@ impl OperatorApp {
         .detach();
 
         Self::register_quit_handler(cx);
-        let diff_watcher_task = Self::start_diff_watcher_from_right_panel(right_panel.clone(), cx);
         let debug_panel = cx.new(|cx| DebugPanel::new(cx));
         let metrics_log_task = Self::start_metrics_logging(cx);
         cx.observe_global::<AppSettings>(|_this, cx| cx.notify()).detach();
@@ -171,11 +151,8 @@ impl OperatorApp {
         let mut app = Self {
             workspaces,
             active_workspace_ix,
-            sidebar_collapsed,
             sidebar_width,
             resizing_sidebar: false,
-            right_panel_collapsed,
-            right_panel,
             resizing_right_panel: false,
             settings_panel_open: false,
             _settings_panel: settings_panel,
@@ -189,7 +166,6 @@ impl OperatorApp {
             ws_drop_index: None,
             update_info: None,
             update_phase: UpdatePhase::Idle,
-            diff_watcher_task,
             debug_panel,
             _metrics_log_task: metrics_log_task,
             _update_check_task: update_check_task,
@@ -267,16 +243,20 @@ impl OperatorApp {
             }
         }
 
-        // Git diff panel
-        let rp = self.right_panel.read(cx);
-        let dp = rp.diff_panel.read(cx);
-        sub.git_diff_bytes = dp.estimated_bytes();
-        sub.git_diff_files = dp.file_count();
-
-        // PR diff panel
-        let pr = rp.pr_diff_panel.read(cx);
-        sub.pr_diff_bytes = pr.estimated_bytes();
-        sub.pr_diff_files = pr.file_count();
+        // Git + PR diff panels live per-workspace — sum across all of them.
+        for ws in &self.workspaces {
+            let ws = ws.read(cx);
+            if let Some(dp) = &ws.git_diff_panel {
+                let dp = dp.read(cx);
+                sub.git_diff_bytes += dp.estimated_bytes();
+                sub.git_diff_files += dp.file_count();
+            }
+            if let Some(pr) = &ws.pr_diff_panel {
+                let pr = pr.read(cx);
+                sub.pr_diff_bytes += pr.estimated_bytes();
+                sub.pr_diff_files += pr.file_count();
+            }
+        }
 
         sub
     }
@@ -325,92 +305,6 @@ impl OperatorApp {
                 }
             }
         })
-    }
-
-    fn start_diff_watcher_from_right_panel(right_panel: Entity<RightPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
-        let diff_panel = right_panel.read(cx).diff_panel.clone();
-        Self::start_diff_watcher(diff_panel, cx)
-    }
-
-    fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
-        // Watch the working tree recursively. This covers both file edits
-        // (creates/modifies/removes in the worktree) and git-internal state
-        // changes — `.git/` lives inside the worktree, so its index/HEAD/refs
-        // writes flow through the same watcher.
-        let workdir = diff_panel.read(cx).workdir()?;
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = match notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    use notify::EventKind;
-                    match event.kind {
-                        EventKind::Create(_)
-                        | EventKind::Modify(_)
-                        | EventKind::Remove(_) => {
-                            // Skip events that don't affect git status:
-                            // build artifacts, vendored deps, git-internal
-                            // pack/object churn, and editor swap files.
-                            if event.paths.iter().all(|p| should_ignore_fs_path(p)) {
-                                return;
-                            }
-                            let _ = tx.send(());
-                        }
-                        _ => {}
-                    }
-                }
-            },
-        ) {
-            Ok(w) => w,
-            Err(_) => return None,
-        };
-
-        use notify::Watcher;
-        let _ = watcher.watch(&workdir, notify::RecursiveMode::Recursive);
-
-        // Spawn a background thread that blocks on the watcher channel,
-        // then pokes the UI when something changes.
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let task = cx.spawn(async move |_app, cx| {
-            // Keep the watcher alive for the lifetime of this task
-            let _watcher = watcher;
-            loop {
-                let rx = rx.clone();
-                let got_event = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let rx = rx.lock().unwrap();
-                        // Wait for first event (blocking)
-                        if rx.recv().is_err() {
-                            return false;
-                        }
-                        // Drain any queued events to coalesce
-                        while rx.try_recv().is_ok() {}
-                        true
-                    })
-                    .await;
-
-                if !got_event {
-                    break;
-                }
-
-                // Small debounce so rapid FS events don't cause excessive refreshes
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(100))
-                    .await;
-
-                let ok = cx.update(|cx| {
-                    diff_panel.update(cx, |panel, cx| {
-                        panel.refresh();
-                        cx.notify();
-                    })
-                });
-                if ok.is_err() {
-                    break;
-                }
-            }
-        });
-        Some(task)
     }
 
     /// Spawn a background loop that checks for updates every hour.
@@ -532,180 +426,109 @@ impl OperatorApp {
         &self.workspaces[self.active_workspace_ix]
     }
 
-    /// Remove the active workspace, adjusting the index or quitting if none remain.
+    pub fn sidebar_collapsed(&self, cx: &App) -> bool {
+        self.active_workspace().read(cx).sidebar_collapsed
+    }
+
+    pub fn right_panel_collapsed(&self, cx: &App) -> bool {
+        self.active_workspace().read(cx).right_panel_collapsed
+    }
+
+    fn set_sidebar_collapsed(&self, collapsed: bool, cx: &mut Context<Self>) {
+        self.active_workspace().update(cx, |ws, cx| {
+            if ws.sidebar_collapsed != collapsed {
+                ws.sidebar_collapsed = collapsed;
+                cx.notify();
+            }
+        });
+    }
+
+    fn set_right_panel_collapsed(&self, collapsed: bool, cx: &mut Context<Self>) {
+        self.active_workspace().update(cx, |ws, cx| {
+            if ws.right_panel_collapsed != collapsed {
+                ws.right_panel_collapsed = collapsed;
+                cx.notify();
+            }
+        });
+    }
+
+    /// Remove the active workspace, adjusting the index or recreating an
+    /// empty welcome workspace if none remain.
     fn remove_active_workspace(&mut self, cx: &mut Context<Self>) {
-        self.cache_editor_files(cx);
         self.workspaces.remove(self.active_workspace_ix);
         if self.workspaces.is_empty() {
-            // Stop the file watcher — no workspace means no .git dir to watch
-            self.diff_watcher_task = None;
-
-            // Instead of quitting, create a fresh uninitialized workspace
+            // Recreate a fresh welcome workspace instead of quitting.
             let ws = cx.new(|cx| Workspace::new_empty(cx));
             cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
             self.workspaces.push(ws);
             self.active_workspace_ix = 0;
-            self.right_panel.update(cx, |rp, cx| {
-                rp.diff_panel.update(cx, |panel, cx| {
-                    let split = panel.is_split_view();
-                    *panel = GitDiffPanel::empty(cx);
-                    panel.set_split_view(split);
-                    cx.notify();
-                });
-                rp.pr_diff_panel.update(cx, |panel, cx| {
-                    let split = panel.is_split_view();
-                    *panel = PrDiffPanel::empty(cx);
-                    panel.set_split_view(split);
-                    cx.notify();
-                });
-                rp.editor = None;
-                cx.notify();
-            });
             cx.notify();
             return;
         }
         if self.active_workspace_ix >= self.workspaces.len() {
             self.active_workspace_ix = self.workspaces.len() - 1;
         }
-        // Restore editor files for the new active workspace
-        let new_ix = self.active_workspace_ix;
-        let dir = self.workspaces[new_ix].read(cx).directory.clone();
-        if let Some(dir) = dir {
-            self.update_right_panel_dir(dir, cx);
-            self.restore_editor_files_for_workspace(new_ix, cx);
-        }
         cx.notify();
+    }
+
+    fn push_inheriting_workspace(
+        &mut self,
+        ws: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let prev_ix = self.active_workspace_ix;
+        if let Some(prev) = self.workspaces.get(prev_ix) {
+            let snapshot = {
+                let p = prev.read(cx);
+                (
+                    p.right_panel_tab,
+                    p.right_panel_width,
+                    p.right_panel_collapsed,
+                    p.sidebar_collapsed,
+                )
+            };
+            ws.update(cx, |ws, _| {
+                ws.right_panel_tab = snapshot.0;
+                ws.right_panel_width = snapshot.1;
+                ws.right_panel_collapsed = snapshot.2;
+                ws.sidebar_collapsed = snapshot.3;
+            });
+        }
+        cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
+        self.workspaces.push(ws);
+        self.active_workspace_ix = self.workspaces.len() - 1;
     }
 
     fn new_workspace(&mut self, _: &NewWorkspace, _window: &mut Window, cx: &mut Context<Self>) {
         let ws = cx.new(|cx| Workspace::new_empty(cx));
-        cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
-        self.workspaces.push(ws);
-        self.active_workspace_ix = self.workspaces.len() - 1;
+        self.push_inheriting_workspace(ws, cx);
         cx.notify();
     }
 
-    /// Cache the current editor's open files into the active workspace,
-    /// so they survive workspace switches and session saves.
-    fn cache_editor_files(&self, cx: &mut Context<Self>) {
-        let files = self.right_panel.read(cx)
-            .editor.as_ref()
-            .map(|e| e.read(cx).all_open_files(cx))
-            .unwrap_or_default();
-        if let Some(ws) = self.workspaces.get(self.active_workspace_ix) {
-            ws.update(cx, |ws, _cx| {
-                ws.cached_editor_files = files;
-            });
-        }
-    }
-
-    /// Cache the right panel's active tab and width into the active workspace.
-    /// Cache the right panel and sidebar state into the active workspace.
-    fn cache_right_panel_state(&self, cx: &mut Context<Self>) {
-        let rp = self.right_panel.read(cx);
-        let tab = match rp.active_tab {
-            RightPanelTab::Files => "files",
-            RightPanelTab::Git => "git",
-            RightPanelTab::Pr => "pr",
-        };
-        let width = rp.width;
-        let sb_collapsed = self.sidebar_collapsed;
-        let rp_collapsed = self.right_panel_collapsed;
-        if let Some(ws) = self.workspaces.get(self.active_workspace_ix) {
-            ws.update(cx, |ws, _cx| {
-                ws.cached_right_panel_tab = Some(tab.to_string());
-                ws.cached_right_panel_width = Some(width);
-                ws.cached_sidebar_collapsed = Some(sb_collapsed);
-                ws.cached_right_panel_collapsed = Some(rp_collapsed);
-            });
-        }
-    }
-
-    /// Restore the right panel and sidebar state from the given workspace.
-    fn restore_right_panel_state(&mut self, ws_ix: usize, cx: &mut Context<Self>) {
-        let (tab, width, sb_collapsed, rp_collapsed) = {
-            let Some(ws) = self.workspaces.get(ws_ix) else { return };
-            let ws = ws.read(cx);
-            (
-                ws.cached_right_panel_tab.clone(),
-                ws.cached_right_panel_width,
-                ws.cached_sidebar_collapsed,
-                ws.cached_right_panel_collapsed,
-            )
-        };
-        self.right_panel.update(cx, |rp, cx| {
-            if let Some(ref tab_str) = tab {
-                rp.active_tab = match tab_str.as_str() {
-                    "files" => RightPanelTab::Files,
-                    "pr" => RightPanelTab::Pr,
-                    _ => RightPanelTab::Git,
-                };
-            }
-            if let Some(w) = width {
-                rp.width = w;
-            }
-            cx.notify();
-        });
-        if let Some(sc) = sb_collapsed {
-            self.sidebar_collapsed = sc;
-        }
-        if let Some(rc) = rp_collapsed {
-            self.right_panel_collapsed = rc;
-        }
-    }
-
-    /// Restore cached editor files for the given workspace into the right panel editor.
-    fn restore_editor_files_for_workspace(&self, ws_ix: usize, cx: &mut Context<Self>) {
-        let (dir, files) = {
-            let Some(ws) = self.workspaces.get(ws_ix) else { return };
-            let ws = ws.read(cx);
-            match &ws.directory {
-                Some(dir) => (dir.clone(), ws.cached_editor_files.clone()),
-                None => return,
-            }
-        };
-        if files.is_empty() {
-            return;
-        }
-        self.right_panel.update(cx, |rp, cx| {
-            rp.ensure_editor(dir, cx);
-            if let Some(editor) = &rp.editor {
-                editor.update(cx, |editor, cx| {
-                    for file_path in &files {
-                        if file_path.exists() {
-                            editor.open_file(file_path.clone(), cx);
-                        }
-                    }
-                });
-            }
-        });
-    }
-
     /// Whether the file editor in the right panel is currently focused.
-    fn editor_focused(&self) -> bool {
-        self.focus_region == FocusRegion::RightPanel && !self.right_panel_collapsed
+    fn editor_focused(&self, cx: &App) -> bool {
+        self.focus_region == FocusRegion::RightPanel && !self.right_panel_collapsed(cx)
     }
 
-    /// Run a closure on the editor's pane group if it exists.
+    /// Run a closure on the active workspace's editor's pane group if present.
     fn with_editor_pane_group(
         &self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut crate::pane::PaneGroup, &mut App),
     ) {
-        self.right_panel.update(cx, |rp, cx| {
-            if let Some(editor) = &rp.editor {
-                editor.update(cx, |ev, cx| {
-                    ev.pane_group.update(cx, |pg, cx| {
-                        f(pg, cx);
-                        cx.notify();
-                    });
+        let editor = self.active_workspace().read(cx).editor.clone();
+        if let Some(editor) = editor {
+            editor.update(cx, |ev, cx| {
+                ev.pane_group.update(cx, |pg, cx| {
+                    f(pg, cx);
+                    cx.notify();
                 });
-            }
-        });
+            });
+        }
     }
 
     fn new_tab(&mut self, _: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_focused() {
+        if self.editor_focused(cx) {
             self.with_editor_pane_group(cx, |pg, cx| {
                 pg.add_tab_to_focused(cx);
             });
@@ -716,7 +539,7 @@ impl OperatorApp {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_focused() {
+        if self.editor_focused(cx) {
             self.with_editor_pane_group(cx, |pg, cx| {
                 pg.close_focused_tab(cx);
             });
@@ -753,7 +576,7 @@ impl OperatorApp {
     }
 
     fn next_tab(&mut self, _: &NextTab, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_focused() {
+        if self.editor_focused(cx) {
             self.with_editor_pane_group(cx, |pg, _cx| {
                 pg.next_tab_in_focused();
             });
@@ -764,7 +587,7 @@ impl OperatorApp {
     }
 
     fn prev_tab(&mut self, _: &PrevTab, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_focused() {
+        if self.editor_focused(cx) {
             self.with_editor_pane_group(cx, |pg, _cx| {
                 pg.prev_tab_in_focused();
             });
@@ -775,7 +598,7 @@ impl OperatorApp {
     }
 
     fn split_pane(&mut self, _: &SplitPane, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_focused() {
+        if self.editor_focused(cx) {
             self.with_editor_pane_group(cx, |pg, cx| {
                 pg.split(crate::pane::pane_group::SplitAxis::Horizontal, cx);
             });
@@ -791,7 +614,7 @@ impl OperatorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editor_focused() {
+        if self.editor_focused(cx) {
             self.with_editor_pane_group(cx, |pg, cx| {
                 pg.split(crate::pane::pane_group::SplitAxis::Vertical, cx);
             });
@@ -802,7 +625,8 @@ impl OperatorApp {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
+        let collapsed = self.sidebar_collapsed(cx);
+        self.set_sidebar_collapsed(!collapsed, cx);
         cx.notify();
     }
 
@@ -812,14 +636,14 @@ impl OperatorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.right_panel_collapsed {
+        if self.right_panel_collapsed(cx) {
             self.show_right_panel_tab(RightPanelTab::Git, cx);
         } else {
-            let current = self.right_panel.read(cx).active_tab;
+            let current = self.active_workspace().read(cx).right_panel_tab;
             match current {
                 RightPanelTab::Git => self.show_right_panel_tab(RightPanelTab::Pr, cx),
                 RightPanelTab::Pr => {
-                    self.right_panel_collapsed = true;
+                    self.set_right_panel_collapsed(true, cx);
                     self.focus_region = FocusRegion::Center;
                     cx.notify();
                 }
@@ -847,37 +671,41 @@ impl OperatorApp {
     }
 
     fn show_right_panel_tab(&mut self, tab: RightPanelTab, cx: &mut Context<Self>) {
-        let is_same_tab = self.right_panel.read(cx).active_tab == tab;
-        if !self.right_panel_collapsed && is_same_tab {
+        let ws = self.active_workspace().clone();
+        let (current_tab, collapsed) = {
+            let w = ws.read(cx);
+            (w.right_panel_tab, w.right_panel_collapsed)
+        };
+        let is_same_tab = current_tab == tab;
+        if !collapsed && is_same_tab {
             // Toggle off if already showing this tab
-            self.right_panel_collapsed = true;
+            ws.update(cx, |w, cx| {
+                w.right_panel_collapsed = true;
+                cx.notify();
+            });
             self.focus_region = FocusRegion::Center;
         } else {
-            self.right_panel_collapsed = false;
-            self.focus_region = FocusRegion::RightPanel;
-            self.right_panel.update(cx, |rp, cx| {
-                rp.active_tab = tab;
+            ws.update(cx, |w, cx| {
+                w.right_panel_collapsed = false;
+                w.right_panel_tab = tab;
                 if tab == RightPanelTab::Git {
-                    rp.diff_panel.update(cx, |panel, cx| {
-                        panel.refresh();
-                        cx.notify();
-                    });
+                    if let Some(dp) = &w.git_diff_panel {
+                        dp.update(cx, |panel, cx| {
+                            panel.refresh();
+                            cx.notify();
+                        });
+                    }
                 }
                 if tab == RightPanelTab::Pr {
-                    rp.pr_diff_panel.update(cx, |panel, cx| {
-                        panel.refresh(cx);
-                    });
+                    if let Some(pr) = &w.pr_diff_panel {
+                        pr.update(cx, |panel, cx| {
+                            panel.refresh(cx);
+                        });
+                    }
                 }
                 cx.notify();
             });
-            // Ensure editor has the right directory
-            if tab == RightPanelTab::Files {
-                if let Some(dir) = self.active_workspace().read(cx).directory.clone() {
-                    self.right_panel.update(cx, |rp, cx| {
-                        rp.ensure_editor(dir, cx);
-                    });
-                }
-            }
+            self.focus_region = FocusRegion::RightPanel;
         }
         cx.notify();
     }
@@ -1008,9 +836,7 @@ impl OperatorApp {
         let active_is_empty = self.active_workspace().read(cx).is_empty_welcome();
         if !active_is_empty {
             let new_ws = cx.new(|cx| Workspace::new_empty(cx));
-            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
-            self.workspaces.push(new_ws);
-            self.active_workspace_ix = self.workspaces.len() - 1;
+            self.push_inheriting_workspace(new_ws, cx);
             cx.notify();
         }
         let prev = window.focused(cx);
@@ -1118,7 +944,8 @@ impl OperatorApp {
                     self.show_right_panel_tab(RightPanelTab::Files, cx);
                 }
                 CommandAction::ToggleSidebar => {
-                    self.sidebar_collapsed = !self.sidebar_collapsed;
+                    let collapsed = self.sidebar_collapsed(cx);
+                    self.set_sidebar_collapsed(!collapsed, cx);
                     cx.notify();
                 }
                 CommandAction::ToggleDiffPanel => {
@@ -1160,19 +987,15 @@ impl OperatorApp {
         cx: &mut Context<Self>,
     ) {
         let ws = self.active_workspace().clone();
-        let has_dir = ws.read(cx).has_directory();
-        if !has_dir {
+        if !ws.read(cx).has_directory() {
             return;
         }
-
-        if let Some(dir) = ws.read(cx).directory.clone() {
-            self.right_panel_collapsed = false;
-            self.focus_region = FocusRegion::RightPanel;
-            self.right_panel.update(cx, |rp, cx| {
-                rp.open_file(result.path.clone(), dir, Some(result.line_num), cx);
-            });
-            cx.notify();
-        }
+        ws.update(cx, |ws, cx| {
+            ws.right_panel_collapsed = false;
+            ws.open_file_in_editor(result.path.clone(), Some(result.line_num), cx);
+        });
+        self.focus_region = FocusRegion::RightPanel;
+        cx.notify();
     }
 
     /// Open a file from a file name search result (Cmd+P) in the editor.
@@ -1181,15 +1004,12 @@ impl OperatorApp {
         if !ws.read(cx).has_directory() {
             return;
         }
-
-        if let Some(dir) = ws.read(cx).directory.clone() {
-            self.right_panel_collapsed = false;
-            self.focus_region = FocusRegion::RightPanel;
-            self.right_panel.update(cx, |rp, cx| {
-                rp.open_file(path, dir, None, cx);
-            });
-            cx.notify();
-        }
+        ws.update(cx, |ws, cx| {
+            ws.right_panel_collapsed = false;
+            ws.open_file_in_editor(path, None, cx);
+        });
+        self.focus_region = FocusRegion::RightPanel;
+        cx.notify();
     }
 
     /// Create a PR review workspace from a URL. Reuses the current workspace
@@ -1202,8 +1022,6 @@ impl OperatorApp {
             w.is_empty_welcome() || w.is_pr_review()
         };
         if reuse {
-            self.cache_editor_files(cx);
-            self.cache_right_panel_state(cx);
             ws.update(cx, |ws, cx| ws.init_pr_review(url, cx));
         } else {
             let new_ws = cx.new(|cx| {
@@ -1211,28 +1029,8 @@ impl OperatorApp {
                 ws.init_pr_review(url, cx);
                 ws
             });
-            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
-            self.workspaces.push(new_ws);
-            self.active_workspace_ix = self.workspaces.len() - 1;
+            self.push_inheriting_workspace(new_ws, cx);
         }
-        // PR review workspaces don't use the right panel at all.
-        self.right_panel.update(cx, |rp, cx| {
-            rp.diff_panel.update(cx, |panel, cx| {
-                let split = panel.is_split_view();
-                *panel = GitDiffPanel::empty(cx);
-                panel.set_split_view(split);
-                cx.notify();
-            });
-            rp.pr_diff_panel.update(cx, |panel, cx| {
-                let split = panel.is_split_view();
-                *panel = PrDiffPanel::empty(cx);
-                panel.set_split_view(split);
-                cx.notify();
-            });
-            rp.editor = None;
-            cx.notify();
-        });
-        self.diff_watcher_task = None;
         cx.notify();
     }
 
@@ -1241,24 +1039,17 @@ impl OperatorApp {
         // Track in recent projects (update cached copy and persist)
         self.recent_projects.add(dir.clone());
 
-        // Cache current editor files before changing directories
-        self.cache_editor_files(cx);
-
         let ws = self.active_workspace().clone();
         if ws.read(cx).is_empty_welcome() {
             ws.update(cx, |ws, cx| ws.set_directory(dir.clone(), cx));
         } else {
-            // Create a new workspace for this directory
             let dir_name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Workspace".to_string());
             let new_ws = cx.new(|cx| Workspace::new(&dir_name, dir.clone(), cx));
-            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
-            self.workspaces.push(new_ws);
-            self.active_workspace_ix = self.workspaces.len() - 1;
+            self.push_inheriting_workspace(new_ws, cx);
         }
-        self.update_right_panel_dir(dir, cx);
         // Invalidate the file search index so it rebuilds for the new directory
         self.command_center.update(cx, |cc, _cx| {
             cc.invalidate_file_index();
@@ -1266,39 +1057,17 @@ impl OperatorApp {
         cx.notify();
     }
 
-    /// Switch to a different workspace, caching editor state and restoring the target's files.
+    /// Switch to a different workspace. Each workspace owns its own editor
+    /// and diff panels — switching is a pointer change, no reload needed.
     fn switch_to_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix >= self.workspaces.len() || ix == self.active_workspace_ix {
             return;
         }
-        self.cache_editor_files(cx);
-        self.cache_right_panel_state(cx);
         self.active_workspace_ix = ix;
-        let dir = self.workspaces[ix].read(cx).directory.clone();
-        // Always restore sidebar/panel collapsed states
-        self.restore_right_panel_state(ix, cx);
-
-        if let Some(dir) = dir {
-            self.update_right_panel_dir(dir, cx);
-            self.restore_editor_files_for_workspace(ix, cx);
-        } else {
-            self.right_panel.update(cx, |rp, cx| {
-                rp.diff_panel.update(cx, |panel, cx| {
-                    let split = panel.is_split_view();
-                    *panel = GitDiffPanel::empty(cx);
-                    panel.set_split_view(split);
-                    cx.notify();
-                });
-                rp.pr_diff_panel.update(cx, |panel, cx| {
-                    let split = panel.is_split_view();
-                    *panel = PrDiffPanel::empty(cx);
-                    panel.set_split_view(split);
-                    cx.notify();
-                });
-                rp.editor = None;
-                cx.notify();
-            });
-        }
+        // Keep file index in sync with the new workspace's directory.
+        self.command_center.update(cx, |cc, _cx| {
+            cc.invalidate_file_index();
+        });
         cx.notify();
     }
 
@@ -1308,34 +1077,6 @@ impl OperatorApp {
             self.switch_to_workspace(ix, cx);
             self.focus_handle.focus(window);
         }
-    }
-
-    /// Point the right panel at a new working directory and restart the file watcher.
-    fn update_right_panel_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        // Drop the old watcher task so it stops watching the previous .git dir
-        self.diff_watcher_task = None;
-
-        self.right_panel.update(cx, |rp, cx| {
-            rp.diff_panel.update(cx, |panel, cx| {
-                let w = panel.width;
-                let split = panel.is_split_view();
-                *panel = GitDiffPanel::new(dir.clone(), cx);
-                panel.width = w;
-                panel.set_split_view(split);
-                cx.notify();
-            });
-            rp.pr_diff_panel.update(cx, |panel, cx| {
-                let w = panel.width;
-                let split = panel.is_split_view();
-                *panel = PrDiffPanel::new(dir.clone(), cx);
-                panel.width = w;
-                panel.set_split_view(split);
-                cx.notify();
-            });
-            rp.set_directory(dir, cx);
-        });
-        let diff_panel = self.right_panel.read(cx).diff_panel.clone();
-        self.diff_watcher_task = Self::start_diff_watcher(diff_panel, cx);
     }
 
     /// Open the OS directory picker and set directory on the active workspace.
@@ -1389,7 +1130,6 @@ impl OperatorApp {
                 if let Some(dir) = paths.into_iter().next() {
                     let _ = cx.update(|cx| {
                         let _ = this.update(cx, |app, cx| {
-                            app.cache_editor_files(cx);
                             app.recent_projects.add(dir.clone());
 
                             let dir_name = dir
@@ -1397,10 +1137,7 @@ impl OperatorApp {
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| "Workspace".to_string());
                             let new_ws = cx.new(|cx| Workspace::new(&dir_name, dir.clone(), cx));
-                            cx.observe(&new_ws, |_this, _ws, cx| cx.notify()).detach();
-                            app.workspaces.push(new_ws);
-                            app.active_workspace_ix = app.workspaces.len() - 1;
-                            app.update_right_panel_dir(dir, cx);
+                            app.push_inheriting_workspace(new_ws, cx);
                             app.command_center.update(cx, |cc, _cx| {
                                 cc.invalidate_file_index();
                             });
@@ -1427,7 +1164,7 @@ impl OperatorApp {
         // When the sidebar is collapsed, the tab bar is the leftmost element
         // and needs to clear the macOS traffic light buttons (~70px).
         // 70px for traffic lights + 28px for the sidebar toggle button
-        let tab_bar_left_inset = if self.sidebar_collapsed { px(98.0) } else { px(0.0) };
+        let tab_bar_left_inset = if ws.sidebar_collapsed { px(98.0) } else { px(0.0) };
 
         if let Some(pr_state) = ws.pr_review.as_ref() {
             self.render_pr_review_center(
@@ -1896,7 +1633,9 @@ impl Render for OperatorApp {
 
         let sidebar_width = self.sidebar_width;
         let ws_drop_index = self.ws_drop_index;
-        let sidebar = if !self.sidebar_collapsed {
+        let sidebar_collapsed = self.sidebar_collapsed(cx);
+        let right_panel_collapsed = self.right_panel_collapsed(cx);
+        let sidebar = if !sidebar_collapsed {
             Some(WorkspaceSidebar::render_with_width(
                 &ws_cards,
                 self.active_workspace_ix,
@@ -1908,9 +1647,7 @@ impl Render for OperatorApp {
                 Rc::new(move |_window, cx| {
                     app_entity2.update(cx, |app, cx| {
                         let ws = cx.new(|cx| Workspace::new_empty(cx));
-                        cx.observe(&ws, |_this, _ws, cx| cx.notify()).detach();
-                        app.workspaces.push(ws);
-                        app.active_workspace_ix = app.workspaces.len() - 1;
+                        app.push_inheriting_workspace(ws, cx);
                         cx.notify();
                     });
                 }),
@@ -1919,10 +1656,6 @@ impl Render for OperatorApp {
                         if app.workspaces.len() <= 1 {
                             return; // Don't close the last workspace
                         }
-                        // Cache files before removing if closing the active workspace
-                        if ix == app.active_workspace_ix {
-                            app.cache_editor_files(cx);
-                        }
                         app.workspaces.remove(ix);
                         if app.active_workspace_ix >= app.workspaces.len() {
                             app.active_workspace_ix = app.workspaces.len() - 1;
@@ -1930,12 +1663,6 @@ impl Render for OperatorApp {
                             app.active_workspace_ix -= 1;
                         } else if app.active_workspace_ix == ix {
                             app.active_workspace_ix = app.active_workspace_ix.min(app.workspaces.len() - 1);
-                        }
-                        let new_ix = app.active_workspace_ix;
-                        let dir = app.workspaces[new_ix].read(cx).directory.clone();
-                        if let Some(dir) = dir {
-                            app.update_right_panel_dir(dir, cx);
-                            app.restore_editor_files_for_workspace(new_ix, cx);
                         }
                         cx.notify();
                     });
@@ -2004,11 +1731,11 @@ impl Render for OperatorApp {
 
         let active_is_pr_review = self.active_workspace().read(cx).is_pr_review();
         let center_focused = self.focus_region == FocusRegion::Center
-            || self.right_panel_collapsed
+            || right_panel_collapsed
             || active_is_pr_review;
         let center = self.render_center(center_focused, cx);
-        let right_panel = if !self.right_panel_collapsed && !active_is_pr_review {
-            Some(self.right_panel.clone())
+        let right_panel = if !right_panel_collapsed && !active_is_pr_review {
+            right_panel::render_right_panel(self.active_workspace().clone(), cx)
         } else {
             None
         };
@@ -2066,12 +1793,12 @@ impl Render for OperatorApp {
                     }
                     if app.resizing_right_panel {
                         let window_width = f32::from(window.bounds().size.width);
-                        let left_edge = if app.sidebar_collapsed { 0.0 } else { app.sidebar_width };
+                        let left_edge = if app.sidebar_collapsed(cx) { 0.0 } else { app.sidebar_width };
                         let max_right = window_width - left_edge - MIN_CENTER_WIDTH;
                         let new_width = (window_width - x).clamp(MIN_RIGHT_PANEL_WIDTH, max_right);
-                        app.right_panel.update(cx, |rp, cx| {
-                            rp.width = new_width;
-                            rp.notify_active_viewer(cx);
+                        app.active_workspace().update(cx, |ws, cx| {
+                            ws.right_panel_width = new_width;
+                            ws.notify_active_viewer(cx);
                             cx.notify();
                         });
                         cx.notify();
@@ -2110,10 +1837,9 @@ impl Render for OperatorApp {
             );
         }
         let right_focused = self.focus_region == FocusRegion::RightPanel
-            && !self.right_panel_collapsed;
+            && !right_panel_collapsed;
 
         let app_focus_center = cx.entity().clone();
-        let sidebar_collapsed = self.sidebar_collapsed;
         let app_toggle_sidebar = cx.entity().clone();
         let app_toggle_right = cx.entity().clone();
 
@@ -2211,7 +1937,8 @@ impl Render for OperatorApp {
                     .tooltip(|_window, cx| util::render_tooltip("Toggle Sidebar (Cmd+B)", cx))
                     .on_click(move |_, _window, cx| {
                         app_toggle_sidebar.update(cx, |app, cx| {
-                            app.sidebar_collapsed = !app.sidebar_collapsed;
+                            let collapsed = app.sidebar_collapsed(cx);
+                            app.set_sidebar_collapsed(!collapsed, cx);
                             cx.notify();
                         });
                     })
@@ -2245,7 +1972,8 @@ impl Render for OperatorApp {
                 .tooltip(|_window, cx| util::render_tooltip("Toggle Right Panel (Cmd+E)", cx))
                 .on_click(move |_, _window, cx| {
                     app_toggle_right.update(cx, |app, cx| {
-                        app.right_panel_collapsed = !app.right_panel_collapsed;
+                        let collapsed = app.right_panel_collapsed(cx);
+                        app.set_right_panel_collapsed(!collapsed, cx);
                         cx.notify();
                     });
                 })
@@ -2377,47 +2105,5 @@ impl Render for OperatorApp {
 
 fn short_path(path: &PathBuf) -> String {
     crate::util::short_path(path)
-}
-
-/// Returns true if a filesystem event for `path` should be ignored by the
-/// diff watcher. We exclude build artifacts, dependency caches, git-internal
-/// object/pack churn, and editor swap files — none of which affect the diff
-/// the user cares about, and all of which can fire many events per second.
-fn should_ignore_fs_path(path: &std::path::Path) -> bool {
-    use std::path::Component;
-    for component in path.components() {
-        if let Component::Normal(name) = component {
-            let name = name.to_string_lossy();
-            match name.as_ref() {
-                "target"
-                | "node_modules"
-                | ".next"
-                | ".turbo"
-                | "dist"
-                | "build"
-                | ".cache"
-                | ".DS_Store" => return true,
-                _ => {}
-            }
-        }
-    }
-    // Inside .git/, only the index, HEAD, and refs matter for our diff.
-    // Pack/object writes happen on every fetch/gc and don't change status.
-    let s = path.to_string_lossy();
-    if s.contains("/.git/objects/") || s.contains("/.git/lfs/") || s.contains("/.git/logs/") {
-        return true;
-    }
-    // Editor swap/temp files.
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.ends_with('~')
-            || name.ends_with(".swp")
-            || name.ends_with(".swx")
-            || name.starts_with(".#")
-            || (name.starts_with('#') && name.ends_with('#'))
-        {
-            return true;
-        }
-    }
-    false
 }
 

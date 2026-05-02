@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::pane::pane_group::{SplitAxis, SplitNode, TabGroup};
 use crate::pane::PaneGroup;
-use crate::right_panel::{RightPanel, RightPanelTab};
+use crate::right_panel::RightPanelTab;
 use crate::tab::tab::Tab;
 
 /// Serializable snapshot of the entire app state.
@@ -20,6 +20,9 @@ pub struct SettingsState {
     pub vim_mode: bool,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Legacy global sidebar/right-panel state — kept for backwards-compat
+    /// load. New saves still populate them from the active workspace so an
+    /// older binary can roughly restore.
     pub sidebar_collapsed: bool,
     pub sidebar_width: f32,
     #[serde(default)]
@@ -40,7 +43,8 @@ pub struct SettingsState {
     /// Whether the diff viewer uses split (side-by-side) mode instead of unified.
     #[serde(default)]
     pub diff_view_split: bool,
-    /// Editor state for the right panel
+    /// Legacy global editor open files. Newer saves keep editor files
+    /// per-workspace; this is read only on legacy session restore.
     #[serde(default)]
     pub editor_open_files: Vec<PathBuf>,
     #[serde(default)]
@@ -127,72 +131,84 @@ pub struct EditorState {
     pub active_file_ix: usize,
 }
 
+fn rp_tab_str(tab: RightPanelTab) -> &'static str {
+    match tab {
+        RightPanelTab::Files => "files",
+        RightPanelTab::Git => "git",
+        RightPanelTab::Pr => "pr",
+    }
+}
+
+fn rp_tab_from_str(s: &str) -> RightPanelTab {
+    match s {
+        "files" => RightPanelTab::Files,
+        "pr" => RightPanelTab::Pr,
+        _ => RightPanelTab::Git,
+    }
+}
+
 // ── Snapshot capture ──
 
 impl SessionState {
     pub fn capture(app: &crate::app::OperatorApp, cx: &gpui::App) -> Self {
         let settings = crate::settings::AppSettings::get(cx);
 
-        let rp = app.right_panel.read(cx);
-        let right_panel_tab = match rp.active_tab {
-            RightPanelTab::Files => "files",
-            RightPanelTab::Git => "git",
-            RightPanelTab::Pr => "pr",
-        };
-
-        let diff_view_split = rp.diff_panel.read(cx).is_split_view();
-
-        // Get live editor files for the active workspace
-        let live_editor_files: Vec<PathBuf> = rp.editor.as_ref()
-            .map(|editor| editor.read(cx).all_open_files(cx))
-            .unwrap_or_default();
-
         let workspaces: Vec<WorkspaceState> = app
             .workspaces
             .iter()
-            .enumerate()
-            .map(|(i, ws_entity)| {
+            .map(|ws_entity| {
                 let ws = ws_entity.read(cx);
                 let layout = ws.layout.as_ref().map(|pg_entity| {
                     let pg = pg_entity.read(cx);
                     Self::capture_split_node(&pg.root, cx)
                 });
-                // Active workspace: use live editor files; others: use cached
-                let open_files = if i == app.active_workspace_ix {
-                    live_editor_files.clone()
-                } else {
-                    ws.cached_editor_files.clone()
-                };
-                // Active workspace: use live right panel state; others: use cached
-                let (rp_tab, rp_width, sb_collapsed, rp_collapsed) =
-                    if i == app.active_workspace_ix {
-                        (
-                            Some(right_panel_tab.to_string()),
-                            Some(rp.width),
-                            Some(app.sidebar_collapsed),
-                            Some(app.right_panel_collapsed),
-                        )
-                    } else {
-                        (
-                            ws.cached_right_panel_tab.clone(),
-                            ws.cached_right_panel_width,
-                            ws.cached_sidebar_collapsed,
-                            ws.cached_right_panel_collapsed,
-                        )
-                    };
+                let open_files = ws
+                    .editor
+                    .as_ref()
+                    .map(|e| e.read(cx).all_open_files(cx))
+                    .unwrap_or_default();
                 WorkspaceState {
                     name: ws.name.to_string(),
                     directory: ws.directory.clone(),
                     layout,
                     open_files,
-                    right_panel_tab: rp_tab,
-                    right_panel_width: rp_width,
-                    sidebar_collapsed: sb_collapsed,
-                    right_panel_collapsed: rp_collapsed,
+                    right_panel_tab: Some(rp_tab_str(ws.right_panel_tab).to_string()),
+                    right_panel_width: Some(ws.right_panel_width),
+                    sidebar_collapsed: Some(ws.sidebar_collapsed),
+                    right_panel_collapsed: Some(ws.right_panel_collapsed),
                     pr_review_url: ws.pr_review.as_ref().map(|s| s.url.clone()),
                 }
             })
             .collect();
+
+        // Legacy SettingsState fields: populate from the active workspace so
+        // older binaries reading this file still get sensible defaults.
+        let active = app.workspaces.get(app.active_workspace_ix).map(|w| w.read(cx));
+        let (rp_tab, rp_width, sb_collapsed, rp_collapsed, diff_split, active_files) = match active
+        {
+            Some(ws) => (
+                rp_tab_str(ws.right_panel_tab).to_string(),
+                ws.right_panel_width,
+                ws.sidebar_collapsed,
+                ws.right_panel_collapsed,
+                ws.git_diff_panel
+                    .as_ref()
+                    .map(|p| p.read(cx).is_split_view())
+                    .unwrap_or(false),
+                ws.editor
+                    .as_ref()
+                    .map(|e| e.read(cx).all_open_files(cx))
+                    .unwrap_or_default(),
+            ),
+            None => (
+                "git".to_string(),
+                400.0,
+                false,
+                false,
+                false,
+                Vec::new(),
+            ),
+        };
 
         SessionState {
             workspaces,
@@ -200,20 +216,19 @@ impl SessionState {
             settings: SettingsState {
                 vim_mode: settings.vim_mode,
                 theme: settings.theme.clone(),
-                sidebar_collapsed: app.sidebar_collapsed,
+                sidebar_collapsed: sb_collapsed,
                 sidebar_width: app.sidebar_width,
-                right_panel_collapsed: app.right_panel_collapsed,
-                right_panel_width: rp.width,
-                right_panel_tab: right_panel_tab.to_string(),
-                diff_panel_collapsed: app.right_panel_collapsed,
-                diff_panel_width: rp.width,
+                right_panel_collapsed: rp_collapsed,
+                right_panel_width: rp_width,
+                right_panel_tab: rp_tab,
+                diff_panel_collapsed: rp_collapsed,
+                diff_panel_width: rp_width,
                 window_x: app.window_bounds.map(|b| b.0),
                 window_y: app.window_bounds.map(|b| b.1),
                 window_width: app.window_bounds.map(|b| b.2),
                 window_height: app.window_bounds.map(|b| b.3),
-                diff_view_split,
-                // Legacy: keep for backwards compat, populated from active workspace
-                editor_open_files: live_editor_files,
+                diff_view_split: diff_split,
+                editor_open_files: active_files,
                 editor_active_file_ix: 0,
             },
         }
@@ -274,24 +289,24 @@ impl SessionState {
             settings.theme = theme_name;
         });
 
-        let sidebar_collapsed = self.settings.sidebar_collapsed;
         let sidebar_width = self.settings.sidebar_width;
-        // Support both new and legacy field names
-        let right_panel_collapsed = if self.settings.right_panel_collapsed {
+        // Legacy fallbacks (used only when a workspace doesn't carry its own
+        // values, e.g. old session files).
+        let legacy_rp_collapsed = if self.settings.right_panel_collapsed {
             true
         } else {
             self.settings.diff_panel_collapsed
         };
-        let right_panel_width = if self.settings.right_panel_width > 0.0 {
+        let legacy_rp_width = if self.settings.right_panel_width > 0.0 {
             self.settings.right_panel_width
         } else {
             self.settings.diff_panel_width.max(400.0)
         };
-        let right_panel_tab = match self.settings.right_panel_tab.as_str() {
-            "files" => RightPanelTab::Files,
-            "pr" => RightPanelTab::Pr,
-            _ => RightPanelTab::Git,
-        };
+        let legacy_rp_tab = rp_tab_from_str(&self.settings.right_panel_tab);
+        let legacy_sb_collapsed = self.settings.sidebar_collapsed;
+        let legacy_diff_split = self.settings.diff_view_split;
+        let legacy_editor_files = self.settings.editor_open_files.clone();
+
         let window_bounds = match (
             self.settings.window_x,
             self.settings.window_y,
@@ -305,17 +320,33 @@ impl SessionState {
         let workspaces: Vec<gpui::Entity<crate::workspace::Workspace>> = self
             .workspaces
             .iter()
-            .map(|ws_state| {
+            .enumerate()
+            .map(|(i, ws_state)| {
                 if let Some(dir) = &ws_state.directory {
                     let name = ws_state.name.clone();
                     let dir = dir.clone();
                     let layout_state = ws_state.layout.clone();
-                    let open_files = ws_state.open_files.clone();
+                    // Older sessions may have the editor open files stashed in
+                    // the legacy global field. Use it for the active workspace.
+                    let mut open_files = ws_state.open_files.clone();
+                    if open_files.is_empty() && i == self.active_workspace_ix {
+                        open_files = legacy_editor_files.clone();
+                    }
+                    let rp_tab = ws_state
+                        .right_panel_tab
+                        .as_deref()
+                        .map(rp_tab_from_str)
+                        .unwrap_or(legacy_rp_tab);
+                    let rp_width = ws_state.right_panel_width.unwrap_or(legacy_rp_width);
+                    let sb_collapsed = ws_state.sidebar_collapsed.unwrap_or(legacy_sb_collapsed);
+                    let rp_collapsed = ws_state
+                        .right_panel_collapsed
+                        .unwrap_or(legacy_rp_collapsed);
                     cx.new(|cx: &mut gpui::Context<crate::workspace::Workspace>| {
                         let dir_for_layout = dir.clone();
                         let mut ws = crate::workspace::Workspace::new(
                             &name,
-                            dir,
+                            dir.clone(),
                             cx,
                         );
                         // Replace the default layout with the restored one
@@ -334,11 +365,31 @@ impl SessionState {
                                 .detach();
                             ws.layout = Some(layout);
                         }
-                        ws.cached_editor_files = open_files;
-                        ws.cached_right_panel_tab = ws_state.right_panel_tab.clone();
-                        ws.cached_right_panel_width = ws_state.right_panel_width;
-                        ws.cached_sidebar_collapsed = ws_state.sidebar_collapsed;
-                        ws.cached_right_panel_collapsed = ws_state.right_panel_collapsed;
+                        ws.right_panel_tab = rp_tab;
+                        ws.right_panel_width = rp_width;
+                        ws.sidebar_collapsed = sb_collapsed;
+                        ws.right_panel_collapsed = rp_collapsed;
+                        if let Some(dp) = &ws.git_diff_panel {
+                            dp.update(cx, |panel, _cx| {
+                                panel.set_split_view(legacy_diff_split);
+                            });
+                        }
+                        if let Some(pp) = &ws.pr_diff_panel {
+                            pp.update(cx, |panel, _cx| {
+                                panel.set_split_view(legacy_diff_split);
+                            });
+                        }
+                        // Eagerly re-open the files that were live in this
+                        // workspace last session, so each workspace's editor
+                        // restores with its own tab set.
+                        for path in &open_files {
+                            if path.exists() {
+                                ws.open_file_in_editor(path.clone(), None, cx);
+                            }
+                        }
+                        // open_file_in_editor flips the right-panel tab to
+                        // Files; restore the saved tab afterwards.
+                        ws.right_panel_tab = rp_tab;
                         ws
                     })
                 } else if let Some(url) = ws_state.pr_review_url.clone() {
@@ -364,106 +415,13 @@ impl SessionState {
             .active_workspace_ix
             .min(workspaces.len().saturating_sub(1));
 
-        // Derive diff panel work_dir from the active workspace's directory
-        let active_ws_dir = workspaces
-            .get(active_workspace_ix)
-            .and_then(|ws| ws.read(cx).directory.clone());
-
-        // Get editor files for active workspace: prefer per-workspace, fall back to legacy global
-        let active_ws_files: Vec<PathBuf> = workspaces
-            .get(active_workspace_ix)
-            .map(|ws| ws.read(cx).cached_editor_files.clone())
-            .unwrap_or_default();
-        let editor_open_files = if !active_ws_files.is_empty() {
-            active_ws_files
-        } else {
-            self.settings.editor_open_files.clone()
-        };
-        let active_ws_dir_clone = active_ws_dir.clone();
-
-        // Prefer per-workspace panel state for the active workspace
-        let active_ws_panel = workspaces.get(active_workspace_ix).map(|ws| {
-            let ws = ws.read(cx);
-            (
-                ws.cached_right_panel_tab.clone(),
-                ws.cached_right_panel_width,
-                ws.cached_sidebar_collapsed,
-                ws.cached_right_panel_collapsed,
-            )
-        });
-        let effective_rp_tab = active_ws_panel
-            .as_ref()
-            .and_then(|(t, _, _, _)| t.as_ref())
-            .map(|t| match t.as_str() {
-                "files" => RightPanelTab::Files,
-                "pr" => RightPanelTab::Pr,
-                _ => RightPanelTab::Git,
-            })
-            .unwrap_or(right_panel_tab);
-        let effective_rp_width = active_ws_panel
-            .as_ref()
-            .and_then(|(_, w, _, _)| *w)
-            .unwrap_or(right_panel_width);
-        let effective_sb_collapsed = active_ws_panel
-            .as_ref()
-            .and_then(|(_, _, sc, _)| *sc)
-            .unwrap_or(sidebar_collapsed);
-        let effective_rp_collapsed = active_ws_panel
-            .as_ref()
-            .and_then(|(_, _, _, rc)| *rc)
-            .unwrap_or(right_panel_collapsed);
-
-        let diff_view_split = self.settings.diff_view_split;
-        let right_panel = cx.new(|cx| {
-            let diff_panel = cx.new(|cx| {
-                let mut panel = if let Some(dir) = &active_ws_dir {
-                    crate::git::GitDiffPanel::new(dir.clone(), cx)
-                } else {
-                    crate::git::GitDiffPanel::empty(cx)
-                };
-                panel.set_split_view(diff_view_split);
-                panel
-            });
-            let pr_diff_panel = cx.new(|cx| {
-                let mut panel = if let Some(dir) = &active_ws_dir {
-                    crate::git::PrDiffPanel::new(dir.clone(), cx)
-                } else {
-                    crate::git::PrDiffPanel::empty(cx)
-                };
-                panel.set_split_view(diff_view_split);
-                panel
-            });
-            let mut rp = RightPanel::new(diff_panel, pr_diff_panel);
-            rp.width = effective_rp_width;
-            rp.active_tab = effective_rp_tab;
-
-            // Restore editor with open files for the active workspace
-            if let Some(dir) = active_ws_dir_clone {
-                rp.ensure_editor(dir, cx);
-                if let Some(editor) = &rp.editor {
-                    editor.update(cx, |editor, cx| {
-                        for file_path in &editor_open_files {
-                            if file_path.exists() {
-                                editor.open_file(file_path.clone(), cx);
-                            }
-                        }
-                    });
-                }
-            }
-
-            rp
-        });
-
         let settings_panel = cx.new(|cx| crate::settings::settings_panel::SettingsPanel::new(cx));
 
         crate::app::OperatorApp::from_restored(
             workspaces,
             active_workspace_ix,
-            effective_sb_collapsed,
             sidebar_width,
-            effective_rp_collapsed,
             window_bounds,
-            right_panel,
             settings_panel,
             cx,
         )

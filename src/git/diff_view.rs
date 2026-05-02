@@ -146,8 +146,6 @@ pub struct GitDiffPanel {
     unstaged_tree_collapsed: bool,
     /// Per-hunk expanded context: key = (section, file_idx, hunk_idx).
     expanded_context: HashMap<(DiffSection, usize, usize), (usize, usize)>,
-    /// Panel width in px (overall diff panel).
-    pub width: f32,
     /// File tree width in px.
     tree_width: f32,
     /// Whether the file tree sidebar is collapsed.
@@ -223,53 +221,6 @@ impl std::hash::Hash for DiffSection {
 }
 
 impl GitDiffPanel {
-    pub fn empty(cx: &mut Context<Self>) -> Self {
-        Self {
-            repo: None,
-            branch: String::new(),
-            staged_files: Vec::new(),
-            unstaged_files: Vec::new(),
-            active_section: DiffSection::Unstaged,
-            collapsed_files: HashSet::new(),
-            file_content_hashes: HashMap::new(),
-            collapsed_dirs: HashSet::new(),
-            staged_tree_collapsed: false,
-            unstaged_tree_collapsed: false,
-            expanded_context: HashMap::new(),
-            width: 360.0,
-            tree_width: 200.0,
-            tree_collapsed: false,
-            resizing_tree: false,
-            tree_drag_start_x: 0.0,
-            tree_drag_start_width: 0.0,
-            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
-            copied_file_key: None,
-            _copied_timer: None,
-            scroll_to_file: None,
-            pending_revert: None,
-            copy_selecting: false,
-            copy_anchor_line: None,
-            copy_end_line: None,
-            copy_line_contents: Vec::new(),
-            _autoscroll_task: None,
-            last_drag_mouse_y: None,
-            cached_file_segments: Vec::new(),
-            flat_rows: Vec::new(),
-            flat_file_starts: Vec::new(),
-            flat_row_height_prefix: vec![0.0],
-            flat_cache_dirty: true,
-            view_mode: DiffViewMode::Unified,
-            focus_handle: cx.focus_handle(),
-            search_active: false,
-            search_query: String::new(),
-            search_input: None,
-            search_matches: Vec::new(),
-            search_match_ix: 0,
-            scrollbar: ScrollbarState::default(),
-            last_scroll_offset: 0.0,
-        }
-    }
-
     pub fn new(work_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let repo = GitRepo::open(&work_dir);
         let branch = repo
@@ -304,7 +255,6 @@ impl GitDiffPanel {
             staged_tree_collapsed: false,
             unstaged_tree_collapsed: false,
             expanded_context: HashMap::new(),
-            width: 360.0,
             tree_width: 200.0,
             tree_collapsed: false,
             resizing_tree: false,

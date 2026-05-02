@@ -364,8 +364,8 @@ impl GitDiffPanel {
         self.staged_files.len() + self.unstaged_files.len()
     }
 
-    pub fn git_dir(&self) -> Option<std::path::PathBuf> {
-        self.repo.as_ref().map(|r| r.git_dir())
+    pub fn workdir(&self) -> Option<std::path::PathBuf> {
+        self.repo.as_ref().and_then(|r| r.workdir())
     }
 
     fn is_line_selected(&self, global_idx: usize) -> bool {

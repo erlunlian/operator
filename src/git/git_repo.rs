@@ -18,6 +18,11 @@ impl GitRepo {
         self.repo.path().to_path_buf()
     }
 
+    /// Returns the path to the working tree root, if any (None for bare repos).
+    pub fn workdir(&self) -> Option<PathBuf> {
+        self.repo.workdir().map(|p| p.to_path_buf())
+    }
+
     pub fn current_branch(&self) -> String {
         self.repo
             .head()
@@ -334,10 +339,29 @@ impl GitRepo {
                     .map(|s| s.to_string());
             }
         }
-        // Fall back to working directory (for unstaged new-side files).
-        self.repo
-            .workdir()
-            .and_then(|w| std::fs::read_to_string(w.join(path)).ok())
+        // Fall back to the working directory (untracked/new files have no
+        // blob in the object database). Retry briefly on empty/missing reads
+        // because the FS watcher can fire while a writer is mid-write — we
+        // don't want to cache a zero-byte snapshot of a file that's about
+        // to have content.
+        let workdir = self.repo.workdir()?;
+        let full = workdir.join(path);
+        // Total budget: ~50ms (2 retries × 25ms). This runs on the main
+        // thread via panel.refresh(), so we cap aggressively. If a file
+        // is genuinely empty we'll fall through and report empty content.
+        for attempt in 0..3 {
+            match std::fs::read_to_string(&full) {
+                Ok(s) if !s.is_empty() => return Some(s),
+                Ok(_) | Err(_) => {
+                    if attempt < 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+            }
+        }
+        // Final read: prefer Some("") over None so the caller still renders
+        // a header for a known-empty file rather than dropping it entirely.
+        std::fs::read_to_string(&full).ok().or(Some(String::new()))
     }
 
     /// Highlight a full file and return per-line SourceLine entries.

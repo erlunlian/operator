@@ -333,22 +333,27 @@ impl OperatorApp {
     }
 
     fn start_diff_watcher(diff_panel: Entity<GitDiffPanel>, cx: &mut Context<Self>) -> Option<Task<()>> {
-        // Get the .git directory to watch
-        let git_dir = diff_panel.read(cx).git_dir();
-        let Some(git_dir) = git_dir else { return None };
+        // Watch the working tree recursively. This covers both file edits
+        // (creates/modifies/removes in the worktree) and git-internal state
+        // changes — `.git/` lives inside the worktree, so its index/HEAD/refs
+        // writes flow through the same watcher.
+        let workdir = diff_panel.read(cx).workdir()?;
 
-        // Create a channel-based file watcher using the `notify` crate.
-        // We watch the .git dir for changes to index, HEAD, refs, etc.
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
-                    // Only care about writes/creates/removes
                     use notify::EventKind;
                     match event.kind {
                         EventKind::Create(_)
                         | EventKind::Modify(_)
                         | EventKind::Remove(_) => {
+                            // Skip events that don't affect git status:
+                            // build artifacts, vendored deps, git-internal
+                            // pack/object churn, and editor swap files.
+                            if event.paths.iter().all(|p| should_ignore_fs_path(p)) {
+                                return;
+                            }
                             let _ = tx.send(());
                         }
                         _ => {}
@@ -360,9 +365,8 @@ impl OperatorApp {
             Err(_) => return None,
         };
 
-        // Watch the .git directory (index, HEAD, refs changes)
         use notify::Watcher;
-        let _ = watcher.watch(&git_dir, notify::RecursiveMode::Recursive);
+        let _ = watcher.watch(&workdir, notify::RecursiveMode::Recursive);
 
         // Spawn a background thread that blocks on the watcher channel,
         // then pokes the UI when something changes.
@@ -2373,5 +2377,47 @@ impl Render for OperatorApp {
 
 fn short_path(path: &PathBuf) -> String {
     crate::util::short_path(path)
+}
+
+/// Returns true if a filesystem event for `path` should be ignored by the
+/// diff watcher. We exclude build artifacts, dependency caches, git-internal
+/// object/pack churn, and editor swap files — none of which affect the diff
+/// the user cares about, and all of which can fire many events per second.
+fn should_ignore_fs_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            let name = name.to_string_lossy();
+            match name.as_ref() {
+                "target"
+                | "node_modules"
+                | ".next"
+                | ".turbo"
+                | "dist"
+                | "build"
+                | ".cache"
+                | ".DS_Store" => return true,
+                _ => {}
+            }
+        }
+    }
+    // Inside .git/, only the index, HEAD, and refs matter for our diff.
+    // Pack/object writes happen on every fetch/gc and don't change status.
+    let s = path.to_string_lossy();
+    if s.contains("/.git/objects/") || s.contains("/.git/lfs/") || s.contains("/.git/logs/") {
+        return true;
+    }
+    // Editor swap/temp files.
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.ends_with('~')
+            || name.ends_with(".swp")
+            || name.ends_with(".swx")
+            || name.starts_with(".#")
+            || (name.starts_with('#') && name.ends_with('#'))
+        {
+            return true;
+        }
+    }
+    false
 }
 

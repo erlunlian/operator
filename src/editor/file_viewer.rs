@@ -225,6 +225,11 @@ pub struct FileViewer {
     /// Last seen scroll offset, used to detect scroll events and bump
     /// scrollbar visibility.
     last_scroll_offset: f32,
+
+    /// Watches the open file's parent directory and reloads the buffer when
+    /// the file is changed by an external tool. Held to keep the watcher
+    /// alive — dropped when the FileViewer drops.
+    _file_watcher: Option<Task<()>>,
 }
 
 impl FileViewer {
@@ -246,6 +251,8 @@ impl FileViewer {
         let is_markdown = language.as_deref() == Some("markdown");
         let rendered_lines = Self::precompute_lines(&content, &highlights, is_markdown, MARKDOWN_WRAP_CHARS);
         let gutter_width = format!("{}", buffer.len()).len().max(3) as f32 * 8.4 + 16.0;
+
+        let file_watcher = Self::spawn_file_watcher(path.clone(), cx);
 
         Self {
             path,
@@ -285,6 +292,7 @@ impl FileViewer {
             current_wrap_chars: MARKDOWN_WRAP_CHARS,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            _file_watcher: file_watcher,
         }
     }
 
@@ -332,7 +340,147 @@ impl FileViewer {
             current_wrap_chars: MARKDOWN_WRAP_CHARS,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            // No watcher for new_empty: the path doesn't exist on disk yet,
+            // so there's nothing meaningful to watch until the first save.
+            _file_watcher: None,
         }
+    }
+
+    /// Spawn a background watcher that reloads the buffer when the file on
+    /// disk changes (e.g. an external tool or another editor writes to it).
+    /// We watch the file's parent directory rather than the file itself
+    /// because many tools save via atomic-replace (write-temp + rename),
+    /// which invalidates a watch on the original inode.
+    fn spawn_file_watcher(path: PathBuf, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let parent = path.parent()?.to_path_buf();
+        let target = path.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    use notify::EventKind;
+                    match event.kind {
+                        EventKind::Create(_)
+                        | EventKind::Modify(_)
+                        | EventKind::Remove(_) => {
+                            if event.paths.iter().any(|p| p == &target) {
+                                let _ = tx.send(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        ) {
+            Ok(w) => w,
+            Err(_) => return None,
+        };
+
+        use notify::Watcher;
+        if watcher
+            .watch(&parent, notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return None;
+        }
+
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let reload_path = path;
+        Some(cx.spawn(async move |this, cx| {
+            // Hold the watcher alive for the lifetime of this task.
+            let _watcher = watcher;
+            loop {
+                let rx_clone = rx.clone();
+                let got_event = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let rx = rx_clone.lock().unwrap();
+                        if rx.recv().is_err() {
+                            return false;
+                        }
+                        // Coalesce burst events (e.g. atomic-rename emits
+                        // create+remove+modify in quick succession).
+                        while rx.try_recv().is_ok() {}
+                        true
+                    })
+                    .await;
+                if !got_event {
+                    break;
+                }
+
+                // Brief settle so the writer finishes before we read.
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(75))
+                    .await;
+
+                let read_path = reload_path.clone();
+                let new_content = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::read_to_string(&read_path).ok() })
+                    .await;
+                let Some(new_content) = new_content else {
+                    continue;
+                };
+
+                let r = this.update(cx, |viewer, cx| {
+                    viewer.reload_from_disk(new_content, cx);
+                });
+                if r.is_err() {
+                    break;
+                }
+            }
+        }))
+    }
+
+    /// Replace the in-memory buffer with content read from disk. Skips when
+    /// the buffer has unsaved changes (we don't want to silently clobber
+    /// user edits) or when content is unchanged (avoids needless rerenders
+    /// after our own `save()` round-trips through the watcher).
+    fn reload_from_disk(&mut self, content: String, cx: &mut Context<Self>) {
+        if self.dirty {
+            return;
+        }
+        let new_buffer: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let new_buffer = if new_buffer.is_empty() {
+            vec![String::new()]
+        } else {
+            new_buffer
+        };
+        if new_buffer == self.buffer {
+            return;
+        }
+
+        let highlights = if let Some(lang) = &self.language {
+            syntax::highlight_source(&content, lang)
+        } else {
+            vec![]
+        };
+        let is_markdown = self.language.as_deref() == Some("markdown");
+        let rendered =
+            Self::precompute_lines(&content, &highlights, is_markdown, self.current_wrap_chars);
+
+        self.buffer = new_buffer;
+        self.rendered_lines = Rc::new(rendered);
+        self.gutter_width = format!("{}", self.buffer.len()).len().max(3) as f32 * 8.4 + 16.0;
+
+        // Clamp cursor to the new bounds.
+        if self.cursor_row >= self.buffer.len() {
+            self.cursor_row = self.buffer.len().saturating_sub(1);
+        }
+        if let Some(line) = self.buffer.get(self.cursor_row) {
+            if self.cursor_col > line.len() {
+                self.cursor_col = line.len();
+            }
+        }
+
+        // The buffer changed underneath; old undo entries reference indices
+        // that may no longer exist, so reset history and transient state.
+        self.selection = None;
+        self.search_matches.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        cx.notify();
     }
 
     // ── Highlight precomputation ──

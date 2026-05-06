@@ -248,6 +248,18 @@ impl GitRepo {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
+            // For renames, capture the prior path so the UI can show
+            // "renamed from old → new" instead of a full content diff.
+            let old_path = if matches!(status, FileStatus::Renamed) {
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .filter(|p| p != &path)
+            } else {
+                None
+            };
+
             let mut hunks = Vec::new();
             if let Ok(patch) = git2::Patch::from_diff(diff, delta_idx) {
                 if let Some(patch) = patch {
@@ -289,6 +301,7 @@ impl GitRepo {
             let mut file = DiffFile {
                 path,
                 status,
+                old_path,
                 hunks,
                 source_lines: None,
             };

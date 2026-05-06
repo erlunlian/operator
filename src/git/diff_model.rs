@@ -42,6 +42,9 @@ pub struct SourceLine {
 pub struct DiffFile {
     pub path: String,
     pub status: FileStatus,
+    /// For renames: the file's prior path (where it moved from). `None` for
+    /// non-rename statuses or when the previous path can't be determined.
+    pub old_path: Option<String>,
     pub hunks: Vec<DiffHunk>,
     /// Full new-side file content split into lines, with precomputed highlights.
     /// Used for correct multiline syntax highlighting and expanding context
@@ -85,7 +88,8 @@ impl DiffFile {
             .as_ref()
             .map(|sl| sl.iter().map(|l| l.estimated_bytes()).sum())
             .unwrap_or(0);
-        self.path.capacity() + hunks + source_lines
+        let old_path = self.old_path.as_ref().map(|s| s.capacity()).unwrap_or(0);
+        self.path.capacity() + old_path + hunks + source_lines
     }
 
     /// Count added lines across all hunks.

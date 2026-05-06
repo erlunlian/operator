@@ -247,6 +247,10 @@ pub struct PrDiffPanel {
     // Auto-hiding scrollbar over the diff list.
     scrollbar: ScrollbarState,
     last_scroll_offset: f32,
+    /// File index whose inline FileHeader row is currently being covered by
+    /// the sticky overlay. The list renders an invisible placeholder for
+    /// that row so we don't double-paint the same header.
+    sticky_file_idx: Option<usize>,
 
     // Merge / checks UI state
     checks_expanded: bool,
@@ -318,6 +322,7 @@ impl PrDiffPanel {
             search_match_ix: 0,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            sticky_file_idx: None,
             checks_expanded: false,
             submitting_merge: false,
             merge_error: None,
@@ -401,6 +406,7 @@ impl PrDiffPanel {
             search_match_ix: 0,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            sticky_file_idx: None,
             checks_expanded: false,
             submitting_merge: false,
             merge_error: None,
@@ -513,6 +519,48 @@ impl PrDiffPanel {
 
     /// Locate the row containing `target_px` via binary search on the
     /// prefix sums.
+    /// Compute the sticky file-header overlay state for the current scroll
+    /// position. See the matching method in `diff_view.rs` for the full
+    /// rationale; activation is shifted by each file's `pt` wrapper so
+    /// the inter-file breathing room stays visible until the card itself
+    /// reaches the top edge.
+    fn sticky_file_header(&self) -> Option<(usize, f32)> {
+        if self.flat_file_starts.is_empty() || self.flat_row_height_prefix.is_empty() {
+            return None;
+        }
+        let scroll_px = self.estimated_scroll_offset_px();
+        let card_h = 42.0;
+
+        let mut current: Option<usize> = None;
+        for (file_idx, &start_row) in self.flat_file_starts.iter().enumerate() {
+            let card_top =
+                self.flat_row_height_prefix[start_row] + file_header_top_pad(file_idx);
+            if card_top <= scroll_px {
+                current = Some(file_idx);
+            } else {
+                break;
+            }
+        }
+        let current = current?;
+
+        let push_offset = self
+            .flat_file_starts
+            .get(current + 1)
+            .map(|&next_start| {
+                let next_card_top = self.flat_row_height_prefix[next_start]
+                    + file_header_top_pad(current + 1);
+                let dist = next_card_top - scroll_px;
+                if dist < card_h {
+                    (card_h - dist).max(0.0)
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        Some((current, push_offset))
+    }
+
     fn item_ix_for_estimated_offset(&self, target_px: f32) -> (usize, f32) {
         if target_px <= 0.0 || self.flat_rows.is_empty() {
             return (0, 0.0);
@@ -1734,11 +1782,14 @@ impl PrDiffPanel {
         let files_count = self.diff_files.len();
         let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(files_count);
         for file_idx in 0..files_count {
-            if self.collapsed_files.contains(&file_idx) || self.diff_files[file_idx].hunks.is_empty()
-            {
+            let f = &self.diff_files[file_idx];
+            let skip = self.collapsed_files.contains(&file_idx)
+                || f.hunks.is_empty()
+                || matches!(f.status, FileStatus::Renamed);
+            if skip {
                 all_segments.push(Vec::new());
             } else {
-                let segs = self.flatten_file_lines(&self.diff_files[file_idx], file_idx);
+                let segs = self.flatten_file_lines(f, file_idx);
                 all_segments.push(segs);
             }
         }
@@ -1758,7 +1809,10 @@ impl PrDiffPanel {
                 continue;
             }
 
-            if self.diff_files[file_idx].hunks.is_empty() {
+            // Renames render as a single info row (old → new) instead of
+            // a full content diff — the rename itself is the change.
+            let is_rename = matches!(self.diff_files[file_idx].status, FileStatus::Renamed);
+            if is_rename || self.diff_files[file_idx].hunks.is_empty() {
                 self.flat_rows.push(FlatRow::EmptyFile { file_idx });
                 continue;
             }
@@ -1913,7 +1967,26 @@ impl PrDiffPanel {
     fn render_flat_row(&self, row_idx: usize, entity: &Entity<Self>) -> AnyElement {
         match &self.flat_rows[row_idx] {
             FlatRow::FileHeader { file_idx } => {
-                self.render_file_header(*file_idx, entity)
+                if Some(*file_idx) == self.sticky_file_idx {
+                    // Inline header is covered by the sticky overlay —
+                    // render an invisible placeholder with the same
+                    // footprint (top_pad wrapper + header card box) so
+                    // the list's measured height stays identical and
+                    // toggling the sticky doesn't shift scroll position.
+                    div()
+                        .w_full()
+                        .pt(px(file_header_top_pad(*file_idx)))
+                        .child(
+                            div()
+                                .min_h(px(32.0))
+                                .py(px(4.0))
+                                .border_1()
+                                .border_color(rgba(0x00000000)),
+                        )
+                        .into_any_element()
+                } else {
+                    self.render_file_header(*file_idx, entity, true)
+                }
             }
             FlatRow::EmptyFile { file_idx } => {
                 self.render_empty_file(*file_idx)
@@ -1981,7 +2054,16 @@ impl PrDiffPanel {
         }
     }
 
-    fn render_file_header(&self, file_idx: usize, entity: &Entity<Self>) -> AnyElement {
+    /// Render a file header. `with_top_pad` controls the inter-file
+    /// spacing wrapper: list rows pass `true` so files visually breathe;
+    /// the sticky overlay passes `false` so the card sits flush against
+    /// the top edge with no padding gap above it.
+    fn render_file_header(
+        &self,
+        file_idx: usize,
+        entity: &Entity<Self>,
+        with_top_pad: bool,
+    ) -> AnyElement {
         let file = &self.diff_files[file_idx];
         let adds = file.additions();
         let dels = file.deletions();
@@ -2122,14 +2204,23 @@ impl PrDiffPanel {
                     }),
             );
 
-        let top_pad = if file_idx > 0 { 12.0 } else { 16.0 };
-        div()
-            .pt(px(top_pad))
-            .child(header)
-            .into_any_element()
+        if with_top_pad {
+            div()
+                .pt(px(file_header_top_pad(file_idx)))
+                .child(header)
+                .into_any_element()
+        } else {
+            header.into_any_element()
+        }
     }
 
     fn render_empty_file(&self, file_idx: usize) -> AnyElement {
+        let file = &self.diff_files[file_idx];
+        let body: String = match (&file.status, file.old_path.as_ref()) {
+            (FileStatus::Renamed, Some(old)) => format!("Renamed from {old}"),
+            (FileStatus::Renamed, None) => "Renamed".to_string(),
+            _ => "This file has no content".to_string(),
+        };
         div()
             .id(ElementId::Name(format!("pr-fempty-{file_idx}").into()))
             .w_full()
@@ -2142,7 +2233,7 @@ impl PrDiffPanel {
             .rounded_b_md()
             .text_xs()
             .text_color(colors::text_muted())
-            .child("This file has no content")
+            .child(body)
             .into_any_element()
     }
 
@@ -3872,6 +3963,16 @@ fn row_height_estimate_px(row: &FlatRow) -> f32 {
     }
 }
 
+/// Inter-file breathing-room above each file header card. Centralized so
+/// the renderer, sticky activation, and placeholder all stay in sync.
+fn file_header_top_pad(file_idx: usize) -> f32 {
+    if file_idx > 0 {
+        12.0
+    } else {
+        16.0
+    }
+}
+
 // ── File tree builder ──
 
 enum TreeNode {
@@ -4657,6 +4758,12 @@ impl Render for PrDiffPanel {
             }
         }
 
+        // Compute sticky overlay state once. Stashing the file index on
+        // `self` lets the row renderer hide the inline header for that
+        // file so the sticky and inline don't double-paint.
+        let sticky = self.sticky_file_header();
+        self.sticky_file_idx = sticky.map(|(idx, _)| idx);
+
         // Diff content — virtualized with list (supports variable row heights for comments)
         let entity_list = cx.entity().clone();
 
@@ -4715,6 +4822,25 @@ impl Render for PrDiffPanel {
             .overflow_x_hidden()
             .px(px(16.0))
             .child(diff_list);
+
+        // Sticky file-header overlay: pinned to the top of the diff
+        // viewport, slid up by `push_offset` as the next file's inline
+        // header approaches. The matching inline row is rendered as an
+        // invisible placeholder of the same height (see `render_flat_row`).
+        if let Some((sticky_idx, push_offset)) = sticky {
+            let entity_sticky = cx.entity().clone();
+            diff_content = diff_content.child(
+                div()
+                    .absolute()
+                    .top(px(-push_offset))
+                    .left(px(16.0))
+                    .right(px(16.0))
+                    // Opaque backstop so scrolling diff lines behind the
+                    // overlay can never show through during the handover.
+                    .bg(colors::surface())
+                    .child(self.render_file_header(sticky_idx, &entity_sticky, false)),
+            );
+        }
 
         if let Some(bar) = scrollbar::render_vertical(
             "pr-diff-scrollbar",

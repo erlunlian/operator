@@ -206,6 +206,10 @@ pub struct GitDiffPanel {
     /// Last ListState scroll offset (px) — used to detect scroll changes
     /// between renders and bump scrollbar visibility.
     last_scroll_offset: f32,
+    /// File index whose inline FileHeader row is currently being covered by
+    /// the sticky overlay. The list renders an invisible placeholder for
+    /// that row so we don't double-paint the same header.
+    sticky_file_idx: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -285,6 +289,7 @@ impl GitDiffPanel {
             search_match_ix: 0,
             scrollbar: ScrollbarState::default(),
             last_scroll_offset: 0.0,
+            sticky_file_idx: None,
         }
     }
 
@@ -390,6 +395,68 @@ impl GitDiffPanel {
             .item_ix
             .min(self.flat_row_height_prefix.len().saturating_sub(1));
         self.flat_row_height_prefix[cap] + f32::from(scroll_top.offset_in_item)
+    }
+
+    /// Compute the sticky file-header overlay state for the current scroll
+    /// position. Returns `Some((file_idx, push_offset_px))` when a file
+    /// header should be pinned at the top of the diff viewport:
+    ///   * `file_idx` — the file whose card has reached (or scrolled
+    ///     past) the top edge.
+    ///   * `push_offset_px` — how many pixels to translate the overlay
+    ///     upward, so the next file's incoming card pushes the sticky
+    ///     off-screen (mirrors CSS `position: sticky` behavior).
+    ///
+    /// The overlay activates the moment the inline header *card* (not the
+    /// row including its inter-file `pt` spacing) touches the top edge —
+    /// so the first file's `pt(16)` of breathing room is fully visible
+    /// before the sticky takes over.
+    fn sticky_file_header(&self) -> Option<(usize, f32)> {
+        if self.flat_file_starts.is_empty() || self.flat_row_height_prefix.is_empty() {
+            return None;
+        }
+        let scroll_px = self.estimated_scroll_offset_px();
+        // The visible card height (min_h 32 + py 4*2 + border 1*2). Distinct
+        // from `row_height_estimate_px`, which estimates the full row
+        // including the `pt` wrapper. Push-off uses the card height because
+        // that's the box the user sees sliding off.
+        let card_h = 42.0;
+
+        // Highest file whose CARD top has reached or passed the viewport
+        // top edge. The card sits below `file_header_top_pad(idx)` of
+        // breathing room, so the activation threshold is shifted by that
+        // pad — keeping the inter-file gap visible until the card itself
+        // is what's pinned.
+        let mut current: Option<usize> = None;
+        for (file_idx, &start_row) in self.flat_file_starts.iter().enumerate() {
+            let card_top =
+                self.flat_row_height_prefix[start_row] + file_header_top_pad(file_idx);
+            if card_top <= scroll_px {
+                current = Some(file_idx);
+            } else {
+                break;
+            }
+        }
+        let current = current?;
+
+        // Push-off: as the next file's card top enters the viewport, slide
+        // the sticky overlay upward at a 1:1 rate so the two cards meet
+        // exactly at the top edge during handover.
+        let push_offset = self
+            .flat_file_starts
+            .get(current + 1)
+            .map(|&next_start| {
+                let next_card_top = self.flat_row_height_prefix[next_start]
+                    + file_header_top_pad(current + 1);
+                let dist = next_card_top - scroll_px;
+                if dist < card_h {
+                    (card_h - dist).max(0.0)
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        Some((current, push_offset))
     }
 
     /// Locate the row containing `target_px` via binary search on the
@@ -1023,7 +1090,10 @@ impl GitDiffPanel {
         let mut all_segments: Vec<Vec<LineSegment>> = Vec::with_capacity(files_count);
         for file_idx in 0..files_count {
             let file_key = (section, files[file_idx].path.clone());
-            if self.collapsed_files.contains(&file_key) || files[file_idx].hunks.is_empty() {
+            let skip = self.collapsed_files.contains(&file_key)
+                || files[file_idx].hunks.is_empty()
+                || matches!(files[file_idx].status, FileStatus::Renamed);
+            if skip {
                 all_segments.push(Vec::new());
             } else {
                 let segs = self.flatten_file_lines(&files[file_idx].clone(), file_idx, section);
@@ -1047,7 +1117,13 @@ impl GitDiffPanel {
                 continue;
             }
 
-            if self.active_files()[file_idx].hunks.is_empty() {
+            // Renames render as a single info row (old → new) instead of
+            // a full content diff — the rename itself is the change.
+            let is_rename = matches!(
+                self.active_files()[file_idx].status,
+                FileStatus::Renamed
+            );
+            if is_rename || self.active_files()[file_idx].hunks.is_empty() {
                 self.flat_rows.push(FlatRow::EmptyFile { file_idx });
                 continue;
             }
@@ -1207,7 +1283,28 @@ impl GitDiffPanel {
     /// Render a single flat row. Called from the list callback.
     fn render_flat_row(&self, row_idx: usize, entity: &Entity<Self>) -> AnyElement {
         match &self.flat_rows[row_idx] {
-            FlatRow::FileHeader { file_idx } => self.render_file_header(*file_idx, entity),
+            FlatRow::FileHeader { file_idx } => {
+                if Some(*file_idx) == self.sticky_file_idx {
+                    // Inline header is covered by the sticky overlay —
+                    // render an invisible placeholder with the same
+                    // footprint (top_pad wrapper + header card box) so
+                    // the list's measured height stays identical and
+                    // toggling the sticky doesn't shift scroll position.
+                    div()
+                        .w_full()
+                        .pt(px(file_header_top_pad(*file_idx)))
+                        .child(
+                            div()
+                                .min_h(px(32.0))
+                                .py(px(4.0))
+                                .border_1()
+                                .border_color(rgba(0x00000000)),
+                        )
+                        .into_any_element()
+                } else {
+                    self.render_file_header(*file_idx, entity, true)
+                }
+            }
             FlatRow::EmptyFile { file_idx } => self.render_empty_file(*file_idx),
             FlatRow::Line {
                 file_idx,
@@ -1264,7 +1361,16 @@ impl GitDiffPanel {
         }
     }
 
-    fn render_file_header(&self, file_idx: usize, entity: &Entity<Self>) -> AnyElement {
+    /// Render a file header. `with_top_pad` controls the inter-file
+    /// spacing wrapper: list rows pass `true` so files visually breathe;
+    /// the sticky overlay passes `false` so the card sits flush against
+    /// the top edge with no padding gap above it.
+    fn render_file_header(
+        &self,
+        file_idx: usize,
+        entity: &Entity<Self>,
+        with_top_pad: bool,
+    ) -> AnyElement {
         let files = self.active_files();
         let file = &files[file_idx];
         let adds = file.additions();
@@ -1467,14 +1573,23 @@ impl GitDiffPanel {
                 actions
             });
 
-        let top_pad = if file_idx > 0 { 12.0 } else { 16.0 };
-        div()
-            .pt(px(top_pad))
-            .child(header)
-            .into_any_element()
+        if with_top_pad {
+            div()
+                .pt(px(file_header_top_pad(file_idx)))
+                .child(header)
+                .into_any_element()
+        } else {
+            header.into_any_element()
+        }
     }
 
     fn render_empty_file(&self, file_idx: usize) -> AnyElement {
+        let file = &self.active_files()[file_idx];
+        let body: String = match (&file.status, file.old_path.as_ref()) {
+            (FileStatus::Renamed, Some(old)) => format!("Renamed from {old}"),
+            (FileStatus::Renamed, None) => "Renamed".to_string(),
+            _ => "This file has no content".to_string(),
+        };
         div()
             .id(ElementId::Name(format!("fdiff-empty-{file_idx}").into()))
             .w_full()
@@ -1487,7 +1602,7 @@ impl GitDiffPanel {
             .rounded_b_md()
             .text_xs()
             .text_color(colors::text_muted())
-            .child("This file has no content")
+            .child(body)
             .into_any_element()
     }
 
@@ -2174,6 +2289,18 @@ fn row_height_estimate_px(row: &FlatRow) -> f32 {
     }
 }
 
+/// Inter-file breathing-room above each file header card. The first file
+/// gets a slightly larger pad so it sits comfortably below the toolbar;
+/// subsequent files only need a smaller separator. Centralized here so
+/// the renderer, sticky activation, and placeholder all stay in sync.
+fn file_header_top_pad(file_idx: usize) -> f32 {
+    if file_idx > 0 {
+        12.0
+    } else {
+        16.0
+    }
+}
+
 // ── File tree builder ──
 
 enum TreeNode {
@@ -2764,6 +2891,12 @@ impl Render for GitDiffPanel {
             }
         }
 
+        // Compute sticky overlay state once. Stashing the file index on
+        // `self` lets the row renderer hide the inline header for that
+        // file so the sticky and inline don't double-paint.
+        let sticky = self.sticky_file_header();
+        self.sticky_file_idx = sticky.map(|(idx, _)| idx);
+
         // Diff content — virtualized with list (supports variable row heights)
         let entity_list = cx.entity().clone();
 
@@ -2825,6 +2958,25 @@ impl Render for GitDiffPanel {
             .overflow_hidden()
             .px(px(16.0))
             .child(diff_list);
+
+        // Sticky file-header overlay: pinned to the top of the diff
+        // viewport, slid up by `push_offset` as the next file's inline
+        // header approaches. The matching inline row is rendered as an
+        // invisible placeholder of the same height (see `render_flat_row`).
+        if let Some((sticky_idx, push_offset)) = sticky {
+            let entity_sticky = cx.entity().clone();
+            diff_content = diff_content.child(
+                div()
+                    .absolute()
+                    .top(px(-push_offset))
+                    .left(px(16.0))
+                    .right(px(16.0))
+                    // Opaque backstop so scrolling diff lines behind the
+                    // overlay can never show through during the handover.
+                    .bg(colors::surface())
+                    .child(self.render_file_header(sticky_idx, &entity_sticky, false)),
+            );
+        }
 
         if let Some(bar) = scrollbar::render_vertical(
             "diff-panel-scrollbar",

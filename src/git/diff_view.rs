@@ -1467,6 +1467,21 @@ impl GitDiffPanel {
                         if panel.collapsed_files.contains(&fk) {
                             panel.collapsed_files.remove(&fk);
                         } else {
+                            // If the click came from the sticky overlay (viewport
+                            // scrolled past this file's header card), preserving
+                            // the raw scroll offset across the collapse would land
+                            // the user in the middle of a later file. Snap back
+                            // to this file's row so the click stays anchored.
+                            if let Some(&start_row) = panel.flat_file_starts.get(file_idx) {
+                                if let Some(&prefix) =
+                                    panel.flat_row_height_prefix.get(start_row)
+                                {
+                                    let card_top = prefix + file_header_top_pad(file_idx);
+                                    if panel.estimated_scroll_offset_px() > card_top {
+                                        panel.scroll_to_file = Some(file_idx);
+                                    }
+                                }
+                            }
                             panel.collapsed_files.insert(fk.clone());
                         }
                         panel.flat_cache_dirty = true;
@@ -2938,6 +2953,19 @@ impl Render for GitDiffPanel {
             }
         }
 
+        // Apply any pending scroll-to-file BEFORE computing the sticky
+        // overlay state — otherwise sticky is decided against the
+        // pre-scroll position and the just-collapsed file's header
+        // briefly flashes as the sticky until the next render.
+        if let Some(target_file) = self.scroll_to_file.take() {
+            if let Some(&row_idx) = self.flat_file_starts.get(target_file) {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: row_idx,
+                    offset_in_item: px(0.),
+                });
+            }
+        }
+
         // Compute sticky overlay state once. Stashing the file index on
         // `self` lets the row renderer hide the inline header for that
         // file so the sticky and inline don't double-paint.
@@ -3038,16 +3066,6 @@ impl Render for GitDiffPanel {
             on_thumb_down,
         ) {
             diff_content = diff_content.child(bar);
-        }
-
-        // Handle scroll-to-file: convert file_idx to flat row index
-        if let Some(target_file) = self.scroll_to_file.take() {
-            if let Some(&row_idx) = self.flat_file_starts.get(target_file) {
-                self.list_state.scroll_to(ListOffset {
-                    item_ix: row_idx,
-                    offset_in_item: px(0.),
-                });
-            }
         }
 
         body = body.child(diff_content);

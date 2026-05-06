@@ -353,28 +353,13 @@ impl GitRepo {
             }
         }
         // Fall back to the working directory (untracked/new files have no
-        // blob in the object database). Retry briefly on empty/missing reads
-        // because the FS watcher can fire while a writer is mid-write — we
-        // don't want to cache a zero-byte snapshot of a file that's about
-        // to have content.
+        // blob in the object database). The watcher consumer already waits
+        // 100ms for writes to settle before triggering a refresh, so a
+        // separate retry/sleep loop here would just add main-thread latency
+        // without improving correctness. Prefer Some("") over None on read
+        // failure so the caller still renders a header for the file.
         let workdir = self.repo.workdir()?;
-        let full = workdir.join(path);
-        // Total budget: ~50ms (2 retries × 25ms). This runs on the main
-        // thread via panel.refresh(), so we cap aggressively. If a file
-        // is genuinely empty we'll fall through and report empty content.
-        for attempt in 0..3 {
-            match std::fs::read_to_string(&full) {
-                Ok(s) if !s.is_empty() => return Some(s),
-                Ok(_) | Err(_) => {
-                    if attempt < 2 {
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
-                }
-            }
-        }
-        // Final read: prefer Some("") over None so the caller still renders
-        // a header for a known-empty file rather than dropping it entirely.
-        std::fs::read_to_string(&full).ok().or(Some(String::new()))
+        Some(std::fs::read_to_string(workdir.join(path)).unwrap_or_default())
     }
 
     /// Highlight a full file and return per-line SourceLine entries.

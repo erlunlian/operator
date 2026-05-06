@@ -2,7 +2,7 @@ use gpui::*;
 use ignore::WalkBuilder;
 use std::cell::Cell;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -234,33 +234,47 @@ pub struct FileViewer {
 
 impl FileViewer {
     pub fn open(path: PathBuf, cx: &mut Context<Self>) -> Self {
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|e| format!("Error: {}", e));
         let language = syntax::detect_language(path.to_str().unwrap_or(""))
             .map(|s| s.to_string());
 
-        let highlights = if let Some(lang) = &language {
-            syntax::highlight_source(&content, lang)
-        } else {
-            vec![]
-        };
-
-        let buffer: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        // Ensure at least one line
-        let buffer = if buffer.is_empty() { vec![String::new()] } else { buffer };
-
-        let is_markdown = language.as_deref() == Some("markdown");
-        let rendered_lines = Self::precompute_lines(&content, &highlights, is_markdown, MARKDOWN_WRAP_CHARS);
-        let gutter_width = format!("{}", buffer.len()).len().max(3) as f32 * 8.4 + 16.0;
-
         let file_watcher = Self::spawn_file_watcher(path.clone(), cx);
+
+        // Heavy work — file I/O, tree-sitter highlighting, per-line allocation,
+        // and render precomputation — runs on the background pool. The viewer
+        // returns an empty placeholder immediately and gets populated via
+        // `apply_loaded_buffer` once the load completes; without this, opening
+        // a multi-MB source file would block the foreground thread for seconds.
+        let load_path = path.clone();
+        let load_lang = language.clone();
+        cx.spawn(async move |this, cx| {
+            let (buffer, rendered) = cx
+                .background_executor()
+                .spawn(async move {
+                    Self::compute_buffer_and_lines(
+                        &load_path,
+                        load_lang.as_deref(),
+                        MARKDOWN_WRAP_CHARS,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |viewer, cx| {
+                viewer.apply_loaded_buffer(buffer, rendered, cx);
+            });
+        })
+        .detach();
 
         Self {
             path,
             language,
             workspace_root: None,
             dirty: false,
-            buffer,
-            rendered_lines: Rc::new(rendered_lines),
+            buffer: vec![String::new()],
+            rendered_lines: Rc::new(vec![RenderedLine {
+                text: SharedString::from(" ".to_string()),
+                highlights: vec![],
+                buffer_row: 0,
+                byte_offset: 0,
+            }]),
             cursor_row: 0,
             cursor_col: 0,
             undo_stack: Vec::new(),
@@ -284,7 +298,9 @@ impl FileViewer {
             search_match_ix: 0,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
-            gutter_width,
+            // Placeholder gutter for the 1-line empty buffer; recomputed in
+            // `apply_loaded_buffer` once the real content arrives.
+            gutter_width: 3.0 * DEFAULT_CHAR_WIDTH + 16.0,
             code_area_left: Rc::new(Cell::new(0.0)),
             content_area_top: Rc::new(Cell::new(0.0)),
             char_width: Rc::new(Cell::new(DEFAULT_CHAR_WIDTH)),
@@ -386,7 +402,6 @@ impl FileViewer {
         }
 
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let reload_path = path;
         Some(cx.spawn(async move |this, cx| {
             // Hold the watcher alive for the lifetime of this task.
             let _watcher = watcher;
@@ -414,17 +429,28 @@ impl FileViewer {
                     .timer(std::time::Duration::from_millis(75))
                     .await;
 
-                let read_path = reload_path.clone();
-                let new_content = cx
-                    .background_executor()
-                    .spawn(async move { std::fs::read_to_string(&read_path).ok() })
-                    .await;
-                let Some(new_content) = new_content else {
-                    continue;
+                // Snapshot the language and wrap setting from the live viewer
+                // so the background load uses current values. Bails if the
+                // viewer was dropped while we were waiting.
+                let Ok((load_path, load_lang, wrap_chars)) = this.update(cx, |v, _| {
+                    (v.path.clone(), v.language.clone(), v.current_wrap_chars)
+                }) else {
+                    break;
                 };
 
+                let (buffer, rendered) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        Self::compute_buffer_and_lines(
+                            &load_path,
+                            load_lang.as_deref(),
+                            wrap_chars,
+                        )
+                    })
+                    .await;
+
                 let r = this.update(cx, |viewer, cx| {
-                    viewer.reload_from_disk(new_content, cx);
+                    viewer.apply_loaded_buffer(buffer, rendered, cx);
                 });
                 if r.is_err() {
                     break;
@@ -433,36 +459,53 @@ impl FileViewer {
         }))
     }
 
-    /// Replace the in-memory buffer with content read from disk. Skips when
-    /// the buffer has unsaved changes (we don't want to silently clobber
-    /// user edits) or when content is unchanged (avoids needless rerenders
+    /// Reads the file and computes the line buffer plus precomputed render
+    /// lines. Pure and `Send` so it can run on the background executor —
+    /// keeps the foreground thread responsive when opening or reloading
+    /// large files (the tree-sitter pass alone can take seconds on multi-MB
+    /// sources).
+    fn compute_buffer_and_lines(
+        path: &Path,
+        language: Option<&str>,
+        wrap_chars: usize,
+    ) -> (Vec<String>, Vec<RenderedLine>) {
+        let content =
+            std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {}", e));
+        let highlights = match language {
+            Some(lang) => syntax::highlight_source(&content, lang),
+            None => vec![],
+        };
+        let mut buffer: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        if buffer.is_empty() {
+            buffer.push(String::new());
+        }
+        let is_markdown = language == Some("markdown");
+        let rendered = Self::precompute_lines(&content, &highlights, is_markdown, wrap_chars);
+        (buffer, rendered)
+    }
+
+    /// Apply a freshly-loaded buffer + render lines to this viewer. Shared
+    /// between the initial async load in `open` and watcher-driven reloads.
+    /// Skips when the buffer has unsaved changes (don't clobber user edits)
+    /// or when the new buffer matches the current one (avoids rerender
     /// after our own `save()` round-trips through the watcher).
-    fn reload_from_disk(&mut self, content: String, cx: &mut Context<Self>) {
+    fn apply_loaded_buffer(
+        &mut self,
+        buffer: Vec<String>,
+        rendered_lines: Vec<RenderedLine>,
+        cx: &mut Context<Self>,
+    ) {
         if self.dirty {
             return;
         }
-        let new_buffer: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        let new_buffer = if new_buffer.is_empty() {
-            vec![String::new()]
-        } else {
-            new_buffer
-        };
-        if new_buffer == self.buffer {
+        if buffer == self.buffer {
             return;
         }
 
-        let highlights = if let Some(lang) = &self.language {
-            syntax::highlight_source(&content, lang)
-        } else {
-            vec![]
-        };
-        let is_markdown = self.language.as_deref() == Some("markdown");
-        let rendered =
-            Self::precompute_lines(&content, &highlights, is_markdown, self.current_wrap_chars);
-
-        self.buffer = new_buffer;
-        self.rendered_lines = Rc::new(rendered);
-        self.gutter_width = format!("{}", self.buffer.len()).len().max(3) as f32 * 8.4 + 16.0;
+        self.buffer = buffer;
+        self.rendered_lines = Rc::new(rendered_lines);
+        self.gutter_width =
+            format!("{}", self.buffer.len()).len().max(3) as f32 * self.char_width.get() + 16.0;
 
         // Clamp cursor to the new bounds.
         if self.cursor_row >= self.buffer.len() {

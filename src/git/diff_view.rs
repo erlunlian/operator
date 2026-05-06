@@ -575,33 +575,80 @@ impl GitDiffPanel {
 
     pub fn refresh(&mut self) {
         if let Some(repo) = &self.repo {
-            self.branch = repo.current_branch();
-            self.staged_files = repo.staged_diff();
-            self.unstaged_files = repo.unstaged_diff();
+            let branch = repo.current_branch();
+            let staged = repo.staged_diff();
+            let unstaged = repo.unstaged_diff();
+            self.apply_refresh_result(branch, staged, unstaged);
+        }
+    }
 
-            // Auto-expand files whose diff content changed since last viewed.
-            for (section, files) in [
-                (DiffSection::Staged, &self.staged_files),
-                (DiffSection::Unstaged, &self.unstaged_files),
-            ] {
-                for file in files {
-                    let key = (section, file.path.clone());
-                    let new_hash = Self::diff_content_hash(file);
-                    if let Some(&old_hash) = self.file_content_hashes.get(&key) {
-                        if new_hash != old_hash {
-                            // Content changed — re-expand and update hash
-                            self.collapsed_files.remove(&key);
-                            self.file_content_hashes.insert(key, new_hash);
-                        }
-                    } else {
-                        // First time seeing this file — record hash
+    /// Async refresh for the watcher path: opens a fresh `GitRepo` on the
+    /// background pool, computes both diffs there (file reads + tree-sitter
+    /// highlighting are the bulk of the cost), then applies the result on
+    /// the foreground thread. Without this, every FS event during a
+    /// `cargo build` triggers a synchronous full-repo diff + highlight pass
+    /// on the main thread — and with each workspace owning its own watcher,
+    /// that work fans out across N panels in parallel.
+    pub fn refresh_async(&self, cx: &mut Context<Self>) {
+        let Some(workdir) = self.repo.as_ref().and_then(|r| r.workdir()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = GitRepo::open(&workdir)?;
+                    let branch = repo.current_branch();
+                    let staged = repo.staged_diff();
+                    let unstaged = repo.unstaged_diff();
+                    Some((branch, staged, unstaged))
+                })
+                .await;
+            if let Some((branch, staged, unstaged)) = result {
+                let _ = this.update(cx, |panel, cx| {
+                    panel.apply_refresh_result(branch, staged, unstaged);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Shared post-refresh bookkeeping: install the new branch + file lists,
+    /// auto-expand any file whose diff content changed since last viewed,
+    /// and invalidate the flat-list render cache.
+    fn apply_refresh_result(
+        &mut self,
+        branch: String,
+        staged: Vec<DiffFile>,
+        unstaged: Vec<DiffFile>,
+    ) {
+        self.branch = branch;
+        self.staged_files = staged;
+        self.unstaged_files = unstaged;
+
+        // Auto-expand files whose diff content changed since last viewed.
+        for (section, files) in [
+            (DiffSection::Staged, &self.staged_files),
+            (DiffSection::Unstaged, &self.unstaged_files),
+        ] {
+            for file in files {
+                let key = (section, file.path.clone());
+                let new_hash = Self::diff_content_hash(file);
+                if let Some(&old_hash) = self.file_content_hashes.get(&key) {
+                    if new_hash != old_hash {
+                        // Content changed — re-expand and update hash
+                        self.collapsed_files.remove(&key);
                         self.file_content_hashes.insert(key, new_hash);
                     }
+                } else {
+                    // First time seeing this file — record hash
+                    self.file_content_hashes.insert(key, new_hash);
                 }
             }
-
-            self.flat_cache_dirty = true;
         }
+
+        self.flat_cache_dirty = true;
     }
 
     /// Clear expanded context state. Called after structural changes
@@ -611,44 +658,44 @@ impl GitDiffPanel {
         self.flat_cache_dirty = true;
     }
 
-    fn stage_file(&mut self, file_idx: usize) {
+    fn stage_file(&mut self, file_idx: usize, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repo {
             if let Some(file) = self.unstaged_files.get(file_idx) {
                 let path = file.path.clone();
                 if repo.stage_file(&path).is_ok() {
-                    self.refresh();
                     self.reset_expanded_context();
+                    self.refresh_async(cx);
                 }
             }
         }
     }
 
-    fn unstage_file(&mut self, file_idx: usize) {
+    fn unstage_file(&mut self, file_idx: usize, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repo {
             if let Some(file) = self.staged_files.get(file_idx) {
                 let path = file.path.clone();
                 if repo.unstage_file(&path).is_ok() {
-                    self.refresh();
                     self.reset_expanded_context();
+                    self.refresh_async(cx);
                 }
             }
         }
     }
 
-    fn revert_file(&mut self, file_idx: usize) {
+    fn revert_file(&mut self, file_idx: usize, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repo {
             if let Some(file) = self.unstaged_files.get(file_idx) {
                 let path = file.path.clone();
                 let status = file.status.clone();
                 if repo.revert_file(&path, &status).is_ok() {
-                    self.refresh();
                     self.reset_expanded_context();
+                    self.refresh_async(cx);
                 }
             }
         }
     }
 
-    fn revert_all_files(&mut self) {
+    fn revert_all_files(&mut self, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repo {
             let files: Vec<_> = self
                 .unstaged_files
@@ -658,30 +705,30 @@ impl GitDiffPanel {
             for (path, status) in &files {
                 let _ = repo.revert_file(path, status);
             }
-            self.refresh();
             self.reset_expanded_context();
+            self.refresh_async(cx);
         }
     }
 
-    fn stage_all_files(&mut self) {
+    fn stage_all_files(&mut self, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repo {
             let paths: Vec<_> = self.unstaged_files.iter().map(|f| f.path.clone()).collect();
             for path in &paths {
                 let _ = repo.stage_file(path);
             }
-            self.refresh();
             self.reset_expanded_context();
+            self.refresh_async(cx);
         }
     }
 
-    fn unstage_all_files(&mut self) {
+    fn unstage_all_files(&mut self, cx: &mut Context<Self>) {
         if let Some(repo) = &self.repo {
             let paths: Vec<_> = self.staged_files.iter().map(|f| f.path.clone()).collect();
             for path in &paths {
                 let _ = repo.unstage_file(path);
             }
-            self.refresh();
             self.reset_expanded_context();
+            self.refresh_async(cx);
         }
     }
 
@@ -833,7 +880,7 @@ impl GitDiffPanel {
                         action_btn("tree-stage-all".to_string(), "+")
                             .on_click(move |_, _window, cx| {
                                 entity_stage_all.update(cx, |panel, cx| {
-                                    panel.stage_all_files();
+                                    panel.stage_all_files(cx);
                                     cx.notify();
                                 });
                                 cx.stop_propagation();
@@ -846,7 +893,7 @@ impl GitDiffPanel {
                         action_btn("tree-unstage-all".to_string(), "\u{2212}")
                             .on_click(move |_, _window, cx| {
                                 entity_unstage_all.update(cx, |panel, cx| {
-                                    panel.unstage_all_files();
+                                    panel.unstage_all_files(cx);
                                     cx.notify();
                                 });
                                 cx.stop_propagation();
@@ -986,7 +1033,7 @@ impl GitDiffPanel {
                                 action_btn(format!("tree-stage-{idx}"), "+")
                                     .on_click(move |_, _window, cx| {
                                         entity_stage.update(cx, |panel, cx| {
-                                            panel.stage_file(idx);
+                                            panel.stage_file(idx, cx);
                                             cx.notify();
                                         });
                                         cx.stop_propagation();
@@ -1000,7 +1047,7 @@ impl GitDiffPanel {
                                 action_btn(format!("tree-unstage-{idx}"), "\u{2212}")
                                     .on_click(move |_, _window, cx| {
                                         entity_unstage.update(cx, |panel, cx| {
-                                            panel.unstage_file(idx);
+                                            panel.unstage_file(idx, cx);
                                             cx.notify();
                                         });
                                         cx.stop_propagation();
@@ -1549,7 +1596,7 @@ impl GitDiffPanel {
                             action_btn(format!("fdiff-stage-{file_idx}"), "+")
                                 .on_click(move |_, _window, cx| {
                                     entity_stage.update(cx, |panel, cx| {
-                                        panel.stage_file(file_idx);
+                                        panel.stage_file(file_idx, cx);
                                         cx.notify();
                                     });
                                     cx.stop_propagation();
@@ -1562,7 +1609,7 @@ impl GitDiffPanel {
                             action_btn(format!("fdiff-unstage-{file_idx}"), "\u{2212}")
                                 .on_click(move |_, _window, cx| {
                                     entity_unstage.update(cx, |panel, cx| {
-                                        panel.unstage_file(file_idx);
+                                        panel.unstage_file(file_idx, cx);
                                         cx.notify();
                                     });
                                     cx.stop_propagation();
@@ -3117,8 +3164,8 @@ impl Render for GitDiffPanel {
                                                 entity_confirm.update(cx, |panel, cx| {
                                                     if let Some(target) = panel.pending_revert.take() {
                                                         match target {
-                                                            RevertTarget::Single(idx) => panel.revert_file(idx),
-                                                            RevertTarget::All => panel.revert_all_files(),
+                                                            RevertTarget::Single(idx) => panel.revert_file(idx, cx),
+                                                            RevertTarget::All => panel.revert_all_files(cx),
                                                         }
                                                     }
                                                     cx.notify();

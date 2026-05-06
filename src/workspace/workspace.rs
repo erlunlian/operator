@@ -463,8 +463,7 @@ impl Workspace {
 
                 let ok = cx.update(|cx| {
                     diff_panel.update(cx, |panel, cx| {
-                        panel.refresh();
-                        cx.notify();
+                        panel.refresh_async(cx);
                     })
                 });
                 if ok.is_err() {
@@ -478,28 +477,41 @@ impl Workspace {
 
 /// Returns true if a filesystem event for `path` should be ignored by the
 /// diff watcher. Excludes build artifacts, dependency caches, git-internal
-/// object/pack churn, and editor swap files.
+/// object/pack churn, and editor swap files. Hot path: a `cargo build` can
+/// fire thousands of FS events per second, so this avoids string allocation.
 fn should_ignore_fs_path(path: &std::path::Path) -> bool {
+    use std::ffi::OsStr;
     use std::path::Component;
+
+    // Top-level / nested "ignored directory" check via OsStr comparison —
+    // byte-level on Unix, no UTF-8 round-trip through `to_string_lossy`.
+    let mut prev_was_dot_git = false;
     for component in path.components() {
         if let Component::Normal(name) = component {
-            let name = name.to_string_lossy();
-            match name.as_ref() {
-                "target"
-                | "node_modules"
-                | ".next"
-                | ".turbo"
-                | "dist"
-                | "build"
-                | ".cache"
-                | ".DS_Store" => return true,
-                _ => {}
+            if name == OsStr::new("target")
+                || name == OsStr::new("node_modules")
+                || name == OsStr::new(".next")
+                || name == OsStr::new(".turbo")
+                || name == OsStr::new("dist")
+                || name == OsStr::new("build")
+                || name == OsStr::new(".cache")
+                || name == OsStr::new(".DS_Store")
+            {
+                return true;
             }
+            // Inside `.git/`, only index/HEAD/refs writes affect our diff;
+            // pack/object/lfs/logs churn doesn't.
+            if prev_was_dot_git
+                && (name == OsStr::new("objects")
+                    || name == OsStr::new("lfs")
+                    || name == OsStr::new("logs"))
+            {
+                return true;
+            }
+            prev_was_dot_git = name == OsStr::new(".git");
+        } else {
+            prev_was_dot_git = false;
         }
-    }
-    let s = path.to_string_lossy();
-    if s.contains("/.git/objects/") || s.contains("/.git/lfs/") || s.contains("/.git/logs/") {
-        return true;
     }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         if name.ends_with('~')
